@@ -11,6 +11,9 @@ pub use archive::{
 pub mod encoding;
 pub use encoding::decode_names;
 
+pub mod path_safety;
+pub use path_safety::safe_join;
+
 #[cfg(test)]
 mod smoke {
     #[test]
