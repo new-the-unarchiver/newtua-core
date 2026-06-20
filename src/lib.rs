@@ -8,6 +8,9 @@ pub use archive::{
     ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, ReadSeek, Source,
 };
 
+pub mod encoding;
+pub use encoding::decode_names;
+
 #[cfg(test)]
 mod smoke {
     #[test]
