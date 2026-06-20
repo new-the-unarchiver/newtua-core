@@ -19,6 +19,9 @@ pub use decompress::{decompressor, Compressor};
 
 pub mod format;
 
+pub mod volume;
+pub use volume::{volume_members, ConcatReader};
+
 #[cfg(test)]
 mod smoke {
     #[test]
