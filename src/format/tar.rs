@@ -1,4 +1,5 @@
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 
 use crate::archive::{ArchiveReader, Entry, FormatHandler, FormatId, OpenOptions, Source};
 use crate::encoding::decode_names;
@@ -21,64 +22,151 @@ impl FormatHandler for TarHandler {
     }
 
     fn open(&self, src: Source, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
-        // Fully read into memory for random-access to entries.
-        let mut buf = Vec::new();
+        // Choose backing strategy:
+        // - Seekable source WITH a known file path → File strategy (no buffer).
+        // - Everything else (Stream, or Seekable without path) → Buffer strategy.
         match src {
-            Source::Seekable { mut inner, .. } => inner.read_to_end(&mut buf)?,
-            Source::Stream { mut inner, .. } => inner.read_to_end(&mut buf)?,
-        };
-        let mut reader = TarReader {
-            data: buf,
-            entries: Vec::new(),
-            offsets: Vec::new(),
-        };
-        reader.index(opts)?;
-        Ok(Box::new(reader))
+            Source::Seekable {
+                mut inner,
+                path: Some(ref path),
+            } => {
+                let path = path.clone();
+                // Index by streaming over the file — reads only headers, not payloads.
+                inner.seek(SeekFrom::Start(0))?;
+                let (entries, offsets) = index_from_reader(inner, opts)?;
+                let reader = TarReader {
+                    backing: Backing::File { path, offsets },
+                    entries,
+                };
+                Ok(Box::new(reader))
+            }
+            Source::Seekable {
+                mut inner,
+                path: None,
+            } => {
+                // Seekable but no path — fall back to buffer.
+                let mut buf = Vec::new();
+                inner.seek(SeekFrom::Start(0))?;
+                inner.read_to_end(&mut buf)?;
+                let (entries, offsets) = index_from_slice(&buf, opts)?;
+                let reader = TarReader {
+                    backing: Backing::Buffer { data: buf, offsets },
+                    entries,
+                };
+                Ok(Box::new(reader))
+            }
+            Source::Stream { mut inner, .. } => {
+                // Stream — must buffer everything.
+                let mut buf = Vec::new();
+                inner.read_to_end(&mut buf)?;
+                let (entries, offsets) = index_from_slice(&buf, opts)?;
+                let reader = TarReader {
+                    backing: Backing::Buffer { data: buf, offsets },
+                    entries,
+                };
+                Ok(Box::new(reader))
+            }
+        }
     }
 }
+
+// ── Backing strategies ────────────────────────────────────────────────────────
+
+enum Backing {
+    /// Entries are read directly from a file by seeking to recorded offsets.
+    /// No archive data is held in memory.
+    File { path: PathBuf, offsets: Vec<u64> },
+    /// The entire archive is buffered in memory (Stream source or no file path).
+    Buffer { data: Vec<u8>, offsets: Vec<u64> },
+}
+
+// ── TarReader ─────────────────────────────────────────────────────────────────
 
 struct TarReader {
-    data: Vec<u8>,
+    backing: Backing,
     entries: Vec<Entry>,
-    offsets: Vec<u64>, // data offset of each entry's payload within `data`
 }
 
-impl TarReader {
-    fn index(&mut self, opts: &OpenOptions) -> Result<()> {
-        let mut raw_names: Vec<Vec<u8>> = Vec::new();
-        let mut metas = Vec::new();
-        let mut ar = tar::Archive::new(std::io::Cursor::new(&self.data));
-        for entry in ar.entries().map_err(|e| Error::Corrupt(e.to_string()))? {
-            let entry = entry.map_err(|e| Error::Corrupt(e.to_string()))?;
-            let header = entry.header();
-            let is_dir = header.entry_type().is_dir();
-            // Header::size() returns io::Result<u64>; Entry::size() returns u64 directly.
-            // Using Header::size() as in the brief for uniformity.
-            let size = header.size().map_err(|e| Error::Corrupt(e.to_string()))?;
-            let path_bytes = entry.path_bytes().to_vec();
-            let offset = entry.raw_file_position();
-            let modified = header
-                .mtime()
-                .ok()
-                .map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
-            raw_names.push(path_bytes);
-            metas.push((size, is_dir, offset, modified));
-        }
-        let names = decode_names(&raw_names, opts.encoding_override.as_deref());
-        for (i, (size, is_dir, offset, modified)) in metas.into_iter().enumerate() {
-            self.entries.push(Entry {
-                path_raw: raw_names[i].clone(),
-                path: std::path::PathBuf::from(&names[i]),
-                size,
-                is_dir,
-                is_encrypted: false,
-                modified,
-            });
-            self.offsets.push(offset);
-        }
-        Ok(())
+// ── Indexing helpers ──────────────────────────────────────────────────────────
+
+/// Index a tar archive from a `Read + Seek` source (e.g., a `File`).
+/// Reads only the headers; skips payloads via the tar crate's streaming API.
+fn index_from_reader<R: Read + Seek>(
+    reader: R,
+    opts: &OpenOptions,
+) -> Result<(Vec<Entry>, Vec<u64>)> {
+    let mut raw_names: Vec<Vec<u8>> = Vec::new();
+    let mut metas: Vec<(u64, bool, u64, Option<std::time::SystemTime>)> = Vec::new();
+
+    let mut ar = tar::Archive::new(reader);
+    for entry in ar.entries().map_err(|e| Error::Corrupt(e.to_string()))? {
+        let entry = entry.map_err(|e| Error::Corrupt(e.to_string()))?;
+        let header = entry.header();
+        let is_dir = header.entry_type().is_dir();
+        let size = header.size().map_err(|e| Error::Corrupt(e.to_string()))?;
+        let path_bytes = entry.path_bytes().to_vec();
+        let offset = entry.raw_file_position();
+        let modified = header
+            .mtime()
+            .ok()
+            .map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
+        raw_names.push(path_bytes);
+        metas.push((size, is_dir, offset, modified));
     }
+
+    build_entries(raw_names, metas, opts)
 }
+
+/// Index a tar archive from an in-memory slice.
+fn index_from_slice(data: &[u8], opts: &OpenOptions) -> Result<(Vec<Entry>, Vec<u64>)> {
+    let mut raw_names: Vec<Vec<u8>> = Vec::new();
+    let mut metas: Vec<(u64, bool, u64, Option<std::time::SystemTime>)> = Vec::new();
+
+    let mut ar = tar::Archive::new(std::io::Cursor::new(data));
+    for entry in ar.entries().map_err(|e| Error::Corrupt(e.to_string()))? {
+        let entry = entry.map_err(|e| Error::Corrupt(e.to_string()))?;
+        let header = entry.header();
+        let is_dir = header.entry_type().is_dir();
+        let size = header.size().map_err(|e| Error::Corrupt(e.to_string()))?;
+        let path_bytes = entry.path_bytes().to_vec();
+        let offset = entry.raw_file_position();
+        let modified = header
+            .mtime()
+            .ok()
+            .map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
+        raw_names.push(path_bytes);
+        metas.push((size, is_dir, offset, modified));
+    }
+
+    build_entries(raw_names, metas, opts)
+}
+
+/// Convert raw name lists and metadata into `(Vec<Entry>, Vec<u64>)`.
+fn build_entries(
+    raw_names: Vec<Vec<u8>>,
+    metas: Vec<(u64, bool, u64, Option<std::time::SystemTime>)>,
+    opts: &OpenOptions,
+) -> Result<(Vec<Entry>, Vec<u64>)> {
+    let names = decode_names(&raw_names, opts.encoding_override.as_deref());
+    let mut entries = Vec::with_capacity(metas.len());
+    let mut offsets = Vec::with_capacity(metas.len());
+
+    for (i, (size, is_dir, offset, modified)) in metas.into_iter().enumerate() {
+        entries.push(Entry {
+            path_raw: raw_names[i].clone(),
+            path: std::path::PathBuf::from(&names[i]),
+            size,
+            is_dir,
+            is_encrypted: false,
+            modified,
+        });
+        offsets.push(offset);
+    }
+
+    Ok((entries, offsets))
+}
+
+// ── ArchiveReader impl ────────────────────────────────────────────────────────
 
 impl ArchiveReader for TarReader {
     fn format(&self) -> FormatId {
@@ -91,10 +179,30 @@ impl ArchiveReader for TarReader {
 
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
         let entry = self.entries.get(idx).ok_or(Error::InvalidIndex(idx))?;
-        let start = self.offsets[idx] as usize;
-        let end = start + entry.size as usize;
-        out.write_all(&self.data[start..end])?;
-        Ok(())
+        let size = entry.size;
+
+        match &self.backing {
+            Backing::File { path, offsets } => {
+                let offset = offsets[idx];
+                let mut file = std::fs::File::open(path)?;
+                file.seek(SeekFrom::Start(offset))?;
+                // Read exactly `size` bytes — take() stops at EOF naturally.
+                let mut limited = file.take(size);
+                std::io::copy(&mut limited, out)?;
+                Ok(())
+            }
+            Backing::Buffer { data, offsets } => {
+                let start = offsets[idx] as usize;
+                let end = start
+                    .checked_add(size as usize)
+                    .ok_or_else(|| Error::Corrupt("tar entry size arithmetic overflow".into()))?;
+                if end > data.len() {
+                    return Err(Error::Corrupt("tar entry size exceeds archive data".into()));
+                }
+                out.write_all(&data[start..end])?;
+                Ok(())
+            }
+        }
     }
 }
 
