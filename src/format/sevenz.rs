@@ -1,4 +1,6 @@
+use std::fs::File;
 use std::io::Write;
+use std::path::PathBuf;
 
 use crate::archive::{
     ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
@@ -24,10 +26,10 @@ impl FormatHandler for SevenZHandler {
     }
 
     fn open(&self, src: Source, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
-        // sevenz-rust2 requires a file path or Read+Seek source. We obtain the
-        // inner reader from Source directly so we can pass it to SevenZReader::new.
-        let inner = match src {
-            Source::Seekable { inner, .. } => inner,
+        // 7z requires seek. Extract the file path (needed for on-demand re-opens
+        // in read_entry) and the seekable reader.
+        let (inner, path) = match src {
+            Source::Seekable { inner, path } => (inner, path),
             Source::Stream { .. } => {
                 return Err(Error::Unsupported {
                     format: "7z".into(),
@@ -36,52 +38,58 @@ impl FormatHandler for SevenZHandler {
             }
         };
 
-        // Build the password. sevenz-rust2 Password converts &str to UTF-16LE bytes.
+        // We need a real file path so that read_entry can re-open the archive.
+        // Source::path() always sets path; in-memory sources have None and are
+        // not supported for on-demand extraction.
+        let file_path = path.ok_or_else(|| Error::Unsupported {
+            format: "7z".into(),
+            feature: "in-memory source (7z on-demand extraction requires a file path)".into(),
+        })?;
+
         let password: sevenz_rust2::Password = match opts.password.as_deref() {
             Some(pw) => pw.into(),
             None => sevenz_rust2::Password::empty(),
         };
 
-        let mut seven = sevenz_rust2::SevenZReader::new(inner, password).map_err(map_7z_err)?;
+        // Archive::read() parses ONLY the 7z header structures (pack-info,
+        // unpack-info, files-info) WITHOUT decompressing any entry payloads.
+        // For header-encrypted archives (-mhe=on) the header itself is AES-encrypted
+        // and the password is required here to decrypt the header block.
+        // Note: Archive::read<R: Read+Seek> requires a concrete Sized type, so we
+        // dereference through the Box to pass &mut dyn ReadSeek directly won't work.
+        // Instead we open the file a second time through the stored path for the
+        // header-only read. The original `inner` is dropped here.
+        drop(inner);
+        let mut header_file = File::open(&file_path).map_err(Error::Io)?;
+        let archive =
+            sevenz_rust2::Archive::read(&mut header_file, password.as_ref()).map_err(map_7z_err)?;
 
-        let mut raw_names: Vec<Vec<u8>> = Vec::new();
-        let mut sizes: Vec<u64> = Vec::new();
-        let mut is_dirs: Vec<bool> = Vec::new();
-        let mut all_data: Vec<Vec<u8>> = Vec::new();
-
-        seven
-            .for_each_entries(|entry, reader| {
-                let name_bytes = entry.name().as_bytes().to_vec();
-                let is_dir = entry.is_directory();
-                let size = entry.size();
-                let mut data = Vec::new();
-                if !is_dir {
-                    std::io::copy(reader, &mut data)?;
-                }
-                raw_names.push(name_bytes);
-                sizes.push(size);
-                is_dirs.push(is_dir);
-                all_data.push(data);
-                Ok(true)
-            })
-            .map_err(map_7z_err)?;
-
+        // Build entries from header metadata — no payload decompression occurs.
+        let raw_names: Vec<Vec<u8>> = archive
+            .files
+            .iter()
+            .map(|f| f.name().as_bytes().to_vec())
+            .collect();
         let names = decode_names(&raw_names, opts.encoding_override.as_deref());
-        let mut entries: Vec<Entry> = Vec::with_capacity(raw_names.len());
-        for (i, name) in names.into_iter().enumerate() {
-            entries.push(Entry {
-                path_raw: raw_names[i].clone(),
+
+        let entries: Vec<Entry> = archive
+            .files
+            .iter()
+            .zip(names)
+            .map(|(file, name)| Entry {
+                path_raw: file.name().as_bytes().to_vec(),
                 path: std::path::PathBuf::from(name),
-                size: sizes[i],
-                is_dir: is_dirs[i],
+                size: file.size(),
+                is_dir: file.is_directory(),
                 is_encrypted: opts.password.is_some(),
                 modified: None,
-            });
-        }
+            })
+            .collect();
 
         Ok(Box::new(SevenZReader {
+            file_path,
+            password: opts.password.clone(),
             entries,
-            data: all_data,
         }))
     }
 }
@@ -96,9 +104,18 @@ fn map_7z_err(e: sevenz_rust2::Error) -> Error {
     }
 }
 
+/// Archive reader that extracts entries on demand.
+///
+/// `open()` only parses the 7z header (zero payload decompression). Each call
+/// to `read_entry()` re-opens the archive file and decompresses only the
+/// requested entry, so at most one entry's data lives in RAM at a time.
 struct SevenZReader {
+    /// Path to the archive file on disk.
+    file_path: PathBuf,
+    /// Optional password (stored as the original UTF-8 string).
+    password: Option<String>,
+    /// Entry metadata populated at open time (headers only, no payloads).
     entries: Vec<Entry>,
-    data: Vec<Vec<u8>>,
 }
 
 impl ArchiveReader for SevenZReader {
@@ -111,8 +128,55 @@ impl ArchiveReader for SevenZReader {
     }
 
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
-        let data = self.data.get(idx).ok_or(Error::InvalidIndex(idx))?;
-        out.write_all(data)?;
+        // Validate index before doing any I/O.
+        if idx >= self.entries.len() {
+            return Err(Error::InvalidIndex(idx));
+        }
+
+        let target_name = self.entries[idx].path_raw.clone();
+
+        let password: sevenz_rust2::Password = match self.password.as_deref() {
+            Some(pw) => pw.into(),
+            None => sevenz_rust2::Password::empty(),
+        };
+
+        // Re-open the archive file for this extraction.  SevenZReader::open()
+        // re-reads only the header; the actual payload is decompressed lazily
+        // by for_each_entries as we iterate.
+        let file = File::open(&self.file_path).map_err(Error::Io)?;
+        let mut seven = sevenz_rust2::SevenZReader::new(file, password).map_err(map_7z_err)?;
+
+        let mut found = false;
+        let mut extract_err: Option<Error> = None;
+
+        seven
+            .for_each_entries(|entry, reader| {
+                if entry.name().as_bytes() == target_name.as_slice() {
+                    found = true;
+                    // Copy only this entry's payload to out; return false to
+                    // stop iteration early (no further decompression occurs).
+                    if let Err(e) = std::io::copy(reader, out) {
+                        extract_err = Some(Error::Io(e));
+                    }
+                    Ok(false)
+                } else {
+                    // Skip entries before the target.  For solid archives this
+                    // still decompresses preceding data (unavoidable for solid
+                    // streams), but we do NOT retain it in memory.
+                    std::io::copy(reader, &mut std::io::sink())?;
+                    Ok(true)
+                }
+            })
+            .map_err(map_7z_err)?;
+
+        if let Some(e) = extract_err {
+            return Err(e);
+        }
+
+        if !found {
+            return Err(Error::InvalidIndex(idx));
+        }
+
         Ok(())
     }
 }
