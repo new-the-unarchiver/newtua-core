@@ -22,6 +22,9 @@ pub mod format;
 pub mod volume;
 pub use volume::{volume_members, ConcatReader};
 
+pub mod detect;
+pub use detect::{detect_compressor, open, registry};
+
 #[cfg(test)]
 mod smoke {
     #[test]

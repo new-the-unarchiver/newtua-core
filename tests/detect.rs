@@ -47,7 +47,9 @@ fn unknown_format_errors() {
     use newtua_core::Error;
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), b"definitely not an archive").unwrap();
-    let err = open(tmp.path(), &OpenOptions::default()).unwrap_err();
+    let result = open(tmp.path(), &OpenOptions::default());
+    assert!(result.is_err());
+    let err = result.err().unwrap();
     assert!(matches!(err, Error::UnknownFormat));
 }
 
