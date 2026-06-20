@@ -1,6 +1,17 @@
 use newtua_core::{ExtractOptions, OpenOptions, extract_all, open};
 use std::io::Write;
 
+fn e(path: &str, is_dir: bool) -> newtua_core::Entry {
+    newtua_core::Entry {
+        path_raw: path.as_bytes().to_vec(),
+        path: std::path::PathBuf::from(path),
+        size: 0,
+        is_dir,
+        is_encrypted: false,
+        modified: None,
+    }
+}
+
 fn make_zip(entries: &[(&str, &[u8])]) -> tempfile::NamedTempFile {
     let tmp = tempfile::Builder::new().suffix(".zip").tempfile().unwrap();
     let mut w = zip::ZipWriter::new(std::fs::File::create(tmp.path()).unwrap());
@@ -129,4 +140,36 @@ fn strict_aborts_on_zip_slip() {
     )
     .unwrap_err();
     assert!(matches!(err, Error::PathTraversal(_)));
+}
+
+#[test]
+fn common_root_with_explicit_dir_entry() {
+    use newtua_core::common_root;
+    let entries = vec![
+        e("root", true),
+        e("root/a.txt", false),
+        e("root/b.txt", false),
+    ];
+    assert_eq!(common_root(&entries), Some("root".to_string()));
+}
+
+#[test]
+fn common_root_single_file_is_none() {
+    use newtua_core::common_root;
+    let entries = vec![e("s.txt", false)];
+    assert_eq!(common_root(&entries), None);
+}
+
+#[test]
+fn common_root_single_nested_file() {
+    use newtua_core::common_root;
+    let entries = vec![e("root/a.txt", false)];
+    assert_eq!(common_root(&entries), Some("root".to_string()));
+}
+
+#[test]
+fn common_root_single_bare_dir() {
+    use newtua_core::common_root;
+    let entries = vec![e("root", true)];
+    assert_eq!(common_root(&entries), Some("root".to_string()));
 }

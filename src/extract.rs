@@ -19,28 +19,36 @@ pub struct ExtractReport {
     pub wrapped: bool,
 }
 
-/// Общий верхний каталог всех записей, если он единственный.
+/// The single shared top-level directory of all entries, or None.
 ///
-/// Возвращает `Some(name)` только если все записи начинаются с одного и того же
-/// компонента-директории (т.е. пути содержат хотя бы два компонента).
-/// Одиночные файлы без подкаталога не считаются «общим корнем» — это
-/// соответствует поведению The Unarchiver: такие архивы оборачиваются в папку.
+/// Returns None when entries do not all live under one common top-level
+/// directory — including a single loose file at the archive root (which should
+/// be wrapped). Bare directory entries (e.g. "root/") are recognized as
+/// directory roots, so a normal single-folder archive that includes explicit
+/// directory entries is still detected as having a common root and is NOT
+/// wrapped.
 pub fn common_root(entries: &[Entry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
     let mut root: Option<String> = None;
+    let mut is_dir_root = false;
     for e in entries {
         let mut comps = e.path.components();
-        let first = comps.next()?;
-        // Если путь состоит из единственного компонента — это файл в корне
-        // архива, а не директория-корень. Считаем, что общего корня нет.
-        comps.next()?;
+        let first = comps.next()?; // empty path → no common root
         let comp = first.as_os_str().to_string_lossy().to_string();
         match &root {
             None => root = Some(comp),
-            Some(r) if *r != comp => return None,
+            Some(r) if *r != comp => return None, // more than one top-level item
             _ => {}
         }
+        // The top component is a directory if some entry nests under it,
+        // or an entry is exactly that component and is itself a directory.
+        if comps.next().is_some() || e.is_dir {
+            is_dir_root = true;
+        }
     }
-    root
+    if is_dir_root { root } else { None }
 }
 
 pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &ExtractOptions) -> Result<ExtractReport> {
