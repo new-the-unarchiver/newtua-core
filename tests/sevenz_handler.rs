@@ -3,6 +3,12 @@ use newtua_core::{FormatHandler, OpenOptions, Source};
 
 // Fixture: pre-built 7z archive with one entry "a.txt" = "hello 7z".
 const FIXTURE: &[u8] = include_bytes!("fixtures/hello.7z");
+
+// secret.7z MUST be created with header encryption enabled:
+//   7zz a -ppw -mhe=on secret.7z a.txt
+// Header encryption makes SevenZReader::new fail immediately on a wrong
+// password. Without -mhe=on, sevenz-rust2 may return wrong data instead of
+// an error, which would make the wrong-password test pass silently on bad output.
 const ENC_FIXTURE: &[u8] = include_bytes!("fixtures/secret.7z");
 
 #[test]
