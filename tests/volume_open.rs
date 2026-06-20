@@ -52,7 +52,10 @@ fn split_zip_opens_via_001_suffix() {
     let mut ar = open(&path, &OpenOptions::default()).unwrap();
 
     let entries = ar.entries().unwrap();
-    let names: Vec<_> = entries.iter().map(|e| e.path.to_str().unwrap().to_string()).collect();
+    let names: Vec<_> = entries
+        .iter()
+        .map(|e| e.path.to_str().unwrap().to_string())
+        .collect();
     assert!(
         names.contains(&"a.txt".to_string()),
         "expected a.txt in entries, got: {names:?}"
@@ -63,7 +66,10 @@ fn split_zip_opens_via_001_suffix() {
     );
 
     // Extract entry "a.txt" (index 0) and verify content.
-    let a_idx = entries.iter().position(|e| e.path.to_str() == Some("a.txt")).unwrap();
+    let a_idx = entries
+        .iter()
+        .position(|e| e.path.to_str() == Some("a.txt"))
+        .unwrap();
     let mut out = Vec::new();
     ar.read_entry(a_idx, &mut out).unwrap();
     assert_eq!(out, b"hello from a");
@@ -122,5 +128,8 @@ fn rar_native_multivolume_lists_and_extracts() {
 
     let mut out = Vec::new();
     ar.read_entry(0, &mut out).unwrap();
-    assert_eq!(out, EXPECTED_CONTENT, "extracted bytes differ from original");
+    assert_eq!(
+        out, EXPECTED_CONTENT,
+        "extracted bytes differ from original"
+    );
 }

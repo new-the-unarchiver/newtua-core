@@ -1,10 +1,13 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
-use crate::archive::{ArchiveReader, Confidence, FormatHandler, OpenOptions, Source};
+use crate::archive::{
+    ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
+};
 use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{RarHandler, SevenZHandler, TarHandler, ZipHandler};
+use crate::volume::{ConcatReader, volume_members};
 
 /// Returns the full handler registry in priority order.
 pub fn registry() -> Vec<Box<dyn FormatHandler>> {
@@ -35,15 +38,33 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     None
 }
 
-/// Public entry point: open an archive at `path`.
+/// Wrapper that keeps a reconstructed temp file alive for the lifetime of the
+/// inner reader. When this is dropped, the temp file is deleted automatically.
+struct VolumeBackedReader {
+    inner: Box<dyn ArchiveReader>,
+    /// Keeps the temp file alive (deleted on drop).
+    _temp: tempfile::TempPath,
+}
+
+impl ArchiveReader for VolumeBackedReader {
+    fn format(&self) -> FormatId {
+        self.inner.format()
+    }
+
+    fn entries(&mut self) -> Result<&[Entry]> {
+        self.inner.entries()
+    }
+
+    fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
+        self.inner.read_entry(idx, out)
+    }
+}
+
+/// Internal helper: open a single concrete file path (no volume logic).
 ///
-/// Logic:
-/// 1. Peek the first 512 bytes via a seekable source.
-/// 2. If a compression wrapper is detected (gzip/bzip2/xz), decompress and
-///    hand the raw stream to `TarHandler` (v1 assumes tar inside).
-/// 3. Otherwise, select the handler with the highest `Confidence` from the
-///    registry and delegate to it.
-pub fn open(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
+/// This is the original `open()` body, now callable from both the normal code
+/// path and the volume-reconstruction path.
+fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
     let mut src = Source::path(path)?;
     let header = src.peek_header(512)?;
 
@@ -72,6 +93,51 @@ pub fn open(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
     // Re-open to get a fresh seekable source at position 0.
     let fresh_src = Source::path(path)?;
     handlers.into_iter().nth(idx).unwrap().open(fresh_src, opts)
+}
+
+/// Public entry point: open an archive at `path`.
+///
+/// Logic:
+/// 1. If `path` ends with `.001`, check for sibling volumes (`.002`, etc.).
+///    If more than one member exists, concatenate all members into a temp file
+///    and open the reconstructed archive from the temp path. The temp file is
+///    kept alive via [`VolumeBackedReader`] until the reader is dropped.
+/// 2. Otherwise (or when `.001` has no siblings), open the file directly.
+///    Within direct open:
+///
+///    - If a compression wrapper is detected (gzip/bzip2/xz), decompress and
+///      hand the raw stream to `TarHandler` (v1 assumes tar inside).
+///    - Otherwise, select the handler with the highest `Confidence` from the
+///      registry and delegate to it.
+pub fn open(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
+    // Check for generic raw byte-split volumes (.001/.002/... scheme).
+    let is_first_volume = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".001"));
+
+    if is_first_volume {
+        let members = volume_members(path)?;
+        if members.len() > 1 {
+            // Reconstruct the original archive by concatenating all volumes.
+            let mut tmp = tempfile::NamedTempFile::new()?;
+            {
+                let mut cat = ConcatReader::open(&members)?;
+                std::io::copy(&mut cat, &mut tmp)?;
+            }
+            // Convert to TempPath so the file is deleted when it goes out of scope,
+            // but first persist into a path we can open.
+            let temp_path = tmp.into_temp_path();
+            let inner = open_single(&temp_path, opts)?;
+            return Ok(Box::new(VolumeBackedReader {
+                inner,
+                _temp: temp_path,
+            }));
+        }
+        // Exactly 1 member (the .001 file itself, no siblings) — open normally.
+    }
+
+    open_single(path, opts)
 }
 
 #[cfg(test)]
