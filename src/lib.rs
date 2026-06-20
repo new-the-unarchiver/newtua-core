@@ -1,5 +1,8 @@
 //! newtua-core — движок распаковки архивов.
 
+pub mod error;
+pub use error::{Error, Result};
+
 #[cfg(test)]
 mod smoke {
     #[test]
