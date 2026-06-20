@@ -2,7 +2,7 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::archive::{ArchiveReader, Confidence, FormatHandler, OpenOptions, Source};
-use crate::decompress::{decompressor, Compressor};
+use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{RarHandler, SevenZHandler, TarHandler, ZipHandler};
 
@@ -51,7 +51,10 @@ pub fn open(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
     if let Some(comp) = detect_compressor(&header) {
         let file = std::fs::File::open(path)?;
         let decoded: Box<dyn Read> = decompressor(comp, Box::new(file));
-        let stream = Source::Stream { inner: decoded, path: Some(path.to_path_buf()) };
+        let stream = Source::Stream {
+            inner: decoded,
+            path: Some(path.to_path_buf()),
+        };
         return TarHandler.open(stream, opts);
     }
 
@@ -61,7 +64,7 @@ pub fn open(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
     let mut best: Option<(Confidence, usize)> = None;
     for (i, h) in handlers.iter().enumerate() {
         let c = h.probe(&header, name);
-        if c > Confidence::NONE && best.map_or(true, |(bc, _)| c > bc) {
+        if c > Confidence::NONE && best.is_none_or(|(bc, _)| c > bc) {
             best = Some((c, i));
         }
     }
@@ -77,7 +80,10 @@ mod tests {
 
     #[test]
     fn detects_each_compressor() {
-        assert_eq!(detect_compressor(&[0x1f, 0x8b, 0x08]), Some(Compressor::Gzip));
+        assert_eq!(
+            detect_compressor(&[0x1f, 0x8b, 0x08]),
+            Some(Compressor::Gzip)
+        );
         assert_eq!(detect_compressor(b"BZh9"), Some(Compressor::Bzip2));
         assert_eq!(
             detect_compressor(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]),

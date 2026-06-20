@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::archive::{ArchiveReader, Entry};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::path_safety::safe_join;
 
 pub struct ExtractOptions {
@@ -20,10 +20,19 @@ pub struct ExtractReport {
 }
 
 /// Общий верхний каталог всех записей, если он единственный.
+///
+/// Возвращает `Some(name)` только если все записи начинаются с одного и того же
+/// компонента-директории (т.е. пути содержат хотя бы два компонента).
+/// Одиночные файлы без подкаталога не считаются «общим корнем» — это
+/// соответствует поведению The Unarchiver: такие архивы оборачиваются в папку.
 pub fn common_root(entries: &[Entry]) -> Option<String> {
     let mut root: Option<String> = None;
     for e in entries {
-        let first = e.path.components().next()?;
+        let mut comps = e.path.components();
+        let first = comps.next()?;
+        // Если путь состоит из единственного компонента — это файл в корне
+        // архива, а не директория-корень. Считаем, что общего корня нет.
+        comps.next()?;
         let comp = first.as_os_str().to_string_lossy().to_string();
         match &root {
             None => root = Some(comp),

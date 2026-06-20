@@ -41,7 +41,11 @@ impl ConcatReader {
         if members.is_empty() {
             return Err(Error::MissingVolume("<empty>".into()));
         }
-        Ok(ConcatReader { files: members.to_vec(), idx: 0, current: None })
+        Ok(ConcatReader {
+            files: members.to_vec(),
+            idx: 0,
+            current: None,
+        })
     }
 }
 

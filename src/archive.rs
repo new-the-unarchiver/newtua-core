@@ -5,7 +5,15 @@ use std::time::SystemTime;
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FormatId { Zip, Tar, Gzip, Bzip2, Xz, SevenZ, Rar }
+pub enum FormatId {
+    Zip,
+    Tar,
+    Gzip,
+    Bzip2,
+    Xz,
+    SevenZ,
+    Rar,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Confidence(pub u8);
@@ -33,8 +41,14 @@ pub struct OpenOptions {
 
 /// Источник архива: либо seekable-файл, либо чистый поток.
 pub enum Source {
-    Seekable { inner: Box<dyn ReadSeek>, path: Option<PathBuf> },
-    Stream { inner: Box<dyn Read>, path: Option<PathBuf> },
+    Seekable {
+        inner: Box<dyn ReadSeek>,
+        path: Option<PathBuf>,
+    },
+    Stream {
+        inner: Box<dyn Read>,
+        path: Option<PathBuf>,
+    },
 }
 
 pub trait ReadSeek: Read + Seek {}
@@ -43,7 +57,10 @@ impl<T: Read + Seek> ReadSeek for T {}
 impl Source {
     pub fn path(p: &Path) -> Result<Source> {
         let f = std::fs::File::open(p)?;
-        Ok(Source::Seekable { inner: Box::new(f), path: Some(p.to_path_buf()) })
+        Ok(Source::Seekable {
+            inner: Box::new(f),
+            path: Some(p.to_path_buf()),
+        })
     }
 
     pub fn file_path(&self) -> Option<&Path> {

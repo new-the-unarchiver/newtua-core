@@ -1,6 +1,8 @@
 use std::io::Write;
 
-use crate::archive::{ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source};
+use crate::archive::{
+    ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
+};
 use crate::encoding::decode_names;
 use crate::error::{Error, Result};
 
@@ -28,7 +30,7 @@ impl FormatHandler for ZipHandler {
                 return Err(Error::Unsupported {
                     format: "zip".into(),
                     feature: "streaming (zip requires seek)".into(),
-                })
+                });
             }
         };
         let mut zip = zip::ZipArchive::new(inner).map_err(map_zip_err)?;

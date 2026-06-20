@@ -15,18 +15,18 @@ pub mod path_safety;
 pub use path_safety::safe_join;
 
 pub mod decompress;
-pub use decompress::{decompressor, Compressor};
+pub use decompress::{Compressor, decompressor};
 
 pub mod format;
 
 pub mod volume;
-pub use volume::{volume_members, ConcatReader};
+pub use volume::{ConcatReader, volume_members};
 
 pub mod detect;
 pub use detect::{detect_compressor, open, registry};
 
 pub mod extract;
-pub use extract::{common_root, extract_all, ExtractOptions, ExtractReport};
+pub use extract::{ExtractOptions, ExtractReport, common_root, extract_all};
 
 #[cfg(test)]
 mod smoke {

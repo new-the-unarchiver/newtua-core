@@ -27,7 +27,11 @@ impl FormatHandler for TarHandler {
             Source::Seekable { mut inner, .. } => inner.read_to_end(&mut buf)?,
             Source::Stream { mut inner, .. } => inner.read_to_end(&mut buf)?,
         };
-        let mut reader = TarReader { data: buf, entries: Vec::new(), offsets: Vec::new() };
+        let mut reader = TarReader {
+            data: buf,
+            entries: Vec::new(),
+            offsets: Vec::new(),
+        };
         reader.index(opts)?;
         Ok(Box::new(reader))
     }

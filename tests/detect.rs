@@ -1,4 +1,4 @@
-use newtua_core::{open, OpenOptions};
+use newtua_core::{OpenOptions, open};
 use std::io::Write;
 
 #[test]
@@ -33,7 +33,10 @@ fn opens_tar_gz() {
     gz.write_all(&tar_bytes).unwrap();
     let gz_bytes = gz.finish().unwrap();
 
-    let tmp = tempfile::Builder::new().suffix(".tar.gz").tempfile().unwrap();
+    let tmp = tempfile::Builder::new()
+        .suffix(".tar.gz")
+        .tempfile()
+        .unwrap();
     std::fs::write(tmp.path(), gz_bytes).unwrap();
 
     let mut ar = open(tmp.path(), &OpenOptions::default()).unwrap();

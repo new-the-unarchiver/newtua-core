@@ -38,7 +38,10 @@ mod tests {
         let e = Error::WrongPassword;
         assert!(e.to_string().to_lowercase().contains("password"));
 
-        let e = Error::Unsupported { format: "rar".into(), feature: "solid".into() };
+        let e = Error::Unsupported {
+            format: "rar".into(),
+            feature: "solid".into(),
+        };
         let msg = e.to_string();
         assert!(msg.contains("rar") && msg.contains("solid"));
     }

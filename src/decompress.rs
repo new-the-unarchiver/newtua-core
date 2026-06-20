@@ -48,7 +48,10 @@ mod full {
         let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
         e.write_all(payload).unwrap();
         let compressed = e.finish().unwrap();
-        let mut r = decompressor(Compressor::Bzip2, Box::new(std::io::Cursor::new(compressed)));
+        let mut r = decompressor(
+            Compressor::Bzip2,
+            Box::new(std::io::Cursor::new(compressed)),
+        );
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, payload);
@@ -68,7 +71,10 @@ mod full {
 
     #[test]
     fn corrupt_gzip_errors_on_read() {
-        let mut r = decompressor(Compressor::Gzip, Box::new(std::io::Cursor::new(vec![0xFF; 32])));
+        let mut r = decompressor(
+            Compressor::Gzip,
+            Box::new(std::io::Cursor::new(vec![0xFF; 32])),
+        );
         let mut out = Vec::new();
         assert!(r.read_to_end(&mut out).is_err());
     }

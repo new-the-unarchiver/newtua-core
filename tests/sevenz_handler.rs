@@ -31,7 +31,13 @@ fn wrong_password_errors() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), ENC_FIXTURE).unwrap();
     let src = Source::path(tmp.path()).unwrap();
-    let opts = OpenOptions { password: Some("WRONG".into()), encoding_override: None };
+    let opts = OpenOptions {
+        password: Some("WRONG".into()),
+        encoding_override: None,
+    };
     let res = SevenZHandler.open(src, &opts);
-    assert!(matches!(res, Err(Error::WrongPassword) | Err(Error::Corrupt(_))));
+    assert!(matches!(
+        res,
+        Err(Error::WrongPassword) | Err(Error::Corrupt(_))
+    ));
 }

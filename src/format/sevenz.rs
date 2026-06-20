@@ -1,6 +1,8 @@
 use std::io::Write;
 
-use crate::archive::{ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source};
+use crate::archive::{
+    ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
+};
 use crate::encoding::decode_names;
 use crate::error::{Error, Result};
 
@@ -40,8 +42,7 @@ impl FormatHandler for SevenZHandler {
             None => sevenz_rust2::Password::empty(),
         };
 
-        let mut seven =
-            sevenz_rust2::SevenZReader::new(inner, password).map_err(map_7z_err)?;
+        let mut seven = sevenz_rust2::SevenZReader::new(inner, password).map_err(map_7z_err)?;
 
         let mut raw_names: Vec<Vec<u8>> = Vec::new();
         let mut sizes: Vec<u64> = Vec::new();
@@ -78,7 +79,10 @@ impl FormatHandler for SevenZHandler {
             });
         }
 
-        Ok(Box::new(SevenZReader { entries, data: all_data }))
+        Ok(Box::new(SevenZReader {
+            entries,
+            data: all_data,
+        }))
     }
 }
 

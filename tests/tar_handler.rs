@@ -1,6 +1,5 @@
 use newtua_core::format::TarHandler;
 use newtua_core::{FormatHandler, OpenOptions, Source};
-use std::io::Write;
 
 fn make_tar() -> tempfile::NamedTempFile {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -10,7 +9,9 @@ fn make_tar() -> tempfile::NamedTempFile {
     header.set_size(data.len() as u64);
     header.set_mode(0o644);
     header.set_cksum();
-    builder.append_data(&mut header, "dir/a.txt", &data[..]).unwrap();
+    builder
+        .append_data(&mut header, "dir/a.txt", &data[..])
+        .unwrap();
     builder.finish().unwrap();
     tmp
 }

@@ -45,7 +45,10 @@ fn encrypted_zip_requires_password() {
 fn encrypted_zip_extracts_with_password() {
     let tmp = make_zip(Some("secret"));
     let src = Source::path(tmp.path()).unwrap();
-    let opts = OpenOptions { password: Some("secret".into()), encoding_override: None };
+    let opts = OpenOptions {
+        password: Some("secret".into()),
+        encoding_override: None,
+    };
     let mut ar = ZipHandler.open(src, &opts).unwrap();
     ar.entries().unwrap();
     let mut out = Vec::new();
@@ -57,7 +60,10 @@ fn encrypted_zip_extracts_with_password() {
 fn wrong_password_reported() {
     let tmp = make_zip(Some("secret"));
     let src = Source::path(tmp.path()).unwrap();
-    let opts = OpenOptions { password: Some("WRONG".into()), encoding_override: None };
+    let opts = OpenOptions {
+        password: Some("WRONG".into()),
+        encoding_override: None,
+    };
     let mut ar = ZipHandler.open(src, &opts).unwrap();
     ar.entries().unwrap();
     let mut out = Vec::new();

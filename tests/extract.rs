@@ -1,4 +1,4 @@
-use newtua_core::{extract_all, open, ExtractOptions, OpenOptions};
+use newtua_core::{ExtractOptions, OpenOptions, extract_all, open};
 use std::io::Write;
 
 fn make_zip(entries: &[(&str, &[u8])]) -> tempfile::NamedTempFile {
@@ -18,9 +18,15 @@ fn extracts_files_to_dest() {
     let zip = make_zip(&[("root/a.txt", b"A"), ("root/b.txt", b"B")]);
     let dest = tempfile::tempdir().unwrap();
     let mut ar = open(zip.path(), &OpenOptions::default()).unwrap();
-    let report = extract_all(&mut *ar, &ExtractOptions {
-        dest: dest.path().to_path_buf(), wrapper_name: Some("arc".into()), strict: false,
-    }).unwrap();
+    let report = extract_all(
+        &mut *ar,
+        &ExtractOptions {
+            dest: dest.path().to_path_buf(),
+            wrapper_name: Some("arc".into()),
+            strict: false,
+        },
+    )
+    .unwrap();
     assert_eq!(report.extracted, 2);
     // единый общий корень "root" → без обёртки
     assert!(!report.wrapped);
@@ -33,14 +39,26 @@ fn wraps_when_no_common_root() {
     let zip = make_zip(&[("a.txt", b"A"), ("b.txt", b"B")]);
     let dest = tempfile::tempdir().unwrap();
     let mut ar = open(zip.path(), &OpenOptions::default()).unwrap();
-    let report = extract_all(&mut *ar, &ExtractOptions {
-        dest: dest.path().to_path_buf(), wrapper_name: Some("myarc".into()), strict: false,
-    }).unwrap();
+    let report = extract_all(
+        &mut *ar,
+        &ExtractOptions {
+            dest: dest.path().to_path_buf(),
+            wrapper_name: Some("myarc".into()),
+            strict: false,
+        },
+    )
+    .unwrap();
     assert!(report.wrapped);
     assert_eq!(report.extracted, 2);
     // содержимое внутри обёртки myarc/
-    assert_eq!(std::fs::read(dest.path().join("myarc/a.txt")).unwrap(), b"A");
-    assert_eq!(std::fs::read(dest.path().join("myarc/b.txt")).unwrap(), b"B");
+    assert_eq!(
+        std::fs::read(dest.path().join("myarc/a.txt")).unwrap(),
+        b"A"
+    );
+    assert_eq!(
+        std::fs::read(dest.path().join("myarc/b.txt")).unwrap(),
+        b"B"
+    );
 }
 
 #[test]
@@ -73,9 +91,15 @@ fn zip_slip_entry_is_skipped_in_non_strict() {
     }
     let dest = tempfile::tempdir().unwrap();
     let mut ar = open(tmp.path(), &OpenOptions::default()).unwrap();
-    let report = extract_all(&mut *ar, &ExtractOptions {
-        dest: dest.path().to_path_buf(), wrapper_name: None, strict: false,
-    }).unwrap();
+    let report = extract_all(
+        &mut *ar,
+        &ExtractOptions {
+            dest: dest.path().to_path_buf(),
+            wrapper_name: None,
+            strict: false,
+        },
+    )
+    .unwrap();
     assert_eq!(report.extracted, 0);
     assert_eq!(report.failed.len(), 1);
     // файл за пределами dest не создан
@@ -95,8 +119,14 @@ fn strict_aborts_on_zip_slip() {
     }
     let dest = tempfile::tempdir().unwrap();
     let mut ar = open(tmp.path(), &OpenOptions::default()).unwrap();
-    let err = extract_all(&mut *ar, &ExtractOptions {
-        dest: dest.path().to_path_buf(), wrapper_name: None, strict: true,
-    }).unwrap_err();
+    let err = extract_all(
+        &mut *ar,
+        &ExtractOptions {
+            dest: dest.path().to_path_buf(),
+            wrapper_name: None,
+            strict: true,
+        },
+    )
+    .unwrap_err();
     assert!(matches!(err, Error::PathTraversal(_)));
 }

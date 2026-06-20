@@ -29,10 +29,16 @@ fn wrong_password_errors() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), ENC_FIXTURE).unwrap();
     let src = Source::path(tmp.path()).unwrap();
-    let opts = OpenOptions { password: Some("WRONG".into()), encoding_override: None };
+    let opts = OpenOptions {
+        password: Some("WRONG".into()),
+        encoding_override: None,
+    };
     let mut ar = RarHandler.open(src, &opts).unwrap();
     ar.entries().unwrap();
     let mut out = Vec::new();
     let err = ar.read_entry(0, &mut out).unwrap_err();
-    assert!(matches!(err, Error::WrongPassword | Error::Encrypted | Error::Corrupt(_)));
+    assert!(matches!(
+        err,
+        Error::WrongPassword | Error::Encrypted | Error::Corrupt(_)
+    ));
 }

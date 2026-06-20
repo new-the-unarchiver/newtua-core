@@ -1,7 +1,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::archive::{ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source};
+use crate::archive::{
+    ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
+};
 use crate::encoding::decode_names;
 use crate::error::{Error, Result};
 
@@ -56,24 +58,29 @@ fn list_entries(path: &Path, password: Option<&str>, encoding: Option<&str>) -> 
 
     // The Iterator impl on OpenArchive<List, CursorBeforeHeader> yields Result<FileHeader>.
     // We use it for listing (payloads are skipped automatically).
-    let iter: Box<dyn Iterator<Item = std::result::Result<unrar::FileHeader, unrar::error::UnrarError>>> =
-        if let Some(pw) = password {
-            let open = unrar::Archive::with_password(path, pw)
-                .open_for_listing()
-                .map_err(map_rar_err)?;
-            Box::new(open)
-        } else {
-            let open = unrar::Archive::new(path)
-                .open_for_listing()
-                .map_err(map_rar_err)?;
-            Box::new(open)
-        };
+    let iter: Box<
+        dyn Iterator<Item = std::result::Result<unrar::FileHeader, unrar::error::UnrarError>>,
+    > = if let Some(pw) = password {
+        let open = unrar::Archive::with_password(path, pw)
+            .open_for_listing()
+            .map_err(map_rar_err)?;
+        Box::new(open)
+    } else {
+        let open = unrar::Archive::new(path)
+            .open_for_listing()
+            .map_err(map_rar_err)?;
+        Box::new(open)
+    };
 
     for item in iter {
         let header = item.map_err(map_rar_err)?;
         let raw = header.filename.to_string_lossy().as_bytes().to_vec();
         raw_names.push(raw);
-        metas.push((header.unpacked_size, header.is_directory(), header.is_encrypted()));
+        metas.push((
+            header.unpacked_size,
+            header.is_directory(),
+            header.is_encrypted(),
+        ));
     }
 
     let names = decode_names(&raw_names, encoding);
@@ -151,8 +158,12 @@ impl ArchiveReader for RarReader {
             match header_archive {
                 None => return Err(Error::UnknownFormat),
                 Some(with_file) => {
-                    let raw =
-                        with_file.entry().filename.to_string_lossy().as_bytes().to_vec();
+                    let raw = with_file
+                        .entry()
+                        .filename
+                        .to_string_lossy()
+                        .as_bytes()
+                        .to_vec();
                     if raw == target {
                         // This is our entry — read it into the output.
                         let (data, _next) = with_file.read().map_err(map_rar_err)?;
@@ -174,12 +185,18 @@ mod tests {
 
     #[test]
     fn probe_detects_rar_magic() {
-        assert_eq!(RarHandler.probe(b"Rar!\x1a\x07\x01\x00", None), Confidence::MAGIC);
+        assert_eq!(
+            RarHandler.probe(b"Rar!\x1a\x07\x01\x00", None),
+            Confidence::MAGIC
+        );
     }
 
     #[test]
     fn probe_detects_rar4_magic() {
-        assert_eq!(RarHandler.probe(b"Rar!\x1a\x07\x00", None), Confidence::MAGIC);
+        assert_eq!(
+            RarHandler.probe(b"Rar!\x1a\x07\x00", None),
+            Confidence::MAGIC
+        );
     }
 
     #[test]
