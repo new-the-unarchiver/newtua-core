@@ -25,6 +25,9 @@ pub use volume::{volume_members, ConcatReader};
 pub mod detect;
 pub use detect::{detect_compressor, open, registry};
 
+pub mod extract;
+pub use extract::{common_root, extract_all, ExtractOptions, ExtractReport};
+
 #[cfg(test)]
 mod smoke {
     #[test]
