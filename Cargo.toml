@@ -1,0 +1,21 @@
+[package]
+name = "newtua-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+encoding_rs.workspace = true
+chardetng.workspace = true
+flate2.workspace = true
+bzip2.workspace = true
+xz2.workspace = true
+zip.workspace = true
+tar.workspace = true
+sevenz-rust2.workspace = true
+unrar.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
