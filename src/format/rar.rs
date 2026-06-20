@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::archive::{ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source};
 use crate::encoding::decode_names;
@@ -35,9 +35,10 @@ impl FormatHandler for RarHandler {
         // For data-encrypted RAR archives (common case), listing does not require
         // a password — only extraction does. For header-encrypted archives, we
         // need the password even for listing; try without first, then with.
-        let entries = match list_entries(&path, None) {
+        let encoding = opts.encoding_override.as_deref();
+        let entries = match list_entries(path.as_path(), None, encoding) {
             Ok(e) => e,
-            Err(_) => list_entries(&path, opts.password.as_deref())?,
+            Err(_) => list_entries(path.as_path(), opts.password.as_deref(), encoding)?,
         };
 
         Ok(Box::new(RarReader {
@@ -49,7 +50,7 @@ impl FormatHandler for RarHandler {
 }
 
 /// List all entries in the archive, collecting metadata.
-fn list_entries(path: &PathBuf, password: Option<&str>) -> Result<Vec<Entry>> {
+fn list_entries(path: &Path, password: Option<&str>, encoding: Option<&str>) -> Result<Vec<Entry>> {
     let mut raw_names: Vec<Vec<u8>> = Vec::new();
     let mut metas: Vec<(u64, bool, bool)> = Vec::new();
 
@@ -57,12 +58,12 @@ fn list_entries(path: &PathBuf, password: Option<&str>) -> Result<Vec<Entry>> {
     // We use it for listing (payloads are skipped automatically).
     let iter: Box<dyn Iterator<Item = std::result::Result<unrar::FileHeader, unrar::error::UnrarError>>> =
         if let Some(pw) = password {
-            let open = unrar::Archive::with_password(path.as_path(), pw)
+            let open = unrar::Archive::with_password(path, pw)
                 .open_for_listing()
                 .map_err(map_rar_err)?;
             Box::new(open)
         } else {
-            let open = unrar::Archive::new(path.as_path())
+            let open = unrar::Archive::new(path)
                 .open_for_listing()
                 .map_err(map_rar_err)?;
             Box::new(open)
@@ -75,7 +76,7 @@ fn list_entries(path: &PathBuf, password: Option<&str>) -> Result<Vec<Entry>> {
         metas.push((header.unpacked_size, header.is_directory(), header.is_encrypted()));
     }
 
-    let names = decode_names(&raw_names, None);
+    let names = decode_names(&raw_names, encoding);
     let entries = raw_names
         .into_iter()
         .zip(metas)

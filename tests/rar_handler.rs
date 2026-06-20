@@ -17,6 +17,10 @@ fn lists_and_extracts_rar() {
     assert_eq!(out, b"hello rar");
 }
 
+// secret.rar: self-generated data-encrypted archive, password "pw".
+// Created with: printf 'hello rar' > a.txt && rar a -ppw secret.rar a.txt && rm a.txt
+// (RAR 7.22 no longer supports -ma4; produces RAR5 data-encrypted archive.)
+// The archive lists without a password; extraction with a wrong password errors.
 const ENC_FIXTURE: &[u8] = include_bytes!("fixtures/secret.rar");
 
 #[test]
