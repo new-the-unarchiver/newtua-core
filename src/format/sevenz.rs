@@ -133,8 +133,6 @@ impl ArchiveReader for SevenZReader {
             return Err(Error::InvalidIndex(idx));
         }
 
-        let target_name = self.entries[idx].path_raw.clone();
-
         let password: sevenz_rust2::Password = match self.password.as_deref() {
             Some(pw) => pw.into(),
             None => sevenz_rust2::Password::empty(),
@@ -146,12 +144,16 @@ impl ArchiveReader for SevenZReader {
         let file = File::open(&self.file_path).map_err(Error::Io)?;
         let mut seven = sevenz_rust2::SevenZReader::new(file, password).map_err(map_7z_err)?;
 
+        // Select by POSITION: for_each_entries yields entries in the same order
+        // as archive.files (the same Vec open() built entries from), so a running
+        // counter matches the caller's idx reliably even when two entries share a name.
+        let mut counter: usize = 0;
         let mut found = false;
         let mut extract_err: Option<Error> = None;
 
         seven
-            .for_each_entries(|entry, reader| {
-                if entry.name().as_bytes() == target_name.as_slice() {
+            .for_each_entries(|_entry, reader| {
+                if counter == idx {
                     found = true;
                     // Copy only this entry's payload to out; return false to
                     // stop iteration early (no further decompression occurs).
@@ -164,6 +166,7 @@ impl ArchiveReader for SevenZReader {
                     // still decompresses preceding data (unavoidable for solid
                     // streams), but we do NOT retain it in memory.
                     std::io::copy(reader, &mut std::io::sink())?;
+                    counter += 1;
                     Ok(true)
                 }
             })
