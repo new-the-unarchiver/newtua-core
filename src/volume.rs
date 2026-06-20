@@ -4,24 +4,65 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 
 /// Находит и упорядочивает тома многотомного архива по первому тому.
-pub fn volume_members(_first: &Path) -> Result<Vec<PathBuf>> {
-    todo!()
+pub fn volume_members(first: &Path) -> Result<Vec<PathBuf>> {
+    let name = first.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    // Схема .001/.002...
+    if let Some(stem) = name.strip_suffix(".001") {
+        let dir = first.parent().unwrap_or_else(|| Path::new("."));
+        let mut members = Vec::new();
+        let mut idx = 1u32;
+        loop {
+            let candidate = dir.join(format!("{stem}.{idx:03}"));
+            if candidate.exists() {
+                members.push(candidate);
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+        if members.is_empty() {
+            return Err(Error::MissingVolume(name.to_string()));
+        }
+        return Ok(members);
+    }
+    // Прочие схемы (.partN, .r00) обрабатываются крейтами 7z/rar по первому тому.
+    Ok(vec![first.to_path_buf()])
 }
 
 /// Последовательное чтение нескольких файлов как единого потока.
 pub struct ConcatReader {
-    _files: Vec<PathBuf>,
+    files: Vec<PathBuf>,
+    idx: usize,
+    current: Option<std::fs::File>,
 }
 
 impl ConcatReader {
-    pub fn open(_members: &[PathBuf]) -> Result<ConcatReader> {
-        todo!()
+    pub fn open(members: &[PathBuf]) -> Result<ConcatReader> {
+        if members.is_empty() {
+            return Err(Error::MissingVolume("<empty>".into()));
+        }
+        Ok(ConcatReader { files: members.to_vec(), idx: 0, current: None })
     }
 }
 
 impl Read for ConcatReader {
-    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-        todo!()
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.current.is_none() {
+                if self.idx >= self.files.len() {
+                    return Ok(0);
+                }
+                self.current = Some(std::fs::File::open(&self.files[self.idx])?);
+                self.idx += 1;
+            }
+            let f = self.current.as_mut().unwrap();
+            let n = f.read(buf)?;
+            if n == 0 {
+                self.current = None;
+                continue;
+            }
+            return Ok(n);
+        }
     }
 }
 
