@@ -66,27 +66,19 @@ fn single_gz_non_tar_yields_one_entry() {
     gz.write_all(payload).unwrap();
     let gz_bytes = gz.finish().unwrap();
 
-    // Named "payload.txt.gz" — expected entry name: "payload.txt"
-    let tmp = tempfile::Builder::new()
-        .prefix("payload.txt")
-        .suffix(".gz")
-        .tempfile()
-        .unwrap();
-    std::fs::write(tmp.path(), gz_bytes).unwrap();
+    // Use a temp directory so we can name the file exactly "payload.txt.gz".
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("payload.txt.gz");
+    std::fs::write(&path, gz_bytes).unwrap();
 
-    let mut ar = open(tmp.path(), &OpenOptions::default()).unwrap();
+    let mut ar = open(&path, &OpenOptions::default()).unwrap();
     let entries = ar.entries().unwrap();
     assert_eq!(entries.len(), 1, "expected exactly 1 entry");
 
-    // Entry name must be stem without .gz
     let entry_name = entries[0].path.to_str().unwrap().to_string();
-    assert!(
-        entry_name.ends_with(".txt"),
-        "expected stem ending with .txt, got: {entry_name}"
-    );
-    assert!(
-        !entry_name.ends_with(".gz"),
-        "entry name must not retain .gz, got: {entry_name}"
+    assert_eq!(
+        entry_name, "payload.txt",
+        "unexpected entry name: {entry_name}"
     );
 
     // Extracted bytes must equal the original payload
@@ -104,21 +96,18 @@ fn single_bz2_non_tar_yields_one_entry() {
     enc.write_all(payload).unwrap();
     let bz2_bytes = enc.finish().unwrap();
 
-    let tmp = tempfile::Builder::new()
-        .prefix("notes.txt")
-        .suffix(".bz2")
-        .tempfile()
-        .unwrap();
-    std::fs::write(tmp.path(), bz2_bytes).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notes.txt.bz2");
+    std::fs::write(&path, bz2_bytes).unwrap();
 
-    let mut ar = open(tmp.path(), &OpenOptions::default()).unwrap();
+    let mut ar = open(&path, &OpenOptions::default()).unwrap();
     let entries = ar.entries().unwrap();
     assert_eq!(entries.len(), 1, "expected exactly 1 entry");
 
     let entry_name = entries[0].path.to_str().unwrap().to_string();
-    assert!(
-        !entry_name.ends_with(".bz2"),
-        "entry name must not retain .bz2, got: {entry_name}"
+    assert_eq!(
+        entry_name, "notes.txt",
+        "unexpected entry name: {entry_name}"
     );
 
     let mut out = Vec::new();
@@ -135,21 +124,18 @@ fn single_xz_non_tar_yields_one_entry() {
     enc.write_all(payload).unwrap();
     let xz_bytes = enc.finish().unwrap();
 
-    let tmp = tempfile::Builder::new()
-        .prefix("data.bin")
-        .suffix(".xz")
-        .tempfile()
-        .unwrap();
-    std::fs::write(tmp.path(), xz_bytes).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.bin.xz");
+    std::fs::write(&path, xz_bytes).unwrap();
 
-    let mut ar = open(tmp.path(), &OpenOptions::default()).unwrap();
+    let mut ar = open(&path, &OpenOptions::default()).unwrap();
     let entries = ar.entries().unwrap();
     assert_eq!(entries.len(), 1, "expected exactly 1 entry");
 
     let entry_name = entries[0].path.to_str().unwrap().to_string();
-    assert!(
-        !entry_name.ends_with(".xz"),
-        "entry name must not retain .xz, got: {entry_name}"
+    assert_eq!(
+        entry_name, "data.bin",
+        "unexpected entry name: {entry_name}"
     );
 
     let mut out = Vec::new();
@@ -167,14 +153,11 @@ fn single_gz_out_of_range_index_errors() {
     gz.write_all(payload).unwrap();
     let gz_bytes = gz.finish().unwrap();
 
-    let tmp = tempfile::Builder::new()
-        .prefix("file.txt")
-        .suffix(".gz")
-        .tempfile()
-        .unwrap();
-    std::fs::write(tmp.path(), gz_bytes).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("file.txt.gz");
+    std::fs::write(&path, gz_bytes).unwrap();
 
-    let mut ar = open(tmp.path(), &OpenOptions::default()).unwrap();
+    let mut ar = open(&path, &OpenOptions::default()).unwrap();
     let result = ar.read_entry(1, &mut Vec::new());
     assert!(
         matches!(result, Err(Error::InvalidIndex(1))),

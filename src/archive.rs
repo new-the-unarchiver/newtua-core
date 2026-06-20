@@ -13,6 +13,8 @@ pub enum FormatId {
     Xz,
     SevenZ,
     Rar,
+    /// A single decompressed file (no container format; e.g. plain `.gz`).
+    Raw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

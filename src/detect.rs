@@ -1,5 +1,5 @@
-use std::io::{Read, Write};
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use crate::archive::{
     ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
@@ -38,15 +38,20 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     None
 }
 
-/// Wrapper that keeps a reconstructed temp file alive for the lifetime of the
-/// inner reader. When this is dropped, the temp file is deleted automatically.
-struct VolumeBackedReader {
+// ── TempBackedReader ──────────────────────────────────────────────────────────
+
+/// Generic wrapper that delegates all [`ArchiveReader`] calls to an inner reader
+/// while keeping a temp file alive (and auto-deleted on drop).
+///
+/// Used both for multi-volume reconstruction and for the decompressed temp file
+/// backing a tar-inside-compressed-file.
+struct TempBackedReader {
     inner: Box<dyn ArchiveReader>,
     /// Keeps the temp file alive (deleted on drop).
     _temp: tempfile::TempPath,
 }
 
-impl ArchiveReader for VolumeBackedReader {
+impl ArchiveReader for TempBackedReader {
     fn format(&self) -> FormatId {
         self.inner.format()
     }
@@ -60,6 +65,107 @@ impl ArchiveReader for VolumeBackedReader {
     }
 }
 
+// Keep a type alias so callers in the volume path still compile (was VolumeBackedReader).
+type VolumeBackedReader = TempBackedReader;
+
+// ── SingleFileReader ──────────────────────────────────────────────────────────
+
+/// Reader that presents a single decompressed file as a one-entry archive.
+///
+/// The decompressed content lives in a `NamedTempFile` on disk; streaming is
+/// done via a regular file seek/read so that large files never reside in RAM.
+struct SingleFileReader {
+    entries: Vec<Entry>,
+    /// Path to the temp file on disk; owns the file so it is deleted on drop.
+    temp_path: tempfile::TempPath,
+}
+
+impl SingleFileReader {
+    /// Create a reader from an already-decompressed temp file.
+    ///
+    /// * `original_path` — path of the compressed source file (e.g. `notes.txt.gz`).
+    ///   The compressor extension (`.gz`, `.bz2`, `.xz`) is stripped to derive the
+    ///   entry name.
+    /// * `tmp` — the `NamedTempFile` holding the decompressed payload.
+    /// * `size` — decompressed byte count.
+    fn new(original_path: &Path, tmp: tempfile::NamedTempFile, size: u64) -> Self {
+        let entry_name = stem_without_compressor_ext(original_path);
+        let path_raw = entry_name.as_bytes().to_vec();
+        let entry = Entry {
+            path_raw,
+            path: PathBuf::from(&entry_name),
+            size,
+            is_dir: false,
+            is_encrypted: false,
+            modified: None,
+        };
+        SingleFileReader {
+            entries: vec![entry],
+            temp_path: tmp.into_temp_path(),
+        }
+    }
+}
+
+impl ArchiveReader for SingleFileReader {
+    fn format(&self) -> FormatId {
+        FormatId::Raw
+    }
+
+    fn entries(&mut self) -> Result<&[Entry]> {
+        Ok(&self.entries)
+    }
+
+    fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
+        if idx != 0 {
+            return Err(Error::InvalidIndex(idx));
+        }
+        let mut file = std::fs::File::open(&self.temp_path)?;
+        file.seek(SeekFrom::Start(0))?;
+        std::io::copy(&mut file, out)?;
+        Ok(())
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Strip the outermost compressor extension from a path's file name.
+///
+/// Examples:
+/// - `notes.txt.gz`  → `"notes.txt"`
+/// - `data.gz`       → `"data"`
+/// - `archive.tar.bz2` → `"archive.tar"`
+/// - `file.xz`       → `"file"`
+fn stem_without_compressor_ext(path: &Path) -> String {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
+
+    for ext in &[".gz", ".bz2", ".xz"] {
+        if let Some(stem) = name.strip_suffix(ext) {
+            return stem.to_string();
+        }
+    }
+    // No recognised compressor extension — use the full name.
+    name.to_string()
+}
+
+/// Check whether the first 263 bytes of a reader contain the tar `ustar` magic
+/// at offset 257. Rewinds the reader to position 0 after the check.
+fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
+    let mut buf = [0u8; 263];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    reader.seek(SeekFrom::Start(0))?;
+    Ok(filled >= 263 && &buf[257..262] == b"ustar")
+}
+
+// ── open_single ───────────────────────────────────────────────────────────────
+
 /// Internal helper: open a single concrete file path (no volume logic).
 ///
 /// This is the original `open()` body, now callable from both the normal code
@@ -68,15 +174,32 @@ fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>
     let mut src = Source::path(path)?;
     let header = src.peek_header(512)?;
 
-    // Compression layer: decompress and hand off to TarHandler.
+    // Compression layer.
     if let Some(comp) = detect_compressor(&header) {
+        // Step 1: decompress to a temp file via streaming io::copy (no RAM spike).
         let file = std::fs::File::open(path)?;
-        let decoded: Box<dyn Read> = decompressor(comp, Box::new(file));
-        let stream = Source::Stream {
-            inner: decoded,
-            path: Some(path.to_path_buf()),
-        };
-        return TarHandler.open(stream, opts);
+        let mut decoded: Box<dyn Read> = decompressor(comp, Box::new(file));
+        let mut tmp = tempfile::NamedTempFile::new()?;
+        let size = std::io::copy(&mut decoded, &mut tmp)?;
+
+        // Step 2: peek the decompressed content for the tar ustar magic.
+        // The io::copy above left the file cursor at the end; rewind first.
+        tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+        let tar_detected = is_tar(tmp.as_file_mut())?;
+
+        if tar_detected {
+            // Open the temp file as a seekable tar archive.
+            let temp_path = tmp.into_temp_path();
+            let tar_src = Source::path(&temp_path)?;
+            let inner = TarHandler.open(tar_src, opts)?;
+            return Ok(Box::new(TempBackedReader {
+                inner,
+                _temp: temp_path,
+            }));
+        } else {
+            // Plain compressed file — present as one entry.
+            return Ok(Box::new(SingleFileReader::new(path, tmp, size)));
+        }
     }
 
     // Container formats: pick handler with highest probe confidence.
@@ -105,8 +228,12 @@ fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>
 /// 2. Otherwise (or when `.001` has no siblings), open the file directly.
 ///    Within direct open:
 ///
-///    - If a compression wrapper is detected (gzip/bzip2/xz), decompress and
-///      hand the raw stream to `TarHandler` (v1 assumes tar inside).
+///    - If a compression wrapper is detected (gzip/bzip2/xz), decompress to a
+///      temp file, then peek for tar magic at offset 257:
+///      - If tar → open as tar (file-backed via temp), wrapped so the temp file
+///        outlives the reader.
+///      - If not tar → return a [`SingleFileReader`] with one entry whose name
+///        is the original file name with the compressor extension stripped.
 ///    - Otherwise, select the handler with the highest `Confidence` from the
 ///      registry and delegate to it.
 pub fn open(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
@@ -168,5 +295,34 @@ mod tests {
     #[test]
     fn registry_has_four_handlers() {
         assert_eq!(registry().len(), 4);
+    }
+
+    #[test]
+    fn stem_strips_gz() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/tmp/notes.txt.gz")),
+            "notes.txt"
+        );
+    }
+
+    #[test]
+    fn stem_strips_bz2() {
+        assert_eq!(stem_without_compressor_ext(Path::new("data.bz2")), "data");
+    }
+
+    #[test]
+    fn stem_strips_xz() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/path/to/archive.tar.xz")),
+            "archive.tar"
+        );
+    }
+
+    #[test]
+    fn stem_no_compressor_ext_unchanged() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("file.zip")),
+            "file.zip"
+        );
     }
 }
