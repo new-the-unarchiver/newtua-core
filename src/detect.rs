@@ -111,10 +111,12 @@ fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>
 ///      registry and delegate to it.
 pub fn open(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
     // Check for generic raw byte-split volumes (.001/.002/... scheme).
+    // The comparison is case-insensitive so that e.g. `ARCHIVE.ZIP.001` is
+    // also handled correctly on case-sensitive file systems.
     let is_first_volume = path
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(".001"));
+        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".001"));
 
     if is_first_volume {
         let members = volume_members(path)?;

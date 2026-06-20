@@ -98,18 +98,15 @@ const RAR_PART2: &[u8] = include_bytes!("fixtures/mv.part2.rar");
 const RAR_PART3: &[u8] = include_bytes!("fixtures/mv.part3.rar");
 const EXPECTED_CONTENT: &[u8] = include_bytes!("fixtures/mv_content.txt");
 
-// RED: unrar crate 0.5.8 crashes (SIGABRT / null-ptr UB) when read_entry()
-// crosses a volume boundary. The listing succeeds but extraction aborts.
-// Tracked as: unrar crate limitation — multi-volume processing is unsupported.
-// This test is marked #[ignore] to prevent the SIGABRT from killing the whole
-// test binary. Once the unrar crate is updated or worked around, re-enable.
+/// Listing a native multi-volume RAR must succeed and return the correct entry
+/// metadata.  The unrar 0.5.8 library is able to list without crossing volume
+/// boundaries, so this should not crash.
 #[test]
-#[ignore = "unrar 0.5.8 crashes (SIGABRT) on cross-volume extraction — tracked as RAR-MV-UB"]
-fn rar_native_multivolume_lists_and_extracts() {
+fn rar_native_multivolume_listing_works() {
     let dir = tempfile::tempdir().unwrap();
 
     // Write all three volumes into the same temp dir so the unrar library
-    // can locate siblings by scanning next to the first volume path.
+    // can locate siblings when it scans next to the first volume path.
     std::fs::write(dir.path().join("mv.part1.rar"), RAR_PART1).unwrap();
     std::fs::write(dir.path().join("mv.part2.rar"), RAR_PART2).unwrap();
     std::fs::write(dir.path().join("mv.part3.rar"), RAR_PART3).unwrap();
@@ -124,12 +121,41 @@ fn rar_native_multivolume_lists_and_extracts() {
         "content.txt",
         "unexpected entry name"
     );
-    assert_eq!(entries[0].size, EXPECTED_CONTENT.len() as u64);
-
-    let mut out = Vec::new();
-    ar.read_entry(0, &mut out).unwrap();
     assert_eq!(
-        out, EXPECTED_CONTENT,
-        "extracted bytes differ from original"
+        entries[0].size,
+        EXPECTED_CONTENT.len() as u64,
+        "entry size should match original"
+    );
+}
+
+/// Extraction from a native multi-volume RAR must return
+/// `Error::Unsupported { feature: "multi-volume extraction" }` rather than
+/// crashing the process (the unrar 0.5.8 C library SIGABRTs on cross-volume
+/// reads; we guard against this before invoking the native read).
+#[test]
+fn rar_native_multivolume_extraction_returns_unsupported() {
+    use newtua_core::Error;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mv.part1.rar"), RAR_PART1).unwrap();
+    std::fs::write(dir.path().join("mv.part2.rar"), RAR_PART2).unwrap();
+    std::fs::write(dir.path().join("mv.part3.rar"), RAR_PART3).unwrap();
+
+    let part1 = dir.path().join("mv.part1.rar");
+    let mut ar = open(&part1, &OpenOptions::default()).unwrap();
+
+    // Listing must succeed first (it is a prerequisite for read_entry).
+    let entries = ar.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+
+    // Extraction must return a clean Unsupported error — NOT crash.
+    let mut out = Vec::new();
+    let err = ar.read_entry(0, &mut out).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Unsupported { ref feature, .. } if feature == "multi-volume extraction"
+        ),
+        "expected Unsupported(multi-volume extraction), got: {err:?}"
     );
 }

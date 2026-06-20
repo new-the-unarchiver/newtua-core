@@ -38,8 +38,8 @@ impl FormatHandler for RarHandler {
         // a password — only extraction does. For header-encrypted archives, we
         // need the password even for listing; try without first, then with.
         let encoding = opts.encoding_override.as_deref();
-        let entries = match list_entries(path.as_path(), None, encoding) {
-            Ok(e) => e,
+        let (entries, is_multivolume) = match list_entries(path.as_path(), None, encoding) {
+            Ok(r) => r,
             Err(_) => list_entries(path.as_path(), opts.password.as_deref(), encoding)?,
         };
 
@@ -47,29 +47,45 @@ impl FormatHandler for RarHandler {
             path,
             password: opts.password.clone(),
             entries,
+            is_multivolume,
         }))
     }
 }
 
 /// List all entries in the archive, collecting metadata.
-fn list_entries(path: &Path, password: Option<&str>, encoding: Option<&str>) -> Result<Vec<Entry>> {
+///
+/// Returns `(entries, is_multivolume)`.  `is_multivolume` is `true` when the
+/// archive header reports that this file is the first (or a subsequent) volume
+/// in a multi-part RAR set, as indicated by `VolumeInfo::First` /
+/// `VolumeInfo::Subsequent` from the unrar crate.
+fn list_entries(
+    path: &Path,
+    password: Option<&str>,
+    encoding: Option<&str>,
+) -> Result<(Vec<Entry>, bool)> {
     let mut raw_names: Vec<Vec<u8>> = Vec::new();
     let mut metas: Vec<(u64, bool, bool)> = Vec::new();
 
     // The Iterator impl on OpenArchive<List, CursorBeforeHeader> yields Result<FileHeader>.
     // We use it for listing (payloads are skipped automatically).
-    let iter: Box<
-        dyn Iterator<Item = std::result::Result<unrar::FileHeader, unrar::error::UnrarError>>,
-    > = if let Some(pw) = password {
+    //
+    // We also read `volume_info()` from the opened archive before consuming it
+    // as an iterator, so we can detect multi-volume sets without filename sniffing.
+    let (is_multivolume, iter): (
+        bool,
+        Box<dyn Iterator<Item = std::result::Result<unrar::FileHeader, unrar::error::UnrarError>>>,
+    ) = if let Some(pw) = password {
         let open = unrar::Archive::with_password(path, pw)
             .open_for_listing()
             .map_err(map_rar_err)?;
-        Box::new(open)
+        let mv = open.volume_info() != unrar::VolumeInfo::None;
+        (mv, Box::new(open))
     } else {
         let open = unrar::Archive::new(path)
             .open_for_listing()
             .map_err(map_rar_err)?;
-        Box::new(open)
+        let mv = open.volume_info() != unrar::VolumeInfo::None;
+        (mv, Box::new(open))
     };
 
     for item in iter {
@@ -98,7 +114,7 @@ fn list_entries(path: &Path, password: Option<&str>, encoding: Option<&str>) -> 
         })
         .collect();
 
-    Ok(entries)
+    Ok((entries, is_multivolume))
 }
 
 fn map_rar_err(e: unrar::error::UnrarError) -> Error {
@@ -114,6 +130,11 @@ struct RarReader {
     path: PathBuf,
     password: Option<String>,
     entries: Vec<Entry>,
+    /// True when the opened file is the first or a subsequent volume in a
+    /// multi-part RAR set.  Extraction is not supported in that case because
+    /// the unrar 0.5.8 C library aborts (SIGABRT) when `read()` crosses a
+    /// volume boundary.
+    is_multivolume: bool,
 }
 
 impl ArchiveReader for RarReader {
@@ -126,6 +147,16 @@ impl ArchiveReader for RarReader {
     }
 
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
+        // Guard: the unrar 0.5.8 C library calls abort() (SIGABRT) when
+        // process_file crosses a volume boundary.  Return a clean error
+        // instead of letting the library crash the host process.
+        if self.is_multivolume {
+            return Err(Error::Unsupported {
+                format: "rar".into(),
+                feature: "multi-volume extraction".into(),
+            });
+        }
+
         let target = self
             .entries
             .get(idx)
