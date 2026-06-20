@@ -131,9 +131,10 @@ struct RarReader {
     password: Option<String>,
     entries: Vec<Entry>,
     /// True when the opened file is the first or a subsequent volume in a
-    /// multi-part RAR set.  Extraction is not supported in that case because
-    /// the unrar 0.5.8 C library aborts (SIGABRT) when `read()` crosses a
-    /// volume boundary.
+    /// multi-part RAR set.  Multi-volume entries are extracted via
+    /// `read_entry_via_extract` (libunrar RAR_EXTRACT mode, which follows
+    /// volume continuations by path) instead of the in-memory `read()` fast
+    /// path used for single-volume archives.
     is_multivolume: bool,
 }
 
