@@ -128,14 +128,17 @@ fn rar_native_multivolume_listing_works() {
     );
 }
 
-/// Extraction from a native multi-volume RAR must return
-/// `Error::Unsupported { feature: "multi-volume extraction" }` rather than
-/// crashing the process (the unrar 0.5.8 C library SIGABRTs on cross-volume
-/// reads; we guard against this before invoking the native read).
+/// Extraction from a native multi-volume RAR must succeed and yield bytes
+/// that exactly match the original content file.
+///
+/// Implementation note: the unrar 0.5.8 crate's in-memory `read()` API
+/// (RAR_TEST mode) SIGABRTs when the payload crosses a volume boundary.
+/// The fix uses `extract_to(temp_file)` (RAR_EXTRACT mode) instead, which
+/// correctly follows the volume continuation chain via libunrar's native
+/// disk-based path.  All volume parts must exist in the same directory as
+/// part1 so that libunrar can locate them automatically.
 #[test]
-fn rar_native_multivolume_extraction_returns_unsupported() {
-    use newtua_core::Error;
-
+fn rar_native_multivolume_extraction_works() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("mv.part1.rar"), RAR_PART1).unwrap();
     std::fs::write(dir.path().join("mv.part2.rar"), RAR_PART2).unwrap();
@@ -144,18 +147,16 @@ fn rar_native_multivolume_extraction_returns_unsupported() {
     let part1 = dir.path().join("mv.part1.rar");
     let mut ar = open(&part1, &OpenOptions::default()).unwrap();
 
-    // Listing must succeed first (it is a prerequisite for read_entry).
+    // Listing must succeed first.
     let entries = ar.entries().unwrap();
-    assert_eq!(entries.len(), 1);
+    assert_eq!(entries.len(), 1, "expected 1 entry across volumes");
 
-    // Extraction must return a clean Unsupported error — NOT crash.
+    // Extraction must yield bytes identical to the original content.
     let mut out = Vec::new();
-    let err = ar.read_entry(0, &mut out).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            Error::Unsupported { ref feature, .. } if feature == "multi-volume extraction"
-        ),
-        "expected Unsupported(multi-volume extraction), got: {err:?}"
+    ar.read_entry(0, &mut out)
+        .expect("multi-volume extraction must not fail");
+    assert_eq!(
+        out, EXPECTED_CONTENT,
+        "extracted bytes must match original content"
     );
 }

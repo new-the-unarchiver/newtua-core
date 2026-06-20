@@ -147,16 +147,6 @@ impl ArchiveReader for RarReader {
     }
 
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
-        // Guard: the unrar 0.5.8 C library calls abort() (SIGABRT) when
-        // process_file crosses a volume boundary.  Return a clean error
-        // instead of letting the library crash the host process.
-        if self.is_multivolume {
-            return Err(Error::Unsupported {
-                format: "rar".into(),
-                feature: "multi-volume extraction".into(),
-            });
-        }
-
         let target = self
             .entries
             .get(idx)
@@ -164,8 +154,22 @@ impl ArchiveReader for RarReader {
             .path_raw
             .clone();
 
-        // Re-open the archive in Process mode to read the target entry.
-        // We scan sequentially and skip entries until we find the target.
+        if self.is_multivolume {
+            // For multi-volume RAR archives the unrar 0.5.8 crate's in-memory
+            // `read()` API (which uses RAR_TEST mode internally) SIGABRTs when
+            // the payload crosses a volume boundary.  The `extract_to` API
+            // (RAR_EXTRACT mode, writes to disk) correctly follows the volume
+            // continuation chain — libunrar locates the next volumes by path,
+            // calling the UCM_CHANGEVOLUMEW callback with RAR_VOL_NOTIFY (found)
+            // rather than RAR_VOL_ASK (missing), so no abort occurs.
+            //
+            // Strategy: open the archive in Process mode, iterate headers
+            // sequentially (skip non-targets), and for the target entry call
+            // `extract_to(temp_file)`.  Then stream the temp file into `out`.
+            return self.read_entry_via_extract(idx, &target, out);
+        }
+
+        // Single-volume fast path: in-memory read via the unrar crate.
         let password = self.password.as_deref();
 
         macro_rules! open_proc {
@@ -207,6 +211,92 @@ impl ArchiveReader for RarReader {
                 }
             }
         }
+    }
+}
+
+impl RarReader {
+    /// Multi-volume extraction path: extract the target entry to a temporary
+    /// file on disk, then stream that file into `out`.
+    ///
+    /// Using `extract_to` (RAR_EXTRACT mode) instead of `read()` (RAR_TEST
+    /// mode) is required for multi-volume archives because libunrar must write
+    /// through its normal extraction path for volume continuation to work
+    /// correctly.  The next-volume files must exist on disk in the same
+    /// directory as `self.path`.
+    fn read_entry_via_extract(&self, idx: usize, target: &[u8], out: &mut dyn Write) -> Result<()> {
+        use std::io::Read as _;
+
+        // Create a temp file to receive the extracted bytes.
+        let tmp = tempfile::NamedTempFile::new().map_err(Error::Io)?;
+        let tmp_path = tmp.path().to_path_buf();
+        // We must close/drop the NamedTempFile handle so that the OS allows
+        // libunrar to write to the same path (important on Windows; on macOS
+        // both handles can coexist, but keeping it explicit is cleaner).
+        // We keep the path around to read back and then remove.
+        drop(tmp);
+
+        let password = self.password.as_deref();
+
+        let mut archive = if let Some(pw) = password {
+            unrar::Archive::with_password(self.path.as_path(), pw)
+                .open_for_processing()
+                .map_err(map_rar_err)?
+        } else {
+            unrar::Archive::new(self.path.as_path())
+                .open_for_processing()
+                .map_err(map_rar_err)?
+        };
+
+        let mut found = false;
+        loop {
+            let header_archive = archive.read_header().map_err(map_rar_err)?;
+            match header_archive {
+                None => {
+                    if !found {
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Err(Error::InvalidIndex(idx));
+                    }
+                    break;
+                }
+                Some(with_file) => {
+                    let raw = with_file
+                        .entry()
+                        .filename
+                        .to_string_lossy()
+                        .as_bytes()
+                        .to_vec();
+                    if raw == target {
+                        // Extract to the temp file on disk.
+                        let _next = with_file.extract_to(&tmp_path).map_err(map_rar_err)?;
+                        found = true;
+                        // The archive might have more entries but we are done.
+                        break;
+                    } else {
+                        archive = with_file.skip().map_err(map_rar_err)?;
+                    }
+                }
+            }
+        }
+
+        if !found {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(Error::InvalidIndex(idx));
+        }
+
+        // Stream the extracted temp file into `out`.
+        let mut f = std::fs::File::open(&tmp_path).map_err(Error::Io)?;
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = f.read(&mut buf).map_err(Error::Io)?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n])?;
+        }
+        drop(f);
+        let _ = std::fs::remove_file(&tmp_path);
+
+        Ok(())
     }
 }
 
