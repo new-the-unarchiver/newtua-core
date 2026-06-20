@@ -27,6 +27,9 @@ pub enum Error {
 
     #[error("missing volume for multi-part archive: {0}")]
     MissingVolume(String),
+
+    #[error("internal: entry index out of range: {0}")]
+    InvalidIndex(usize),
 }
 
 #[cfg(test)]
@@ -68,5 +71,13 @@ mod edge {
     fn path_traversal_carries_offending_path() {
         let e = Error::PathTraversal("../../etc/passwd".into());
         assert!(e.to_string().contains("../../etc/passwd"));
+    }
+
+    #[test]
+    fn invalid_index_display_contains_index_and_number() {
+        let e = Error::InvalidIndex(7);
+        let msg = e.to_string();
+        assert!(msg.contains("7"), "expected '7' in: {msg}");
+        assert!(msg.contains("index"), "expected 'index' in: {msg}");
     }
 }

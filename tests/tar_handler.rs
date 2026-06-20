@@ -1,3 +1,4 @@
+use newtua_core::error::Error;
 use newtua_core::format::TarHandler;
 use newtua_core::{FormatHandler, OpenOptions, Source};
 
@@ -38,6 +39,21 @@ fn extracts_tar_entry_bytes() {
     let mut out = Vec::new();
     ar.read_entry(0, &mut out).unwrap();
     assert_eq!(out, b"hello tar");
+}
+
+#[test]
+fn read_entry_out_of_range_returns_invalid_index() {
+    let tmp = make_tar();
+    let h = TarHandler;
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = h.open(src, &OpenOptions::default()).unwrap();
+    ar.entries().unwrap();
+    let mut sink = Vec::new();
+    let err = ar.read_entry(999, &mut sink).unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidIndex(_)),
+        "expected InvalidIndex, got: {err}"
+    );
 }
 
 #[test]

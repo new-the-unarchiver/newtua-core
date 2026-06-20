@@ -90,7 +90,7 @@ impl ArchiveReader for TarReader {
     }
 
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
-        let entry = self.entries.get(idx).ok_or(Error::UnknownFormat)?;
+        let entry = self.entries.get(idx).ok_or(Error::InvalidIndex(idx))?;
         let start = self.offsets[idx] as usize;
         let end = start + entry.size as usize;
         out.write_all(&self.data[start..end])?;

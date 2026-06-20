@@ -111,7 +111,7 @@ impl ArchiveReader for SevenZReader {
     }
 
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
-        let data = self.data.get(idx).ok_or(Error::UnknownFormat)?;
+        let data = self.data.get(idx).ok_or(Error::InvalidIndex(idx))?;
         out.write_all(data)?;
         Ok(())
     }

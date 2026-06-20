@@ -135,7 +135,7 @@ impl ArchiveReader for ZipReader {
         let is_encrypted = self
             .entries
             .get(idx)
-            .ok_or(Error::UnknownFormat)?
+            .ok_or(Error::InvalidIndex(idx))?
             .is_encrypted;
         if is_encrypted {
             let pw = self.password.clone().ok_or(Error::Encrypted)?;

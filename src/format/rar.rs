@@ -129,7 +129,7 @@ impl ArchiveReader for RarReader {
         let target = self
             .entries
             .get(idx)
-            .ok_or(Error::UnknownFormat)?
+            .ok_or(Error::InvalidIndex(idx))?
             .path_raw
             .clone();
 
@@ -156,7 +156,7 @@ impl ArchiveReader for RarReader {
         loop {
             let header_archive = archive.read_header().map_err(map_rar_err)?;
             match header_archive {
-                None => return Err(Error::UnknownFormat),
+                None => return Err(Error::InvalidIndex(idx)),
                 Some(with_file) => {
                     let raw = with_file
                         .entry()
