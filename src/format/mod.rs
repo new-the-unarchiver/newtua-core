@@ -6,3 +6,6 @@ pub use zip::ZipHandler;
 
 pub mod sevenz;
 pub use sevenz::SevenZHandler;
+
+pub mod rar;
+pub use rar::RarHandler;
