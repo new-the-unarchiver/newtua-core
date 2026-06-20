@@ -5,7 +5,7 @@ pub use error::{Error, Result};
 
 pub mod archive;
 pub use archive::{
-    ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
+    ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, ReadSeek, Source,
 };
 
 #[cfg(test)]
