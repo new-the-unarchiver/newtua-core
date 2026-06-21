@@ -113,8 +113,8 @@ fn sevenz_populates_mode_when_available() {
     assert_eq!(f.mode, Some(0o755));
 }
 
-/// Verifies that the symlink entry in symlink.7z has its target populated.
-/// Currently fails because the 7z handler sets `target: PathBuf::new()` (RED).
+/// Verifies that the symlink entry in symlink.7z has its target populated at
+/// listing time (open() reads the symlink content and sets the real target).
 #[cfg(unix)]
 #[test]
 fn sevenz_symlink_target_populated() {
@@ -137,9 +137,8 @@ fn sevenz_symlink_target_populated() {
     );
 }
 
-/// Verifies that extracting symlink.7z creates a real symlink on disk pointing
-/// to "target.txt". Currently fails because the empty target causes broken
-/// extraction (RED).
+/// Verifies that extracting symlink.7z creates a real on-disk symlink pointing
+/// to "target.txt" (end-to-end: open -> entries -> extract_all -> read_link).
 #[cfg(unix)]
 #[test]
 fn sevenz_symlink_extracted_correctly() {

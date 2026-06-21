@@ -242,28 +242,45 @@ fn restores_unix_mode_and_symlink() {
         let mut b = tar::Builder::new(std::fs::File::create(tmp.path()).unwrap());
         let data = b"#!/bin/sh\n";
         let mut h = tar::Header::new_gnu();
-        h.set_size(data.len() as u64); h.set_mode(0o755);
-        h.set_entry_type(tar::EntryType::Regular); h.set_cksum();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o755);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_cksum();
         b.append_data(&mut h, "top/exec.sh", &data[..]).unwrap();
         let mut hs = tar::Header::new_gnu();
-        hs.set_size(0); hs.set_entry_type(tar::EntryType::Symlink); hs.set_mode(0o777);
+        hs.set_size(0);
+        hs.set_entry_type(tar::EntryType::Symlink);
+        hs.set_mode(0o777);
         b.append_link(&mut hs, "top/link", "exec.sh").unwrap();
         b.finish().unwrap();
     }
     let dest = tempfile::tempdir().unwrap();
     let mut ar = newtua_core::open(tmp.path(), &newtua_core::OpenOptions::default()).unwrap();
-    let report = newtua_core::extract_all(&mut *ar, &newtua_core::ExtractOptions {
-        dest: dest.path().to_path_buf(), wrapper_name: None, strict: false, preserve: true,
-    }).unwrap();
+    let report = newtua_core::extract_all(
+        &mut *ar,
+        &newtua_core::ExtractOptions {
+            dest: dest.path().to_path_buf(),
+            wrapper_name: None,
+            strict: false,
+            preserve: true,
+        },
+    )
+    .unwrap();
     assert!(report.failed.is_empty());
 
-    let mode = std::fs::metadata(dest.path().join("top/exec.sh")).unwrap().permissions().mode();
+    let mode = std::fs::metadata(dest.path().join("top/exec.sh"))
+        .unwrap()
+        .permissions()
+        .mode();
     assert_eq!(mode & 0o777, 0o755);
 
     let link = dest.path().join("top/link");
     let lmeta = std::fs::symlink_metadata(&link).unwrap();
     assert!(lmeta.file_type().is_symlink());
-    assert_eq!(std::fs::read_link(&link).unwrap(), std::path::PathBuf::from("exec.sh"));
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        std::path::PathBuf::from("exec.sh")
+    );
 }
 
 #[cfg(unix)]
@@ -276,21 +293,37 @@ fn rejects_escaping_symlink() {
     {
         let mut b = tar::Builder::new(std::fs::File::create(tmp.path()).unwrap());
         let mut hs = tar::Header::new_gnu();
-        hs.set_size(0); hs.set_entry_type(tar::EntryType::Symlink); hs.set_mode(0o777);
+        hs.set_size(0);
+        hs.set_entry_type(tar::EntryType::Symlink);
+        hs.set_mode(0o777);
         b.append_link(&mut hs, "evil", "../../etc/passwd").unwrap();
         // second entry so there is content and no single-file wrap surprise
         let mut h = tar::Header::new_gnu();
-        h.set_size(1); h.set_mode(0o644); h.set_cksum();
+        h.set_size(1);
+        h.set_mode(0o644);
+        h.set_cksum();
         b.append_data(&mut h, "ok.txt", &b"x"[..]).unwrap();
         b.finish().unwrap();
     }
     let dest = tempfile::tempdir().unwrap();
     let mut ar = newtua_core::open(tmp.path(), &newtua_core::OpenOptions::default()).unwrap();
-    let report = newtua_core::extract_all(&mut *ar, &newtua_core::ExtractOptions {
-        dest: dest.path().to_path_buf(), wrapper_name: Some("arc".into()), strict: false, preserve: true,
-    }).unwrap();
+    let report = newtua_core::extract_all(
+        &mut *ar,
+        &newtua_core::ExtractOptions {
+            dest: dest.path().to_path_buf(),
+            wrapper_name: Some("arc".into()),
+            strict: false,
+            preserve: true,
+        },
+    )
+    .unwrap();
     // the escaping symlink is recorded as failed and NOT created
-    assert!(report.failed.iter().any(|(p, _)| p.to_str() == Some("evil")));
+    assert!(
+        report
+            .failed
+            .iter()
+            .any(|(p, _)| p.to_str() == Some("evil"))
+    );
     let _ = EntryKind::File; // silence unused import if needed
     assert!(!dest.path().join("arc/evil").exists());
 }
