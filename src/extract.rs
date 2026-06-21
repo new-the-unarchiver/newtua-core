@@ -1,8 +1,19 @@
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use filetime::FileTime;
 
 use crate::archive::{ArchiveReader, Entry};
 use crate::error::Result;
 use crate::path_safety::safe_join;
+
+fn apply_mtime(path: &Path, modified: Option<SystemTime>) {
+    if let Some(t) = modified {
+        let ft = FileTime::from_system_time(t);
+        // best-effort: data is already written, ignore errors
+        let _ = filetime::set_file_mtime(path, ft);
+    }
+}
 
 pub struct ExtractOptions {
     pub dest: PathBuf,
@@ -71,8 +82,12 @@ pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &ExtractOptions) -> Result<
         std::fs::create_dir_all(&dest)?;
     }
 
+    // Collect directory paths + their mtimes for a second pass (writing children
+    // bumps the parent dir mtime, so we apply dir mtimes after all entries).
+    let mut dir_mtimes: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
+
     for (idx, entry) in entries.iter().enumerate() {
-        let result = extract_one(ar, idx, entry, &dest);
+        let result = extract_one(ar, idx, entry, &dest, opts.preserve, &mut dir_mtimes);
         match result {
             Ok(()) => report.extracted += 1,
             Err(e) => {
@@ -83,13 +98,29 @@ pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &ExtractOptions) -> Result<
             }
         }
     }
+
+    // Second pass: restore directory mtimes after all children are written.
+    if opts.preserve {
+        for (path, modified) in &dir_mtimes {
+            apply_mtime(path, *modified);
+        }
+    }
+
     Ok(report)
 }
 
-fn extract_one(ar: &mut dyn ArchiveReader, idx: usize, entry: &Entry, dest: &Path) -> Result<()> {
+fn extract_one(
+    ar: &mut dyn ArchiveReader,
+    idx: usize,
+    entry: &Entry,
+    dest: &Path,
+    preserve: bool,
+    dir_mtimes: &mut Vec<(PathBuf, Option<SystemTime>)>,
+) -> Result<()> {
     let target = safe_join(dest, &entry.path)?;
     if entry.is_dir() {
         std::fs::create_dir_all(&target)?;
+        dir_mtimes.push((target, entry.modified));
         return Ok(());
     }
     if let Some(parent) = target.parent() {
@@ -97,5 +128,8 @@ fn extract_one(ar: &mut dyn ArchiveReader, idx: usize, entry: &Entry, dest: &Pat
     }
     let mut out = std::fs::File::create(&target)?;
     ar.read_entry(idx, &mut out)?;
+    if preserve {
+        apply_mtime(&target, entry.modified);
+    }
     Ok(())
 }

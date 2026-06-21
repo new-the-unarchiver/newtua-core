@@ -208,15 +208,28 @@ fn restores_file_mtime_by_default() {
     }
     let dest = tempfile::tempdir().unwrap();
     let mut ar = newtua_core::open(tmp.path(), &newtua_core::OpenOptions::default()).unwrap();
-    newtua_core::extract_all(&mut *ar, &newtua_core::ExtractOptions {
-        dest: dest.path().to_path_buf(), wrapper_name: None, strict: false, preserve: true,
-    }).unwrap();
+    newtua_core::extract_all(
+        &mut *ar,
+        &newtua_core::ExtractOptions {
+            dest: dest.path().to_path_buf(),
+            wrapper_name: None,
+            strict: false,
+            preserve: true,
+        },
+    )
+    .unwrap();
 
     let meta = std::fs::metadata(dest.path().join("root/a.txt")).unwrap();
     let mtime = meta.modified().unwrap();
     let expected = SystemTime::UNIX_EPOCH + Duration::from_secs(known);
-    let diff = mtime.duration_since(expected).or_else(|_| expected.duration_since(mtime)).unwrap();
-    assert!(diff < Duration::from_secs(2), "mtime not restored: {diff:?}");
+    let diff = mtime
+        .duration_since(expected)
+        .or_else(|_| expected.duration_since(mtime))
+        .unwrap();
+    assert!(
+        diff < Duration::from_secs(2),
+        "mtime not restored: {diff:?}"
+    );
 }
 
 #[test]
@@ -226,19 +239,35 @@ fn no_preserve_skips_mtime() {
     {
         let mut b = tar::Builder::new(std::fs::File::create(tmp.path()).unwrap());
         let mut h = tar::Header::new_gnu();
-        h.set_size(1); h.set_mode(0o644); h.set_mtime(known); h.set_cksum();
+        h.set_size(1);
+        h.set_mode(0o644);
+        h.set_mtime(known);
+        h.set_cksum();
         b.append_data(&mut h, "root/a.txt", &b"x"[..]).unwrap();
         let mut h2 = tar::Header::new_gnu();
-        h2.set_size(1); h2.set_mode(0o644); h2.set_mtime(known); h2.set_cksum();
+        h2.set_size(1);
+        h2.set_mode(0o644);
+        h2.set_mtime(known);
+        h2.set_cksum();
         b.append_data(&mut h2, "root/b.txt", &b"y"[..]).unwrap();
         b.finish().unwrap();
     }
     let dest = tempfile::tempdir().unwrap();
     let mut ar = newtua_core::open(tmp.path(), &newtua_core::OpenOptions::default()).unwrap();
-    newtua_core::extract_all(&mut *ar, &newtua_core::ExtractOptions {
-        dest: dest.path().to_path_buf(), wrapper_name: None, strict: false, preserve: false,
-    }).unwrap();
-    let mtime = std::fs::metadata(dest.path().join("root/a.txt")).unwrap().modified().unwrap();
+    newtua_core::extract_all(
+        &mut *ar,
+        &newtua_core::ExtractOptions {
+            dest: dest.path().to_path_buf(),
+            wrapper_name: None,
+            strict: false,
+            preserve: false,
+        },
+    )
+    .unwrap();
+    let mtime = std::fs::metadata(dest.path().join("root/a.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
     let expected = SystemTime::UNIX_EPOCH + Duration::from_secs(known);
     // With preserve=false the file keeps "now", far from 2020.
     assert!(mtime.duration_since(expected).unwrap() > Duration::from_secs(60 * 60 * 24));
