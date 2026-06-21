@@ -200,3 +200,22 @@ fn multi_entry_on_demand_extraction() {
     ar.read_entry(idx_f1, &mut out1).unwrap();
     assert_eq!(out1, b"first", "f1.txt content mismatch");
 }
+
+// Regression (found by the fuzz harness): a 63-byte 7z with a malformed start
+// header made sevenz-rust2 fall back to a tail-scan recovery and request a
+// ~412 GB allocation, killing the process. Our start-header guard must reject
+// it cleanly. If the guard regresses, this test OOMs/aborts instead of failing.
+const MALFORMED_OOM_FIXTURE: &[u8] = include_bytes!("fixtures/malformed_oom.7z");
+
+#[test]
+fn malformed_header_is_rejected_not_oom() {
+    use newtua_core::Error;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), MALFORMED_OOM_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    match SevenZHandler.open(src, &OpenOptions::default()) {
+        Ok(_) => panic!("malformed 7z must be rejected, not opened"),
+        Err(Error::Corrupt(_)) => {}
+        Err(e) => panic!("expected Corrupt, got {e:?}"),
+    }
+}

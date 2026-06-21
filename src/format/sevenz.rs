@@ -1,6 +1,6 @@
 use std::fs::File;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use crate::archive::{
     ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
@@ -11,6 +11,52 @@ use crate::error::{Error, Result};
 pub struct SevenZHandler;
 
 const SEVENZ_MAGIC: &[u8] = &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
+
+/// Sanity-check the 32-byte 7z signature header before handing the file to
+/// `sevenz-rust2`, which trusts the size/count fields it reads. On a bad start
+/// header the library falls back to a tail-scan recovery that can request an
+/// enormous allocation — a malformed 7z could OOM the whole process (found by
+/// the fuzz harness; see `fuzz/fuzz_targets/fuzz_open.rs`). We reject up front:
+/// a genuine 7z has a correct StartHeaderCRC and a next-header region that fits
+/// inside the file.
+///
+/// LIMITATION: this does not fully close the hole. A crafted 7z with a valid
+/// start header but huge internal varint counts (file/block/coder counts) can
+/// still drive a large allocation inside the dependency. A complete fix belongs
+/// upstream in `sevenz-rust2` (validate every count against the remaining input).
+///
+/// 7z signature header layout (32 bytes):
+///   0..6  magic · 6..8 version · 8..12 StartHeaderCRC (u32 LE)
+///   12..20 NextHeaderOffset (u64 LE) · 20..28 NextHeaderSize (u64 LE)
+///   28..32 NextHeaderCRC (u32 LE).  StartHeaderCRC covers bytes 12..32.
+fn validate_7z_header(path: &Path) -> Result<()> {
+    let mut f = File::open(path).map_err(Error::Io)?;
+    let mut hdr = [0u8; 32];
+    f.read_exact(&mut hdr)
+        .map_err(|_| Error::Corrupt("7z: truncated signature header".into()))?;
+
+    let stored_crc = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+    let mut crc = flate2::Crc::new();
+    crc.update(&hdr[12..32]);
+    if crc.sum() != stored_crc {
+        return Err(Error::Corrupt("7z: bad start-header CRC".into()));
+    }
+
+    let next_off = u64::from_le_bytes(hdr[12..20].try_into().unwrap());
+    let next_size = u64::from_le_bytes(hdr[20..28].try_into().unwrap());
+    let file_len = f.metadata().map_err(Error::Io)?.len();
+    // The next header must lie within the file: 32 + offset + size <= len.
+    let fits = 32u64
+        .checked_add(next_off)
+        .and_then(|x| x.checked_add(next_size))
+        .is_some_and(|end| end <= file_len);
+    if !fits {
+        return Err(Error::Corrupt(
+            "7z: next-header region exceeds file size".into(),
+        ));
+    }
+    Ok(())
+}
 
 impl FormatHandler for SevenZHandler {
     fn id(&self) -> FormatId {
@@ -60,9 +106,11 @@ impl FormatHandler for SevenZHandler {
         // Instead we open the file a second time through the stored path for the
         // header-only read. The original `inner` is dropped here.
         drop(inner);
+        // Reject malformed start headers before the library can OOM on them.
+        validate_7z_header(&file_path)?;
         let mut header_file = File::open(&file_path).map_err(Error::Io)?;
         let archive =
-            sevenz_rust2::Archive::read(&mut header_file, password.as_ref()).map_err(map_7z_err)?;
+            sevenz_rust2::Archive::read(&mut header_file, &password).map_err(map_7z_err)?;
 
         // Build entries from header metadata — no payload decompression occurs.
         let raw_names: Vec<Vec<u8>> = archive
@@ -73,19 +121,19 @@ impl FormatHandler for SevenZHandler {
         let names = decode_names(&raw_names, opts.encoding_override.as_deref());
 
         // Build a per-file encryption lookup: does the file's folder use AES?
-        // archive.stream_map.file_folder_index[i] maps file index → folder index
+        // archive.stream_map.file_block_index[i] maps file index → block index
         // (None for files that have no data stream, e.g. empty dirs).
         // Folders whose coder list contains the AES-256/SHA-256 method ID are
         // considered encrypted regardless of whether a password was supplied.
-        let aes_id = sevenz_rust2::SevenZMethod::ID_AES256SHA256;
+        let aes_id = sevenz_rust2::EncoderMethod::ID_AES256_SHA256;
         let folder_is_encrypted: Vec<bool> = archive
-            .folders
+            .blocks
             .iter()
             .map(|folder| {
                 folder
                     .coders
                     .iter()
-                    .any(|coder| coder.decompression_method_id() == aes_id)
+                    .any(|coder| coder.encoder_method_id() == aes_id)
             })
             .collect();
 
@@ -98,7 +146,7 @@ impl FormatHandler for SevenZHandler {
                 // Resolve per-entry encryption from the folder coder chain.
                 let is_encrypted = archive
                     .stream_map
-                    .file_folder_index
+                    .file_block_index
                     .get(file_idx)
                     .and_then(|&fi| fi)
                     .and_then(|fi| folder_is_encrypted.get(fi))
@@ -154,7 +202,7 @@ impl FormatHandler for SevenZHandler {
 
         // Second pass: populate symlink targets.
         // Symlink content (the link target path) is stored as the entry's payload.
-        // For each symlink we open a SEPARATE SevenZReader, iterate to that entry,
+        // For each symlink we open a SEPARATE ArchiveReader, iterate to that entry,
         // verify the name, read its content, then stop immediately.
         // This avoids decompressing the full archive and avoids assuming iteration order
         // — we verify entry.name() matches our expected path_raw before reading.
@@ -171,7 +219,8 @@ impl FormatHandler for SevenZHandler {
             // Returns the decoded, non-empty target if one was successfully read.
             let target: Option<PathBuf> = (|| -> Option<PathBuf> {
                 let sym_file = File::open(&file_path).ok()?;
-                let mut seven = sevenz_rust2::SevenZReader::new(sym_file, password.clone()).ok()?;
+                let mut seven =
+                    sevenz_rust2::ArchiveReader::new(sym_file, password.clone()).ok()?;
                 let mut counter: usize = 0;
                 let mut target_bytes: Option<Vec<u8>> = None;
 
@@ -273,11 +322,11 @@ impl ArchiveReader for SevenZReader {
             None => sevenz_rust2::Password::empty(),
         };
 
-        // Re-open the archive file for this extraction.  SevenZReader::open()
+        // Re-open the archive file for this extraction.  ArchiveReader::new()
         // re-reads only the header; the actual payload is decompressed lazily
         // by for_each_entries as we iterate.
         let file = File::open(&self.file_path).map_err(Error::Io)?;
-        let mut seven = sevenz_rust2::SevenZReader::new(file, password).map_err(map_7z_err)?;
+        let mut seven = sevenz_rust2::ArchiveReader::new(file, password).map_err(map_7z_err)?;
 
         // Select by POSITION: for_each_entries yields entries in the same order
         // as archive.files (the same Vec open() built entries from), so a running
