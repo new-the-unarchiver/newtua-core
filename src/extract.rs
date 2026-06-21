@@ -130,9 +130,22 @@ pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &mut ExtractOptions) -> Res
     let entries: Vec<Entry> = ar.entries()?.to_vec();
     let mut report = ExtractReport::default();
 
-    // Wrapper folder (The Unarchiver behavior). Computed from immutable reads
-    // BEFORE we mutably borrow `opts.progress` below.
-    let dest = match (common_root(&entries), &opts.wrapper_name) {
+    // Selected subset for wrapper/common-root computation.
+    // Built from immutable reads BEFORE we mutably borrow `opts.progress` below.
+    let selected: Option<std::collections::HashSet<usize>> =
+        opts.selection.as_ref().map(|v| v.iter().copied().collect());
+    let subset: Vec<Entry> = match &selected {
+        Some(set) => entries
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| set.contains(i))
+            .map(|(_, e)| e.clone())
+            .collect(),
+        None => entries.clone(),
+    };
+
+    // Wrapper folder (The Unarchiver behavior). Computed over the selected subset.
+    let dest = match (common_root(&subset), &opts.wrapper_name) {
         (None, Some(name)) => {
             report.wrapped = true;
             opts.dest.join(name)
@@ -148,6 +161,11 @@ pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &mut ExtractOptions) -> Res
     let mut dir_mtimes: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
 
     for (idx, entry) in entries.iter().enumerate() {
+        if let Some(set) = &selected {
+            if !set.contains(&idx) {
+                continue;
+            }
+        }
         // EntryStart (also a cancellation checkpoint for dirs/symlinks).
         if let Some(p) = opts.progress.as_mut() {
             let path = entry.path.to_string_lossy();
