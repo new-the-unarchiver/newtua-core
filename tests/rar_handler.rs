@@ -17,6 +17,31 @@ fn lists_and_extracts_rar() {
     assert_eq!(out, b"hello rar");
 }
 
+// meta.rar: self-generated archive with known unix mode.
+// Created with:
+//   printf 'x' > f.txt && chmod 0755 f.txt
+//   rar a meta.rar f.txt && rm f.txt
+// (RAR 7.22, Host OS: Unix, Attributes: -rwxr-xr-x)
+// file_attr field: unix mode in high 16 bits; (file_attr >> 16) & 0o7777 == 0o755
+const META_FIXTURE: &[u8] = include_bytes!("fixtures/meta.rar");
+
+#[test]
+fn rar_populates_mode_when_available() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), META_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = RarHandler.open(src, &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap().to_vec();
+    let f = entries
+        .iter()
+        .find(|e| e.path.to_str() == Some("f.txt"))
+        .expect("f.txt not found in meta.rar");
+    // The unrar crate exposes file_attr: u32 on FileHeader.
+    // For Unix-created RARs, file_attr >> 16 is the full st_mode; & 0o7777 strips the type bits.
+    // Host OS is not exposed by FileHeader, but file_attr >> 16 != 0 signals unix attributes.
+    assert_eq!(f.mode, Some(0o755));
+}
+
 // secret.rar: self-generated data-encrypted archive, password "pw".
 // Created with: printf 'hello rar' > a.txt && rar a -ppw secret.rar a.txt && rm a.txt
 // (RAR 7.22 no longer supports -ma4; produces RAR5 data-encrypted archive.)
