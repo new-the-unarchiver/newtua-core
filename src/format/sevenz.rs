@@ -104,16 +104,48 @@ impl FormatHandler for SevenZHandler {
                     .and_then(|fi| folder_is_encrypted.get(fi))
                     .copied()
                     .unwrap_or(false);
-                Entry {
-                    path_raw: file.name().as_bytes().to_vec(),
-                    path: std::path::PathBuf::from(name),
-                    kind: if file.is_directory() {
+                // 7z stores Windows FILE_ATTRIBUTE_* in windows_attributes.
+                // Unix tools (including 7zz on macOS/Linux) set bit 15 (0x8000,
+                // FILE_ATTRIBUTE_UNIX_EXTENSION) and place the full st_mode in
+                // the high 16 bits: unix_mode = windows_attributes >> 16.
+                // We extract the permission bits with & 0o7777.
+                const UNIX_EXT_BIT: u32 = 0x8000;
+                const S_IFLNK: u32 = 0o120000;
+                const S_IFMT: u32 = 0o170000;
+
+                let (kind, mode) = if file.has_windows_attributes
+                    && (file.windows_attributes & UNIX_EXT_BIT) != 0
+                {
+                    let unix_mode = file.windows_attributes >> 16;
+                    let perm_bits = unix_mode & 0o7777;
+                    let kind = if file.is_directory() {
+                        EntryKind::Dir
+                    } else if (unix_mode & S_IFMT) == S_IFLNK {
+                        // Symlink target is the entry's content — read on demand.
+                        // We do not decompress here; leave target empty and let
+                        // callers use read_entry() to obtain the target path.
+                        EntryKind::Symlink {
+                            target: std::path::PathBuf::new(),
+                        }
+                    } else {
+                        EntryKind::File
+                    };
+                    (kind, Some(perm_bits))
+                } else {
+                    let kind = if file.is_directory() {
                         EntryKind::Dir
                     } else {
                         EntryKind::File
-                    },
+                    };
+                    (kind, None)
+                };
+
+                Entry {
+                    path_raw: file.name().as_bytes().to_vec(),
+                    path: std::path::PathBuf::from(name),
+                    kind,
                     size: file.size(),
-                    mode: None,
+                    mode,
                     is_encrypted,
                     modified: None,
                 }
