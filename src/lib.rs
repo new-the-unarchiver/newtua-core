@@ -31,6 +31,9 @@ pub use extract::{
     ExtractOptions, ExtractReport, Flow, ProgressEvent, ProgressFn, common_root, extract_all,
 };
 
+pub mod macos;
+pub use macos::is_macos_metadata;
+
 #[cfg(test)]
 mod smoke {
     #[test]

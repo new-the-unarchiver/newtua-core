@@ -44,6 +44,7 @@ fn extracts_files_to_dest() {
             preserve: true,
             selection: None,
             progress: None,
+            keep_macos_metadata: false,
         },
     )
     .unwrap();
@@ -68,6 +69,7 @@ fn wraps_when_no_common_root() {
             preserve: true,
             selection: None,
             progress: None,
+            keep_macos_metadata: false,
         },
     )
     .unwrap();
@@ -123,6 +125,7 @@ fn zip_slip_entry_is_skipped_in_non_strict() {
             preserve: true,
             selection: None,
             progress: None,
+            keep_macos_metadata: false,
         },
     )
     .unwrap();
@@ -154,6 +157,7 @@ fn strict_aborts_on_zip_slip() {
             preserve: true,
             selection: None,
             progress: None,
+            keep_macos_metadata: false,
         },
     )
     .unwrap_err();
@@ -225,6 +229,7 @@ fn restores_file_mtime_by_default() {
             preserve: true,
             selection: None,
             progress: None,
+            keep_macos_metadata: false,
         },
     )
     .unwrap();
@@ -275,6 +280,7 @@ fn restores_unix_mode_and_symlink() {
             preserve: true,
             selection: None,
             progress: None,
+            keep_macos_metadata: false,
         },
     )
     .unwrap();
@@ -328,6 +334,7 @@ fn rejects_escaping_symlink() {
             preserve: true,
             selection: None,
             progress: None,
+            keep_macos_metadata: false,
         },
     )
     .unwrap();
@@ -373,6 +380,7 @@ fn no_preserve_skips_mtime() {
             preserve: false,
             selection: None,
             progress: None,
+            keep_macos_metadata: false,
         },
     )
     .unwrap();

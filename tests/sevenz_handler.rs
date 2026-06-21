@@ -156,6 +156,7 @@ fn sevenz_symlink_extracted_correctly() {
             preserve: false,
             selection: None,
             progress: None,
+            keep_macos_metadata: false,
         },
     )
     .unwrap();

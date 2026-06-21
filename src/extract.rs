@@ -84,6 +84,9 @@ pub struct ExtractOptions {
     pub selection: Option<Vec<usize>>,
     /// Optional progress/cancellation callback.
     pub progress: Option<ProgressFn>,
+    /// Skip macOS sidecar entries (`._*`, `.DS_Store`, `__MACOSX/`).
+    /// Default behavior is to skip (set `false` only via `--keep-macos-metadata`).
+    pub keep_macos_metadata: bool,
 }
 
 #[derive(Debug, Default)]
@@ -134,14 +137,16 @@ pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &mut ExtractOptions) -> Res
     // Built from immutable reads BEFORE we mutably borrow `opts.progress` below.
     let selected: Option<std::collections::HashSet<usize>> =
         opts.selection.as_ref().map(|v| v.iter().copied().collect());
+    let keep_macos = opts.keep_macos_metadata;
+    let is_skipped = |e: &Entry| !keep_macos && crate::is_macos_metadata(&e.path);
     let subset: Vec<Entry> = match &selected {
         Some(set) => entries
             .iter()
             .enumerate()
-            .filter(|(i, _)| set.contains(i))
+            .filter(|(i, e)| set.contains(i) && !is_skipped(e))
             .map(|(_, e)| e.clone())
             .collect(),
-        None => entries.clone(),
+        None => entries.iter().filter(|e| !is_skipped(e)).cloned().collect(),
     };
 
     // Wrapper folder (The Unarchiver behavior). Computed over the selected subset.
@@ -165,6 +170,9 @@ pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &mut ExtractOptions) -> Res
             if !set.contains(&idx) {
                 continue;
             }
+        }
+        if !opts.keep_macos_metadata && crate::is_macos_metadata(&entry.path) {
+            continue;
         }
         // EntryStart (also a cancellation checkpoint for dirs/symlinks).
         if let Some(p) = opts.progress.as_mut() {

@@ -33,6 +33,7 @@ fn progress_reports_bytes_per_entry() {
             }
             Flow::Continue
         })),
+        keep_macos_metadata: false,
     };
     let report = extract_all(&mut *ar, &mut opts).unwrap();
     assert_eq!(report.extracted, 2);
@@ -61,6 +62,7 @@ fn abort_stops_and_marks_report() {
             ProgressEvent::EntryStart { .. } => Flow::Abort,
             _ => Flow::Continue,
         })),
+        keep_macos_metadata: false,
     };
     let report = extract_all(&mut *ar, &mut opts).unwrap();
     assert!(report.aborted);

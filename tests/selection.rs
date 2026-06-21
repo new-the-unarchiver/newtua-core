@@ -30,6 +30,7 @@ fn selection_extracts_only_chosen_indices() {
         preserve: true,
         selection: Some(vec![0, 2]),
         progress: None,
+        keep_macos_metadata: false,
     };
     let report = extract_all(&mut *ar, &mut opts).unwrap();
     assert_eq!(report.extracted, 2);
@@ -50,6 +51,7 @@ fn empty_selection_extracts_nothing() {
         preserve: true,
         selection: Some(vec![]),
         progress: None,
+        keep_macos_metadata: false,
     };
     let report = extract_all(&mut *ar, &mut opts).unwrap();
     assert_eq!(report.extracted, 0);
