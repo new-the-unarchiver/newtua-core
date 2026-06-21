@@ -83,11 +83,18 @@ impl FormatHandler for ZipHandler {
             metas.push((size, is_dir, is_encrypted, modified, mode, kind_raw));
         }
         // Second pass: read symlink targets via by_index (decompressed).
+        // This is best-effort: if the entry is encrypted or otherwise unreadable,
+        // we fall back to an empty target so that listing still succeeds.
         for (i, meta) in metas.iter_mut().enumerate() {
             if matches!(meta.5, EntryKindRaw::Symlink(_)) {
-                let mut f = zip.by_index(i).map_err(map_zip_err)?;
-                let mut buf = Vec::new();
-                f.read_to_end(&mut buf)?;
+                let buf = zip
+                    .by_index(i)
+                    .ok()
+                    .and_then(|mut f| {
+                        let mut buf = Vec::new();
+                        f.read_to_end(&mut buf).ok().map(|_| buf)
+                    })
+                    .unwrap_or_default();
                 meta.5 = EntryKindRaw::Symlink(buf);
             }
         }
