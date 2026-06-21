@@ -152,6 +152,49 @@ impl FormatHandler for SevenZHandler {
             })
             .collect();
 
+        // Second pass: populate symlink targets.
+        // Symlink content (the link target path) is stored as the entry's payload.
+        // We re-open the archive and iterate once to collect all symlink targets.
+        let has_symlinks = entries
+            .iter()
+            .any(|e| matches!(e.kind, EntryKind::Symlink { .. }));
+
+        let mut entries = entries;
+
+        if has_symlinks {
+            // Best-effort: if we can't read targets, leave them empty rather than failing open().
+            if let Ok(sym_file) = File::open(&file_path) {
+                if let Ok(mut seven) = sevenz_rust2::SevenZReader::new(sym_file, password.clone()) {
+                    let mut counter: usize = 0;
+                    let _ = seven.for_each_entries(|_entry, reader| {
+                        if matches!(entries.get(counter), Some(e) if matches!(e.kind, EntryKind::Symlink { .. }))
+                        {
+                            let mut buf = Vec::new();
+                            if std::io::copy(reader, &mut buf).is_ok() {
+                                // Trim any trailing null bytes and decode.
+                                let s = String::from_utf8_lossy(
+                                    buf.iter()
+                                        .rposition(|&b| b != 0)
+                                        .map(|p| &buf[..=p])
+                                        .unwrap_or(&[]),
+                                );
+                                if let Some(e) = entries.get_mut(counter) {
+                                    e.kind = EntryKind::Symlink {
+                                        target: std::path::PathBuf::from(s.as_ref()),
+                                    };
+                                }
+                            }
+                        } else {
+                            // Skip non-symlink payloads.
+                            let _ = std::io::copy(reader, &mut std::io::sink());
+                        }
+                        counter += 1;
+                        Ok(true)
+                    });
+                }
+            }
+        }
+
         Ok(Box::new(SevenZReader {
             file_path,
             password: opts.password.clone(),
