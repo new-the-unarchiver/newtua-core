@@ -66,9 +66,6 @@ impl ArchiveReader for TempBackedReader {
     }
 }
 
-// Keep a type alias so callers in the volume path still compile (was VolumeBackedReader).
-type VolumeBackedReader = TempBackedReader;
-
 // ── SingleFileReader ──────────────────────────────────────────────────────────
 
 /// Reader that presents a single decompressed file as a one-entry archive.
@@ -149,7 +146,6 @@ impl ArchiveReader for SingleFileReader {
             return Err(Error::InvalidIndex(idx));
         }
         let mut file = std::fs::File::open(&self.temp_path)?;
-        file.seek(SeekFrom::Start(0))?;
         std::io::copy(&mut file, out)?;
         Ok(())
     }
@@ -260,7 +256,7 @@ fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>
 /// 1. If `path` ends with `.001`, check for sibling volumes (`.002`, etc.).
 ///    If more than one member exists, concatenate all members into a temp file
 ///    and open the reconstructed archive from the temp path. The temp file is
-///    kept alive via [`VolumeBackedReader`] until the reader is dropped.
+///    kept alive via [`TempBackedReader`] until the reader is dropped.
 /// 2. Otherwise (or when `.001` has no siblings), open the file directly.
 ///    Within direct open:
 ///
@@ -294,7 +290,7 @@ pub fn open(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
             // but first persist into a path we can open.
             let temp_path = tmp.into_temp_path();
             let inner = open_single(&temp_path, opts)?;
-            return Ok(Box::new(VolumeBackedReader {
+            return Ok(Box::new(TempBackedReader {
                 inner,
                 _temp: temp_path,
             }));

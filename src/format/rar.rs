@@ -256,8 +256,6 @@ impl RarReader {
     /// correctly.  The next-volume files must exist on disk in the same
     /// directory as `self.path`.
     fn read_entry_via_extract(&self, idx: usize, target: &[u8], out: &mut dyn Write) -> Result<()> {
-        use std::io::Read as _;
-
         // Create a temp file to receive the extracted bytes.
         let tmp = tempfile::NamedTempFile::new().map_err(Error::Io)?;
         let tmp_path = tmp.path().to_path_buf();
@@ -317,14 +315,7 @@ impl RarReader {
 
         // Stream the extracted temp file into `out`.
         let mut f = std::fs::File::open(&tmp_path).map_err(Error::Io)?;
-        let mut buf = [0u8; 65536];
-        loop {
-            let n = f.read(&mut buf).map_err(Error::Io)?;
-            if n == 0 {
-                break;
-            }
-            out.write_all(&buf[..n])?;
-        }
+        std::io::copy(&mut f, out)?;
         drop(f);
         let _ = std::fs::remove_file(&tmp_path);
 

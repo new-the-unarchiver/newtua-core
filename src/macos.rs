@@ -4,10 +4,8 @@ use std::path::Path;
 /// any `__MACOSX` path component, a `.DS_Store` file, or an AppleDouble
 /// `._name` file.
 pub fn is_macos_metadata(path: &Path) -> bool {
-    for comp in path.components() {
-        if comp.as_os_str() == "__MACOSX" {
-            return true;
-        }
+    if path.components().any(|c| c.as_os_str() == "__MACOSX") {
+        return true;
     }
     match path.file_name().and_then(|s| s.to_str()) {
         Some(name) => name == ".DS_Store" || name.starts_with("._"),
