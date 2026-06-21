@@ -53,6 +53,42 @@ mod tests {
 }
 
 #[cfg(test)]
+mod symlink_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn relative_target_inside_is_ok() {
+        // link at out/sub/link -> ../file  =>  out/file  (inside)
+        assert!(safe_symlink_target(Path::new("/out"), Path::new("sub/link"), Path::new("../file")).is_ok());
+    }
+
+    #[test]
+    fn same_dir_target_is_ok() {
+        assert!(safe_symlink_target(Path::new("/out"), Path::new("a/link"), Path::new("sibling")).is_ok());
+    }
+
+    #[test]
+    fn escaping_relative_target_rejected() {
+        // link at out/link -> ../../etc  => escapes /out
+        let e = safe_symlink_target(Path::new("/out"), Path::new("link"), Path::new("../../etc")).unwrap_err();
+        assert!(matches!(e, crate::Error::PathTraversal(_)));
+    }
+
+    #[test]
+    fn absolute_target_rejected() {
+        let e = safe_symlink_target(Path::new("/out"), Path::new("link"), Path::new("/etc/passwd")).unwrap_err();
+        assert!(matches!(e, crate::Error::PathTraversal(_)));
+    }
+
+    #[test]
+    fn windows_backslash_escape_rejected() {
+        let e = safe_symlink_target(Path::new("/out"), Path::new("link"), Path::new("..\\..\\x")).unwrap_err();
+        assert!(matches!(e, crate::Error::PathTraversal(_)));
+    }
+}
+
+#[cfg(test)]
 mod edge {
     use super::*;
     use std::path::Path;
