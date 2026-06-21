@@ -10,6 +10,8 @@ pub struct ExtractOptions {
     /// только если у записей нет единого общего корневого каталога.
     pub wrapper_name: Option<String>,
     pub strict: bool,
+    /// Restore mtime (and in future: mode) from archive metadata. Default: true.
+    pub preserve: bool,
 }
 
 #[derive(Debug, Default)]
