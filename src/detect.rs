@@ -1,5 +1,6 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::archive::{
     ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
@@ -88,7 +89,13 @@ impl SingleFileReader {
     ///   entry name.
     /// * `tmp` — the `NamedTempFile` holding the decompressed payload.
     /// * `size` — decompressed byte count.
-    fn new(original_path: &Path, tmp: tempfile::NamedTempFile, size: u64) -> Self {
+    /// * `modified` — optional modification timestamp (only gzip headers carry one).
+    fn new(
+        original_path: &Path,
+        tmp: tempfile::NamedTempFile,
+        size: u64,
+        modified: Option<SystemTime>,
+    ) -> Self {
         let entry_name = stem_without_compressor_ext(original_path);
         let path_raw = entry_name.as_bytes().to_vec();
         let entry = Entry {
@@ -97,12 +104,33 @@ impl SingleFileReader {
             size,
             is_dir: false,
             is_encrypted: false,
-            modified: None,
+            modified,
         };
         SingleFileReader {
             entries: vec![entry],
             temp_path: tmp.into_temp_path(),
         }
+    }
+}
+
+/// Read the gzip mtime from the original `.gz` file.
+///
+/// The gzip header stores the original modification time as a little-endian
+/// `u32` at byte offset 4 (seconds since Unix epoch; 0 = "no timestamp").
+/// Returns `Some(timestamp)` if the mtime is non-zero, `None` otherwise.
+fn read_gz_mtime(path: &Path) -> Option<SystemTime> {
+    let mut buf = [0u8; 8];
+    let mut f = std::fs::File::open(path).ok()?;
+    // We only need bytes 0..8; a short read means the file is too small.
+    let n = f.read(&mut buf).ok()?;
+    if n < 8 {
+        return None;
+    }
+    let mtime = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if mtime == 0 {
+        None
+    } else {
+        Some(UNIX_EPOCH + Duration::from_secs(mtime as u64))
     }
 }
 
@@ -198,7 +226,14 @@ fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>
             }));
         } else {
             // Plain compressed file — present as one entry.
-            return Ok(Box::new(SingleFileReader::new(path, tmp, size)));
+            // For gzip only: read the original-file mtime from the header (bytes 4..8).
+            // bzip2 and xz carry no mtime in their standard headers.
+            let modified = if comp == Compressor::Gzip {
+                read_gz_mtime(path)
+            } else {
+                None
+            };
+            return Ok(Box::new(SingleFileReader::new(path, tmp, size, modified)));
         }
     }
 

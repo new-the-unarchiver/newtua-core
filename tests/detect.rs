@@ -1,5 +1,6 @@
 use newtua_core::{OpenOptions, open};
 use std::io::Write;
+use std::time::{Duration, UNIX_EPOCH};
 
 #[test]
 fn opens_plain_zip_by_magic() {
@@ -141,6 +142,89 @@ fn single_xz_non_tar_yields_one_entry() {
     let mut out = Vec::new();
     ar.read_entry(0, &mut out).unwrap();
     assert_eq!(out, payload, "extracted content mismatch");
+}
+
+/// A .gz file built with a known mtime must expose that mtime on the single entry.
+/// (RED before fix: modified == None; GREEN after fix: modified == Some(epoch + secs))
+#[test]
+fn single_gz_mtime_propagated() {
+    const KNOWN_MTIME: u32 = 1_700_000_000; // 2023-11-14T22:13:20Z
+    let payload = b"mtime test payload\n";
+
+    let gz_bytes = {
+        use flate2::GzBuilder;
+        let buf = Vec::new();
+        let mut encoder = GzBuilder::new()
+            .mtime(KNOWN_MTIME)
+            .write(buf, flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.bin.gz");
+    std::fs::write(&path, gz_bytes).unwrap();
+
+    let mut ar = open(&path, &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+
+    let expected = UNIX_EPOCH + Duration::from_secs(KNOWN_MTIME as u64);
+    assert_eq!(
+        entries[0].modified,
+        Some(expected),
+        "gz mtime should be propagated to the single entry"
+    );
+}
+
+/// A .gz file built with mtime == 0 must yield modified == None.
+#[test]
+fn single_gz_mtime_zero_yields_none() {
+    let payload = b"no mtime\n";
+
+    let gz_bytes = {
+        use flate2::GzBuilder;
+        let buf = Vec::new();
+        let mut encoder = GzBuilder::new()
+            .mtime(0)
+            .write(buf, flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notime.txt.gz");
+    std::fs::write(&path, gz_bytes).unwrap();
+
+    let mut ar = open(&path, &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].modified, None,
+        "gz mtime=0 must yield modified=None"
+    );
+}
+
+/// .bz2 single-file entries must have modified == None (format carries no mtime).
+#[test]
+fn single_bz2_mtime_is_none() {
+    let payload = b"bz2 no mtime\n";
+
+    let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+    enc.write_all(payload).unwrap();
+    let bz2_bytes = enc.finish().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.txt.bz2");
+    std::fs::write(&path, bz2_bytes).unwrap();
+
+    let mut ar = open(&path, &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].modified, None,
+        "bz2 single-file must have modified=None"
+    );
 }
 
 /// read_entry with out-of-range index on a single-file reader must return an error.
