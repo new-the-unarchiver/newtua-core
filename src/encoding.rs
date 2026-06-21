@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn aggregate_detection_decodes_legacy_bytes() {
-        // Кириллица в windows-1251: "файл" = C4 E0 E9 EB
+        // Кириллица в windows-1251: "файл" = F4 E0 E9 EB
         let raw = vec![vec![0xF4, 0xE0, 0xE9, 0xEB]];
         let out = decode_names(&raw, None);
         // детект должен дать осмысленную кириллицу, а не U+FFFD

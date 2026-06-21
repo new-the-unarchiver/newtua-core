@@ -67,7 +67,7 @@ impl FormatHandler for TarHandler {
                 let mut buf = Vec::new();
                 inner.seek(SeekFrom::Start(0))?;
                 inner.read_to_end(&mut buf)?;
-                let (entries, offsets) = index_from_slice(&buf, opts)?;
+                let (entries, offsets) = index_from_reader(std::io::Cursor::new(&buf), opts)?;
                 let reader = TarReader {
                     backing: Backing::Buffer { data: buf, offsets },
                     entries,
@@ -78,7 +78,7 @@ impl FormatHandler for TarHandler {
                 // Stream — must buffer everything.
                 let mut buf = Vec::new();
                 inner.read_to_end(&mut buf)?;
-                let (entries, offsets) = index_from_slice(&buf, opts)?;
+                let (entries, offsets) = index_from_reader(std::io::Cursor::new(&buf), opts)?;
                 let reader = TarReader {
                     backing: Backing::Buffer { data: buf, offsets },
                     entries,
@@ -108,8 +108,9 @@ struct TarReader {
 
 // ── Indexing helpers ──────────────────────────────────────────────────────────
 
-/// Index a tar archive from a `Read + Seek` source (e.g., a `File`).
+/// Index a tar archive from any `Read + Seek` source.
 /// Reads only the headers; skips payloads via the tar crate's streaming API.
+/// For an in-memory slice, wrap it in `std::io::Cursor::new(data)` before calling.
 fn index_from_reader<R: Read + Seek>(
     reader: R,
     opts: &OpenOptions,
@@ -118,42 +119,6 @@ fn index_from_reader<R: Read + Seek>(
     let mut metas: Vec<EntryMeta> = Vec::new();
 
     let mut ar = tar::Archive::new(reader);
-    for entry in ar.entries().map_err(|e| Error::Corrupt(e.to_string()))? {
-        let entry = entry.map_err(|e| Error::Corrupt(e.to_string()))?;
-        let header = entry.header();
-        let entry_type = header.entry_type();
-        let mode = header.mode().ok();
-        let size = header.size().map_err(|e| Error::Corrupt(e.to_string()))?;
-        let path_bytes = entry.path_bytes().to_vec();
-        let offset = entry.raw_file_position();
-        let modified = header
-            .mtime()
-            .ok()
-            .map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
-        let kind_raw = if entry_type.is_symlink() {
-            let target_raw = entry
-                .link_name_bytes()
-                .map(|c| c.into_owned())
-                .unwrap_or_default();
-            EntryKindRaw::Symlink(target_raw)
-        } else if entry_type.is_dir() {
-            EntryKindRaw::Dir
-        } else {
-            EntryKindRaw::File
-        };
-        raw_names.push(path_bytes);
-        metas.push((size, offset, modified, mode, kind_raw));
-    }
-
-    build_entries(raw_names, metas, opts)
-}
-
-/// Index a tar archive from an in-memory slice.
-fn index_from_slice(data: &[u8], opts: &OpenOptions) -> Result<(Vec<Entry>, Vec<u64>)> {
-    let mut raw_names: Vec<Vec<u8>> = Vec::new();
-    let mut metas: Vec<EntryMeta> = Vec::new();
-
-    let mut ar = tar::Archive::new(std::io::Cursor::new(data));
     for entry in ar.entries().map_err(|e| Error::Corrupt(e.to_string()))? {
         let entry = entry.map_err(|e| Error::Corrupt(e.to_string()))?;
         let header = entry.header();

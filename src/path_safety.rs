@@ -28,6 +28,9 @@ pub fn safe_join(dest_root: &Path, entry_path: &Path) -> Result<PathBuf> {
 /// `safe_join` only protects literal write paths; it does not resolve
 /// symlinks. Validating that every created symlink points inside `dest_root`
 /// is what prevents a later write from escaping through the link.
+///
+/// `link_rel` is expected to have already been validated by `safe_join` on the
+/// same entry path; callers must run `safe_join` before calling this function.
 pub fn safe_symlink_target(_dest_root: &Path, link_rel: &Path, target: &Path) -> Result<()> {
     // Normalize Windows separators in the archive-supplied target.
     let target_norm = target.to_string_lossy().replace('\\', "/");
