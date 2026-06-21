@@ -94,6 +94,25 @@ fn encrypted_archive_reports_is_encrypted_true() {
     }
 }
 
+/// Verifies that unix mode bits are extracted from 7z Windows attributes when the
+/// unix-extension bit (0x8000) is set by the archiver (e.g. `7zz` on macOS/Linux).
+/// The fixture meta.7z was built with `7zz a meta.7z f.txt` where `f.txt` had
+/// mode 0755 — so `windows_attributes >> 16` should yield `0o100755` and the
+/// permission bits `& 0o7777` should be `0o755`.
+#[test]
+fn sevenz_populates_mode_when_available() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), include_bytes!("fixtures/meta.7z")).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = SevenZHandler.open(src, &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap().to_vec();
+    let f = entries
+        .iter()
+        .find(|e| e.path.to_str() == Some("f.txt"))
+        .unwrap();
+    assert_eq!(f.mode, Some(0o755));
+}
+
 /// Verifies on-demand per-index extraction: opening a two-entry archive must
 /// list both entries and extract each one independently (without buffering the
 /// other entry into RAM).
