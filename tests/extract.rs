@@ -37,11 +37,13 @@ fn extracts_files_to_dest() {
     let mut ar = open(zip.path(), &OpenOptions::default()).unwrap();
     let report = extract_all(
         &mut *ar,
-        &ExtractOptions {
+        &mut ExtractOptions {
             dest: dest.path().to_path_buf(),
             wrapper_name: Some("arc".into()),
             strict: false,
             preserve: true,
+            selection: None,
+            progress: None,
         },
     )
     .unwrap();
@@ -59,11 +61,13 @@ fn wraps_when_no_common_root() {
     let mut ar = open(zip.path(), &OpenOptions::default()).unwrap();
     let report = extract_all(
         &mut *ar,
-        &ExtractOptions {
+        &mut ExtractOptions {
             dest: dest.path().to_path_buf(),
             wrapper_name: Some("myarc".into()),
             strict: false,
             preserve: true,
+            selection: None,
+            progress: None,
         },
     )
     .unwrap();
@@ -112,11 +116,13 @@ fn zip_slip_entry_is_skipped_in_non_strict() {
     let mut ar = open(tmp.path(), &OpenOptions::default()).unwrap();
     let report = extract_all(
         &mut *ar,
-        &ExtractOptions {
+        &mut ExtractOptions {
             dest: dest.path().to_path_buf(),
             wrapper_name: None,
             strict: false,
             preserve: true,
+            selection: None,
+            progress: None,
         },
     )
     .unwrap();
@@ -141,11 +147,13 @@ fn strict_aborts_on_zip_slip() {
     let mut ar = open(tmp.path(), &OpenOptions::default()).unwrap();
     let err = extract_all(
         &mut *ar,
-        &ExtractOptions {
+        &mut ExtractOptions {
             dest: dest.path().to_path_buf(),
             wrapper_name: None,
             strict: true,
             preserve: true,
+            selection: None,
+            progress: None,
         },
     )
     .unwrap_err();
@@ -210,11 +218,13 @@ fn restores_file_mtime_by_default() {
     let mut ar = newtua_core::open(tmp.path(), &newtua_core::OpenOptions::default()).unwrap();
     newtua_core::extract_all(
         &mut *ar,
-        &newtua_core::ExtractOptions {
+        &mut newtua_core::ExtractOptions {
             dest: dest.path().to_path_buf(),
             wrapper_name: None,
             strict: false,
             preserve: true,
+            selection: None,
+            progress: None,
         },
     )
     .unwrap();
@@ -258,11 +268,13 @@ fn restores_unix_mode_and_symlink() {
     let mut ar = newtua_core::open(tmp.path(), &newtua_core::OpenOptions::default()).unwrap();
     let report = newtua_core::extract_all(
         &mut *ar,
-        &newtua_core::ExtractOptions {
+        &mut newtua_core::ExtractOptions {
             dest: dest.path().to_path_buf(),
             wrapper_name: None,
             strict: false,
             preserve: true,
+            selection: None,
+            progress: None,
         },
     )
     .unwrap();
@@ -309,11 +321,13 @@ fn rejects_escaping_symlink() {
     let mut ar = newtua_core::open(tmp.path(), &newtua_core::OpenOptions::default()).unwrap();
     let report = newtua_core::extract_all(
         &mut *ar,
-        &newtua_core::ExtractOptions {
+        &mut newtua_core::ExtractOptions {
             dest: dest.path().to_path_buf(),
             wrapper_name: Some("arc".into()),
             strict: false,
             preserve: true,
+            selection: None,
+            progress: None,
         },
     )
     .unwrap();
@@ -352,11 +366,13 @@ fn no_preserve_skips_mtime() {
     let mut ar = newtua_core::open(tmp.path(), &newtua_core::OpenOptions::default()).unwrap();
     newtua_core::extract_all(
         &mut *ar,
-        &newtua_core::ExtractOptions {
+        &mut newtua_core::ExtractOptions {
             dest: dest.path().to_path_buf(),
             wrapper_name: None,
             strict: false,
             preserve: false,
+            selection: None,
+            progress: None,
         },
     )
     .unwrap();

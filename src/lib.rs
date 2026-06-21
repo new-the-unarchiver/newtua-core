@@ -27,7 +27,9 @@ pub mod detect;
 pub use detect::{detect_compressor, open, registry};
 
 pub mod extract;
-pub use extract::{ExtractOptions, ExtractReport, common_root, extract_all};
+pub use extract::{
+    ExtractOptions, ExtractReport, Flow, ProgressEvent, ProgressFn, common_root, extract_all,
+};
 
 #[cfg(test)]
 mod smoke {

@@ -149,11 +149,13 @@ fn sevenz_symlink_extracted_correctly() {
     let dest = tempfile::tempdir().unwrap();
     extract_all(
         &mut *ar,
-        &ExtractOptions {
+        &mut ExtractOptions {
             dest: dest.path().to_path_buf(),
             wrapper_name: None,
             strict: true,
             preserve: false,
+            selection: None,
+            progress: None,
         },
     )
     .unwrap();

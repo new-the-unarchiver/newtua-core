@@ -7,6 +7,31 @@ use crate::archive::{ArchiveReader, Entry, EntryKind};
 use crate::error::Result;
 use crate::path_safety::safe_join;
 
+/// Streamed progress notifications during extraction.
+pub enum ProgressEvent<'a> {
+    EntryStart {
+        index: usize,
+        path: &'a str,
+        size: u64,
+    },
+    Bytes {
+        index: usize,
+        written: u64,
+    },
+    EntryDone {
+        index: usize,
+    },
+}
+
+/// Returned by a progress callback to continue or cooperatively abort.
+pub enum Flow {
+    Continue,
+    Abort,
+}
+
+/// Progress callback: invoked during extraction; returns `Flow` to control it.
+pub type ProgressFn = Box<dyn FnMut(ProgressEvent) -> Flow + Send>;
+
 fn apply_mtime(path: &Path, modified: Option<SystemTime>) {
     if let Some(t) = modified {
         let ft = FileTime::from_system_time(t);
@@ -54,6 +79,11 @@ pub struct ExtractOptions {
     pub strict: bool,
     /// Restore mtime (and in future: mode) from archive metadata. Default: true.
     pub preserve: bool,
+    /// Restrict extraction to these original entry indices. `None` = all.
+    /// (Honored starting in Task 2; accepted here for a stable struct shape.)
+    pub selection: Option<Vec<usize>>,
+    /// Optional progress/cancellation callback.
+    pub progress: Option<ProgressFn>,
 }
 
 #[derive(Debug, Default)]
@@ -61,6 +91,7 @@ pub struct ExtractReport {
     pub extracted: usize,
     pub failed: Vec<(PathBuf, String)>,
     pub wrapped: bool,
+    pub aborted: bool,
 }
 
 /// The single shared top-level directory of all entries, or None.
@@ -95,13 +126,12 @@ pub fn common_root(entries: &[Entry]) -> Option<String> {
     if is_dir_root { root } else { None }
 }
 
-pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &ExtractOptions) -> Result<ExtractReport> {
+pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &mut ExtractOptions) -> Result<ExtractReport> {
     let entries: Vec<Entry> = ar.entries()?.to_vec();
     let mut report = ExtractReport::default();
 
-    // Обёртка-папка как в The Unarchiver: если у записей нет единого общего
-    // корневого каталога и задан wrapper_name — оборачиваем содержимое в
-    // папку по имени архива.
+    // Wrapper folder (The Unarchiver behavior). Computed from immutable reads
+    // BEFORE we mutably borrow `opts.progress` below.
     let dest = match (common_root(&entries), &opts.wrapper_name) {
         (None, Some(name)) => {
             report.wrapped = true;
@@ -112,17 +142,44 @@ pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &ExtractOptions) -> Result<
     if report.wrapped {
         std::fs::create_dir_all(&dest)?;
     }
+    let preserve = opts.preserve;
+    let strict = opts.strict;
 
-    // Collect directory paths + their mtimes for a second pass (writing children
-    // bumps the parent dir mtime, so we apply dir mtimes after all entries).
     let mut dir_mtimes: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
 
     for (idx, entry) in entries.iter().enumerate() {
-        let result = extract_one(ar, idx, entry, &dest, opts.preserve, &mut dir_mtimes);
+        // EntryStart (also a cancellation checkpoint for dirs/symlinks).
+        if let Some(p) = opts.progress.as_mut() {
+            let path = entry.path.to_string_lossy();
+            if let Flow::Abort = p(ProgressEvent::EntryStart {
+                index: idx,
+                path: &path,
+                size: entry.size,
+            }) {
+                report.aborted = true;
+                break;
+            }
+        }
+
+        let mut aborted = false;
+        let ctx = ProgressCtx {
+            progress: opts.progress.as_mut(),
+            aborted: &mut aborted,
+        };
+        let result = extract_one(ar, idx, entry, &dest, preserve, &mut dir_mtimes, ctx);
+        if aborted {
+            report.aborted = true;
+            break;
+        }
         match result {
-            Ok(()) => report.extracted += 1,
+            Ok(()) => {
+                report.extracted += 1;
+                if let Some(p) = opts.progress.as_mut() {
+                    let _ = p(ProgressEvent::EntryDone { index: idx });
+                }
+            }
             Err(e) => {
-                if opts.strict {
+                if strict {
                     return Err(e);
                 }
                 report.failed.push((entry.path.clone(), e.to_string()));
@@ -130,14 +187,20 @@ pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &ExtractOptions) -> Result<
         }
     }
 
-    // Second pass: restore directory mtimes after all children are written.
-    if opts.preserve {
+    if preserve {
         for (path, modified) in &dir_mtimes {
             apply_mtime(path, *modified);
         }
     }
 
     Ok(report)
+}
+
+/// Bundles the optional progress callback with the cooperative-abort flag so
+/// `extract_one` stays within clippy's argument-count limit.
+struct ProgressCtx<'a> {
+    progress: Option<&'a mut ProgressFn>,
+    aborted: &'a mut bool,
 }
 
 fn extract_one(
@@ -147,6 +210,7 @@ fn extract_one(
     dest: &Path,
     preserve: bool,
     dir_mtimes: &mut Vec<(PathBuf, Option<SystemTime>)>,
+    mut ctx: ProgressCtx<'_>,
 ) -> Result<()> {
     let target = safe_join(dest, &entry.path)?;
     match &entry.kind {
@@ -173,9 +237,29 @@ fn extract_one(
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut out = std::fs::File::create(&target)?;
-            ar.read_entry(idx, &mut out)?;
-            drop(out);
+            let out = std::fs::File::create(&target)?;
+            match ctx.progress.as_mut() {
+                Some(p) => {
+                    let mut w = ProgressWriter {
+                        idx,
+                        inner: out,
+                        progress: p,
+                        aborted: ctx.aborted,
+                    };
+                    // On cooperative abort, ProgressWriter returns an io error and
+                    // sets *aborted; swallow that specific stop here.
+                    if let Err(e) = ar.read_entry(idx, &mut w) {
+                        if *ctx.aborted {
+                            return Ok(());
+                        }
+                        return Err(e);
+                    }
+                }
+                None => {
+                    let mut out = out;
+                    ar.read_entry(idx, &mut out)?;
+                }
+            }
             if preserve {
                 apply_mode(&target, entry.mode);
                 apply_mtime(&target, entry.modified);
@@ -183,4 +267,28 @@ fn extract_one(
         }
     }
     Ok(())
+}
+
+struct ProgressWriter<'a> {
+    idx: usize,
+    inner: std::fs::File,
+    progress: &'a mut ProgressFn,
+    aborted: &'a mut bool,
+}
+
+impl std::io::Write for ProgressWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if let Flow::Abort = (self.progress)(ProgressEvent::Bytes {
+            index: self.idx,
+            written: n as u64,
+        }) {
+            *self.aborted = true;
+            return Err(std::io::Error::other("extraction aborted"));
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
