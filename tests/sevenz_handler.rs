@@ -1,5 +1,5 @@
 use newtua_core::format::SevenZHandler;
-use newtua_core::{FormatHandler, OpenOptions, Source};
+use newtua_core::{EntryKind, ExtractOptions, FormatHandler, OpenOptions, Source, extract_all};
 
 // Fixture: pre-built 7z archive with one entry "a.txt" = "hello 7z".
 const FIXTURE: &[u8] = include_bytes!("fixtures/hello.7z");
@@ -111,6 +111,58 @@ fn sevenz_populates_mode_when_available() {
         .find(|e| e.path.to_str() == Some("f.txt"))
         .unwrap();
     assert_eq!(f.mode, Some(0o755));
+}
+
+/// Verifies that the symlink entry in symlink.7z has its target populated.
+/// Currently fails because the 7z handler sets `target: PathBuf::new()` (RED).
+#[cfg(unix)]
+#[test]
+fn sevenz_symlink_target_populated() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), include_bytes!("fixtures/symlink.7z")).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = SevenZHandler.open(src, &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap();
+    let slink = entries
+        .iter()
+        .find(|e| e.path.file_name().map(|n| n == "slink").unwrap_or(false))
+        .expect("entry 'slink' not found in symlink.7z");
+    assert_eq!(
+        slink.kind,
+        EntryKind::Symlink {
+            target: std::path::PathBuf::from("target.txt"),
+        },
+        "symlink target must be 'target.txt', got {:?}",
+        slink.kind
+    );
+}
+
+/// Verifies that extracting symlink.7z creates a real symlink on disk pointing
+/// to "target.txt". Currently fails because the empty target causes broken
+/// extraction (RED).
+#[cfg(unix)]
+#[test]
+fn sevenz_symlink_extracted_correctly() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), include_bytes!("fixtures/symlink.7z")).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = SevenZHandler.open(src, &OpenOptions::default()).unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    extract_all(
+        &mut *ar,
+        &ExtractOptions {
+            dest: dest.path().to_path_buf(),
+            wrapper_name: None,
+            strict: true,
+            preserve: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_link(dest.path().join("slink")).unwrap(),
+        std::path::PathBuf::from("target.txt"),
+        "extracted symlink must point to 'target.txt'"
+    );
 }
 
 /// Verifies on-demand per-index extraction: opening a two-entry archive must
