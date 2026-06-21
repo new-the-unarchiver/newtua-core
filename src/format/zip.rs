@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 
 use crate::archive::{
     ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
@@ -9,6 +9,24 @@ use crate::error::{Error, Result};
 pub struct ZipHandler;
 
 type ZipArc = zip::ZipArchive<Box<dyn crate::archive::ReadSeek>>;
+
+/// Private staging enum used during zip indexing to carry entry-type info
+/// before symlink targets have been decoded.
+enum EntryKindRaw {
+    File,
+    Dir,
+    Symlink(Vec<u8>),
+}
+
+/// Staging metadata collected for each entry during the index pass.
+type EntryMeta = (
+    u64,
+    bool,
+    bool,
+    Option<std::time::SystemTime>,
+    Option<u32>,
+    EntryKindRaw,
+);
 
 impl FormatHandler for ZipHandler {
     fn id(&self) -> FormatId {
@@ -35,30 +53,74 @@ impl FormatHandler for ZipHandler {
         };
         let mut zip = zip::ZipArchive::new(inner).map_err(map_zip_err)?;
         let mut raw_names: Vec<Vec<u8>> = Vec::new();
-        let mut metas: Vec<(u64, bool, bool, Option<std::time::SystemTime>)> = Vec::new();
+        let mut metas: Vec<EntryMeta> = Vec::new();
         for i in 0..zip.len() {
             let f = zip.by_index_raw(i).map_err(map_zip_err)?;
+            // unix_mode() returns the full 16-bit value (type bits + perms).
+            // Use the crate's is_symlink() for detection: unix_permissions() on
+            // write strips type bits and always sets S_IFREG, so checking raw
+            // mode bits ourselves is unreliable. is_symlink() checks S_IFLNK
+            // which is only set when the entry was written via add_symlink().
+            let is_symlink = f.is_symlink();
+            // Strip the file-type nibble so `mode` holds only permission bits,
+            // matching the convention used by the tar handler.
+            let mode = f.unix_mode().map(|m| m & 0o7777);
+            let is_dir = f.is_dir();
+            let size = f.size();
+            let is_encrypted = f.encrypted();
+            let modified = f.last_modified().and_then(zip_dt_to_systime);
             raw_names.push(f.name_raw().to_vec());
-            metas.push((
-                f.size(),
-                f.is_dir(),
-                f.encrypted(),
-                f.last_modified().and_then(zip_dt_to_systime),
-            ));
+            // For symlinks we need the content (link target), but by_index_raw
+            // gives raw (possibly compressed) bytes. We stage a placeholder and
+            // read the target below via by_index (decompressed).
+            let kind_raw = if is_symlink {
+                EntryKindRaw::Symlink(Vec::new()) // filled in next loop
+            } else if is_dir {
+                EntryKindRaw::Dir
+            } else {
+                EntryKindRaw::File
+            };
+            metas.push((size, is_dir, is_encrypted, modified, mode, kind_raw));
         }
-        let names = decode_names(&raw_names, opts.encoding_override.as_deref());
+        // Second pass: read symlink targets via by_index (decompressed).
+        for (i, meta) in metas.iter_mut().enumerate() {
+            if matches!(meta.5, EntryKindRaw::Symlink(_)) {
+                let mut f = zip.by_index(i).map_err(map_zip_err)?;
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf)?;
+                meta.5 = EntryKindRaw::Symlink(buf);
+            }
+        }
+
+        let encoding_label = opts.encoding_override.as_deref();
+        let names = decode_names(&raw_names, encoding_label);
+
+        // Collect symlink target byte-strings for batch decoding with same charset.
+        let raw_targets: Vec<Vec<u8>> = metas
+            .iter()
+            .map(|(_, _, _, _, _, kind_raw)| match kind_raw {
+                EntryKindRaw::Symlink(t) => t.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let decoded_targets = decode_names(&raw_targets, encoding_label);
+
         let mut entries = Vec::with_capacity(zip.len());
-        for (i, (size, is_dir, is_encrypted, modified)) in metas.into_iter().enumerate() {
+        for (i, (size, _, is_encrypted, modified, mode, kind_raw)) in metas.into_iter().enumerate()
+        {
+            let kind = match kind_raw {
+                EntryKindRaw::File => EntryKind::File,
+                EntryKindRaw::Dir => EntryKind::Dir,
+                EntryKindRaw::Symlink(_) => EntryKind::Symlink {
+                    target: std::path::PathBuf::from(&decoded_targets[i]),
+                },
+            };
             entries.push(Entry {
                 path_raw: raw_names[i].clone(),
                 path: std::path::PathBuf::from(&names[i]),
-                kind: if is_dir {
-                    EntryKind::Dir
-                } else {
-                    EntryKind::File
-                },
+                kind,
                 size,
-                mode: None,
+                mode,
                 is_encrypted,
                 modified,
             });

@@ -90,11 +90,10 @@ fn make_zip_with_symlink() -> tempfile::NamedTempFile {
     use std::io::Write as _;
     w.write_all(b"hi").unwrap();
 
-    // symlink "link" -> "f.txt": unix mode S_IFLNK | 0777, content = target
-    let lopts: zip::write::FileOptions<()> =
-        zip::write::FileOptions::default().unix_permissions(0o120777);
-    w.start_file("link", lopts).unwrap();
-    w.write_all(b"f.txt").unwrap();
+    // symlink "link" -> "f.txt": use add_symlink() so the zip crate sets S_IFLNK
+    // (unix_permissions() strips type bits, so start_file with 0o120777 won't work)
+    let lopts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+    w.add_symlink("link", "f.txt", lopts).unwrap();
 
     w.finish().unwrap();
     tmp
@@ -109,9 +108,20 @@ fn zip_populates_mode_and_symlink() {
         .unwrap();
     let entries = ar.entries().unwrap().to_vec();
 
-    let f = entries.iter().find(|e| e.path.to_str() == Some("f.txt")).unwrap();
+    let f = entries
+        .iter()
+        .find(|e| e.path.to_str() == Some("f.txt"))
+        .unwrap();
     assert_eq!(f.mode, Some(0o644));
 
-    let link = entries.iter().find(|e| e.path.to_str() == Some("link")).unwrap();
-    assert_eq!(link.kind, EntryKind::Symlink { target: std::path::PathBuf::from("f.txt") });
+    let link = entries
+        .iter()
+        .find(|e| e.path.to_str() == Some("link"))
+        .unwrap();
+    assert_eq!(
+        link.kind,
+        EntryKind::Symlink {
+            target: std::path::PathBuf::from("f.txt")
+        }
+    );
 }
