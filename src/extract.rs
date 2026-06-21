@@ -44,7 +44,7 @@ pub fn common_root(entries: &[Entry]) -> Option<String> {
         }
         // The top component is a directory if some entry nests under it,
         // or an entry is exactly that component and is itself a directory.
-        if comps.next().is_some() || e.is_dir {
+        if comps.next().is_some() || e.is_dir() {
             is_dir_root = true;
         }
     }
@@ -86,7 +86,7 @@ pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &ExtractOptions) -> Result<
 
 fn extract_one(ar: &mut dyn ArchiveReader, idx: usize, entry: &Entry, dest: &Path) -> Result<()> {
     let target = safe_join(dest, &entry.path)?;
-    if entry.is_dir {
+    if entry.is_dir() {
         std::fs::create_dir_all(&target)?;
         return Ok(());
     }

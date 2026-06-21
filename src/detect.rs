@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::archive::{
-    ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
+    ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
 };
 use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
@@ -101,8 +101,9 @@ impl SingleFileReader {
         let entry = Entry {
             path_raw,
             path: PathBuf::from(&entry_name),
+            kind: EntryKind::File,
             size,
-            is_dir: false,
+            mode: None,
             is_encrypted: false,
             modified,
         };

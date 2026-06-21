@@ -5,8 +5,13 @@ fn e(path: &str, is_dir: bool) -> newtua_core::Entry {
     newtua_core::Entry {
         path_raw: path.as_bytes().to_vec(),
         path: std::path::PathBuf::from(path),
+        kind: if is_dir {
+            newtua_core::EntryKind::Dir
+        } else {
+            newtua_core::EntryKind::File
+        },
         size: 0,
-        is_dir,
+        mode: None,
         is_encrypted: false,
         modified: None,
     }

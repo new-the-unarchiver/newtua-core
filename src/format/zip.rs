@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use crate::archive::{
-    ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
+    ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
 };
 use crate::encoding::decode_names;
 use crate::error::{Error, Result};
@@ -52,8 +52,13 @@ impl FormatHandler for ZipHandler {
             entries.push(Entry {
                 path_raw: raw_names[i].clone(),
                 path: std::path::PathBuf::from(&names[i]),
+                kind: if is_dir {
+                    EntryKind::Dir
+                } else {
+                    EntryKind::File
+                },
                 size,
-                is_dir,
+                mode: None,
                 is_encrypted,
                 modified,
             });

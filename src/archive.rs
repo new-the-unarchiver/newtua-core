@@ -25,14 +25,29 @@ impl Confidence {
     pub const MAGIC: Confidence = Confidence(100);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Dir,
+    Symlink { target: std::path::PathBuf },
+}
+
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub path_raw: Vec<u8>,
     pub path: PathBuf,
+    pub kind: EntryKind,
     pub size: u64,
-    pub is_dir: bool,
+    pub mode: Option<u32>,
     pub is_encrypted: bool,
     pub modified: Option<SystemTime>,
+}
+
+impl Entry {
+    /// True when this entry is a directory.
+    pub fn is_dir(&self) -> bool {
+        matches!(self.kind, EntryKind::Dir)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -135,12 +150,13 @@ mod tests {
         let e = Entry {
             path_raw: b"a.txt".to_vec(),
             path: std::path::PathBuf::from("a.txt"),
+            kind: EntryKind::File,
             size: 5,
-            is_dir: false,
+            mode: None,
             is_encrypted: false,
             modified: None,
         };
         assert_eq!(e.size, 5);
-        assert!(!e.is_dir);
+        assert!(!e.is_dir());
     }
 }

@@ -84,7 +84,7 @@ fn encrypted_archive_reports_is_encrypted_true() {
     let entries = ar.entries().unwrap();
     assert!(!entries.is_empty());
     // Every entry in secret.7z is in an AES-encrypted folder.
-    let data_entries: Vec<_> = entries.iter().filter(|e| !e.is_dir).collect();
+    let data_entries: Vec<_> = entries.iter().filter(|e| !e.is_dir()).collect();
     assert!(!data_entries.is_empty(), "expected at least one file entry");
     for entry in data_entries {
         assert!(

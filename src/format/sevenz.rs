@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::archive::{
-    ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
+    ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
 };
 use crate::encoding::decode_names;
 use crate::error::{Error, Result};
@@ -107,8 +107,13 @@ impl FormatHandler for SevenZHandler {
                 Entry {
                     path_raw: file.name().as_bytes().to_vec(),
                     path: std::path::PathBuf::from(name),
+                    kind: if file.is_directory() {
+                        EntryKind::Dir
+                    } else {
+                        EntryKind::File
+                    },
                     size: file.size(),
-                    is_dir: file.is_directory(),
+                    mode: None,
                     is_encrypted,
                     modified: None,
                 }

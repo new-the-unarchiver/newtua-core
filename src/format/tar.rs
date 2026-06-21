@@ -1,7 +1,9 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-use crate::archive::{ArchiveReader, Entry, FormatHandler, FormatId, OpenOptions, Source};
+use crate::archive::{
+    ArchiveReader, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
+};
 use crate::encoding::decode_names;
 use crate::error::{Error, Result};
 
@@ -155,8 +157,13 @@ fn build_entries(
         entries.push(Entry {
             path_raw: raw_names[i].clone(),
             path: std::path::PathBuf::from(&names[i]),
+            kind: if is_dir {
+                EntryKind::Dir
+            } else {
+                EntryKind::File
+            },
             size,
-            is_dir,
+            mode: None,
             is_encrypted: false,
             modified,
         });

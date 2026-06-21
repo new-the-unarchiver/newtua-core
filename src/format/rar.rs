@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::archive::{
-    ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
+    ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
 };
 use crate::encoding::decode_names;
 use crate::error::{Error, Result};
@@ -107,8 +107,13 @@ fn list_entries(
         .map(|(i, (raw, (size, is_dir, is_encrypted)))| Entry {
             path_raw: raw,
             path: PathBuf::from(&names[i]),
+            kind: if is_dir {
+                EntryKind::Dir
+            } else {
+                EntryKind::File
+            },
             size,
-            is_dir,
+            mode: None,
             is_encrypted,
             modified: None,
         })
