@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 use filetime::FileTime;
 
-use crate::archive::{ArchiveReader, Entry};
+use crate::archive::{ArchiveReader, Entry, EntryKind};
 use crate::error::Result;
 use crate::path_safety::safe_join;
 
@@ -12,6 +12,37 @@ fn apply_mtime(path: &Path, modified: Option<SystemTime>) {
         let ft = FileTime::from_system_time(t);
         // best-effort: data is already written, ignore errors
         let _ = filetime::set_file_mtime(path, ft);
+    }
+}
+
+#[cfg(unix)]
+fn apply_mode(path: &Path, mode: Option<u32>) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(m) = mode {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(m & 0o7777));
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_mode(_path: &Path, _mode: Option<u32>) {}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, link: &Path) -> Result<()> {
+    // Best-effort; requires privilege. Treat as file symlink.
+    std::os::windows::fs::symlink_file(target, link)?;
+    Ok(())
+}
+
+fn apply_symlink_mtime(path: &Path, modified: Option<SystemTime>) {
+    if let Some(t) = modified {
+        let ft = FileTime::from_system_time(t);
+        let _ = filetime::set_symlink_file_times(path, ft, ft);
     }
 }
 
@@ -118,18 +149,38 @@ fn extract_one(
     dir_mtimes: &mut Vec<(PathBuf, Option<SystemTime>)>,
 ) -> Result<()> {
     let target = safe_join(dest, &entry.path)?;
-    if entry.is_dir() {
-        std::fs::create_dir_all(&target)?;
-        dir_mtimes.push((target, entry.modified));
-        return Ok(());
-    }
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut out = std::fs::File::create(&target)?;
-    ar.read_entry(idx, &mut out)?;
-    if preserve {
-        apply_mtime(&target, entry.modified);
+    match &entry.kind {
+        EntryKind::Dir => {
+            std::fs::create_dir_all(&target)?;
+            if preserve {
+                apply_mode(&target, entry.mode);
+            }
+            dir_mtimes.push((target.clone(), entry.modified));
+        }
+        EntryKind::Symlink {
+            target: link_target,
+        } => {
+            crate::path_safety::safe_symlink_target(dest, &entry.path, link_target)?;
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            create_symlink(link_target, &target)?;
+            if preserve {
+                apply_symlink_mtime(&target, entry.modified);
+            }
+        }
+        EntryKind::File => {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut out = std::fs::File::create(&target)?;
+            ar.read_entry(idx, &mut out)?;
+            drop(out);
+            if preserve {
+                apply_mode(&target, entry.mode);
+                apply_mtime(&target, entry.modified);
+            }
+        }
     }
     Ok(())
 }
