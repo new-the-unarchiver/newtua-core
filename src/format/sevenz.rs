@@ -72,17 +72,46 @@ impl FormatHandler for SevenZHandler {
             .collect();
         let names = decode_names(&raw_names, opts.encoding_override.as_deref());
 
+        // Build a per-file encryption lookup: does the file's folder use AES?
+        // archive.stream_map.file_folder_index[i] maps file index → folder index
+        // (None for files that have no data stream, e.g. empty dirs).
+        // Folders whose coder list contains the AES-256/SHA-256 method ID are
+        // considered encrypted regardless of whether a password was supplied.
+        let aes_id = sevenz_rust2::SevenZMethod::ID_AES256SHA256;
+        let folder_is_encrypted: Vec<bool> = archive
+            .folders
+            .iter()
+            .map(|folder| {
+                folder
+                    .coders
+                    .iter()
+                    .any(|coder| coder.decompression_method_id() == aes_id)
+            })
+            .collect();
+
         let entries: Vec<Entry> = archive
             .files
             .iter()
+            .enumerate()
             .zip(names)
-            .map(|(file, name)| Entry {
-                path_raw: file.name().as_bytes().to_vec(),
-                path: std::path::PathBuf::from(name),
-                size: file.size(),
-                is_dir: file.is_directory(),
-                is_encrypted: opts.password.is_some(),
-                modified: None,
+            .map(|((file_idx, file), name)| {
+                // Resolve per-entry encryption from the folder coder chain.
+                let is_encrypted = archive
+                    .stream_map
+                    .file_folder_index
+                    .get(file_idx)
+                    .and_then(|&fi| fi)
+                    .and_then(|fi| folder_is_encrypted.get(fi))
+                    .copied()
+                    .unwrap_or(false);
+                Entry {
+                    path_raw: file.name().as_bytes().to_vec(),
+                    path: std::path::PathBuf::from(name),
+                    size: file.size(),
+                    is_dir: file.is_directory(),
+                    is_encrypted,
+                    modified: None,
+                }
             })
             .collect();
 

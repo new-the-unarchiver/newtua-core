@@ -46,6 +46,54 @@ fn wrong_password_errors() {
     ));
 }
 
+/// Opening an UNENCRYPTED archive with a spurious password must report
+/// `is_encrypted == false` for every entry.  The old password-based hack
+/// returned `true` here (regression test: RED before fix, GREEN after).
+#[test]
+fn unencrypted_archive_with_spurious_password_is_not_encrypted() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let opts = OpenOptions {
+        password: Some("spurious".into()),
+        encoding_override: None,
+    };
+    let mut ar = SevenZHandler.open(src, &opts).unwrap();
+    let entries = ar.entries().unwrap();
+    assert!(!entries.is_empty());
+    for entry in entries {
+        assert!(
+            !entry.is_encrypted,
+            "plain archive entry must not be marked encrypted even when a password is supplied"
+        );
+    }
+}
+
+/// Opening an AES-encrypted archive (header-encrypted, -mhe=on) with the
+/// correct password must report `is_encrypted == true` for every data entry.
+#[test]
+fn encrypted_archive_reports_is_encrypted_true() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), ENC_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let opts = OpenOptions {
+        password: Some("pw".into()),
+        encoding_override: None,
+    };
+    let mut ar = SevenZHandler.open(src, &opts).unwrap();
+    let entries = ar.entries().unwrap();
+    assert!(!entries.is_empty());
+    // Every entry in secret.7z is in an AES-encrypted folder.
+    let data_entries: Vec<_> = entries.iter().filter(|e| !e.is_dir).collect();
+    assert!(!data_entries.is_empty(), "expected at least one file entry");
+    for entry in data_entries {
+        assert!(
+            entry.is_encrypted,
+            "encrypted archive entry must be marked encrypted"
+        );
+    }
+}
+
 /// Verifies on-demand per-index extraction: opening a two-entry archive must
 /// list both entries and extract each one independently (without buffering the
 /// other entry into RAM).
