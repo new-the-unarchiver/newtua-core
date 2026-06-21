@@ -22,6 +22,55 @@ pub fn safe_join(dest_root: &Path, entry_path: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// Validate that a symlink placed at `dest_root/link_rel` and pointing to
+/// `target` resolves (lexically) to a location inside `dest_root`.
+///
+/// `safe_join` only protects literal write paths; it does not resolve
+/// symlinks. Validating that every created symlink points inside `dest_root`
+/// is what prevents a later write from escaping through the link.
+pub fn safe_symlink_target(_dest_root: &Path, link_rel: &Path, target: &Path) -> Result<()> {
+    // Normalize Windows separators in the archive-supplied target.
+    let target_norm = target.to_string_lossy().replace('\\', "/");
+    let target = Path::new(&target_norm);
+
+    // Absolute targets always escape a relative extraction root.
+    if target.is_absolute() {
+        return Err(Error::PathTraversal(target_norm));
+    }
+
+    // Start from the symlink's PARENT directory (relative to dest_root) and
+    // apply the target's components, tracking depth below dest_root.
+    // depth must never go negative (that would mean leaving dest_root).
+    let mut depth: i64 = 0;
+    for comp in link_rel.components() {
+        if let Component::Normal(_) = comp {
+            depth += 1;
+        }
+    }
+    // The link itself is the last component of link_rel; the target is
+    // resolved relative to the link's directory, so drop one level.
+    if depth > 0 {
+        depth -= 1;
+    }
+
+    for comp in target.components() {
+        match comp {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(Error::PathTraversal(target_norm));
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::PathTraversal(target_norm));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,30 +109,47 @@ mod symlink_tests {
     #[test]
     fn relative_target_inside_is_ok() {
         // link at out/sub/link -> ../file  =>  out/file  (inside)
-        assert!(safe_symlink_target(Path::new("/out"), Path::new("sub/link"), Path::new("../file")).is_ok());
+        assert!(
+            safe_symlink_target(
+                Path::new("/out"),
+                Path::new("sub/link"),
+                Path::new("../file")
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn same_dir_target_is_ok() {
-        assert!(safe_symlink_target(Path::new("/out"), Path::new("a/link"), Path::new("sibling")).is_ok());
+        assert!(
+            safe_symlink_target(Path::new("/out"), Path::new("a/link"), Path::new("sibling"))
+                .is_ok()
+        );
     }
 
     #[test]
     fn escaping_relative_target_rejected() {
         // link at out/link -> ../../etc  => escapes /out
-        let e = safe_symlink_target(Path::new("/out"), Path::new("link"), Path::new("../../etc")).unwrap_err();
+        let e = safe_symlink_target(Path::new("/out"), Path::new("link"), Path::new("../../etc"))
+            .unwrap_err();
         assert!(matches!(e, crate::Error::PathTraversal(_)));
     }
 
     #[test]
     fn absolute_target_rejected() {
-        let e = safe_symlink_target(Path::new("/out"), Path::new("link"), Path::new("/etc/passwd")).unwrap_err();
+        let e = safe_symlink_target(
+            Path::new("/out"),
+            Path::new("link"),
+            Path::new("/etc/passwd"),
+        )
+        .unwrap_err();
         assert!(matches!(e, crate::Error::PathTraversal(_)));
     }
 
     #[test]
     fn windows_backslash_escape_rejected() {
-        let e = safe_symlink_target(Path::new("/out"), Path::new("link"), Path::new("..\\..\\x")).unwrap_err();
+        let e = safe_symlink_target(Path::new("/out"), Path::new("link"), Path::new("..\\..\\x"))
+            .unwrap_err();
         assert!(matches!(e, crate::Error::PathTraversal(_)));
     }
 }

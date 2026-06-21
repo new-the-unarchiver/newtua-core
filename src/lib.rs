@@ -13,7 +13,7 @@ pub mod encoding;
 pub use encoding::decode_names;
 
 pub mod path_safety;
-pub use path_safety::safe_join;
+pub use path_safety::{safe_join, safe_symlink_target};
 
 pub mod decompress;
 pub use decompress::{Compressor, decompressor};
