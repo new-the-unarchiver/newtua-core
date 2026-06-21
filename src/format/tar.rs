@@ -9,6 +9,23 @@ use crate::error::{Error, Result};
 
 pub struct TarHandler;
 
+/// Private staging enum used during tar indexing to carry entry-type info
+/// before symlink targets have been decoded.
+enum EntryKindRaw {
+    File,
+    Dir,
+    Symlink(Vec<u8>),
+}
+
+/// Staging metadata collected for each entry during the index pass.
+type EntryMeta = (
+    u64,
+    u64,
+    Option<std::time::SystemTime>,
+    Option<u32>,
+    EntryKindRaw,
+);
+
 impl FormatHandler for TarHandler {
     fn id(&self) -> FormatId {
         FormatId::Tar
@@ -98,13 +115,14 @@ fn index_from_reader<R: Read + Seek>(
     opts: &OpenOptions,
 ) -> Result<(Vec<Entry>, Vec<u64>)> {
     let mut raw_names: Vec<Vec<u8>> = Vec::new();
-    let mut metas: Vec<(u64, bool, u64, Option<std::time::SystemTime>)> = Vec::new();
+    let mut metas: Vec<EntryMeta> = Vec::new();
 
     let mut ar = tar::Archive::new(reader);
     for entry in ar.entries().map_err(|e| Error::Corrupt(e.to_string()))? {
         let entry = entry.map_err(|e| Error::Corrupt(e.to_string()))?;
         let header = entry.header();
-        let is_dir = header.entry_type().is_dir();
+        let entry_type = header.entry_type();
+        let mode = header.mode().ok();
         let size = header.size().map_err(|e| Error::Corrupt(e.to_string()))?;
         let path_bytes = entry.path_bytes().to_vec();
         let offset = entry.raw_file_position();
@@ -112,8 +130,19 @@ fn index_from_reader<R: Read + Seek>(
             .mtime()
             .ok()
             .map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
+        let kind_raw = if entry_type.is_symlink() {
+            let target_raw = entry
+                .link_name_bytes()
+                .map(|c| c.into_owned())
+                .unwrap_or_default();
+            EntryKindRaw::Symlink(target_raw)
+        } else if entry_type.is_dir() {
+            EntryKindRaw::Dir
+        } else {
+            EntryKindRaw::File
+        };
         raw_names.push(path_bytes);
-        metas.push((size, is_dir, offset, modified));
+        metas.push((size, offset, modified, mode, kind_raw));
     }
 
     build_entries(raw_names, metas, opts)
@@ -122,13 +151,14 @@ fn index_from_reader<R: Read + Seek>(
 /// Index a tar archive from an in-memory slice.
 fn index_from_slice(data: &[u8], opts: &OpenOptions) -> Result<(Vec<Entry>, Vec<u64>)> {
     let mut raw_names: Vec<Vec<u8>> = Vec::new();
-    let mut metas: Vec<(u64, bool, u64, Option<std::time::SystemTime>)> = Vec::new();
+    let mut metas: Vec<EntryMeta> = Vec::new();
 
     let mut ar = tar::Archive::new(std::io::Cursor::new(data));
     for entry in ar.entries().map_err(|e| Error::Corrupt(e.to_string()))? {
         let entry = entry.map_err(|e| Error::Corrupt(e.to_string()))?;
         let header = entry.header();
-        let is_dir = header.entry_type().is_dir();
+        let entry_type = header.entry_type();
+        let mode = header.mode().ok();
         let size = header.size().map_err(|e| Error::Corrupt(e.to_string()))?;
         let path_bytes = entry.path_bytes().to_vec();
         let offset = entry.raw_file_position();
@@ -136,8 +166,19 @@ fn index_from_slice(data: &[u8], opts: &OpenOptions) -> Result<(Vec<Entry>, Vec<
             .mtime()
             .ok()
             .map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
+        let kind_raw = if entry_type.is_symlink() {
+            let target_raw = entry
+                .link_name_bytes()
+                .map(|c| c.into_owned())
+                .unwrap_or_default();
+            EntryKindRaw::Symlink(target_raw)
+        } else if entry_type.is_dir() {
+            EntryKindRaw::Dir
+        } else {
+            EntryKindRaw::File
+        };
         raw_names.push(path_bytes);
-        metas.push((size, is_dir, offset, modified));
+        metas.push((size, offset, modified, mode, kind_raw));
     }
 
     build_entries(raw_names, metas, opts)
@@ -146,24 +187,42 @@ fn index_from_slice(data: &[u8], opts: &OpenOptions) -> Result<(Vec<Entry>, Vec<
 /// Convert raw name lists and metadata into `(Vec<Entry>, Vec<u64>)`.
 fn build_entries(
     raw_names: Vec<Vec<u8>>,
-    metas: Vec<(u64, bool, u64, Option<std::time::SystemTime>)>,
+    metas: Vec<EntryMeta>,
     opts: &OpenOptions,
 ) -> Result<(Vec<Entry>, Vec<u64>)> {
-    let names = decode_names(&raw_names, opts.encoding_override.as_deref());
+    let encoding_label = opts.encoding_override.as_deref();
+    let names = decode_names(&raw_names, encoding_label);
+
+    // Collect symlink target byte-strings in parallel so they can be decoded
+    // with the same charset as the entry names.
+    let raw_targets: Vec<Vec<u8>> = metas
+        .iter()
+        .map(|(_, _, _, _, kind_raw)| match kind_raw {
+            EntryKindRaw::Symlink(t) => t.clone(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let decoded_targets = decode_names(&raw_targets, encoding_label);
+
     let mut entries = Vec::with_capacity(metas.len());
     let mut offsets = Vec::with_capacity(metas.len());
 
-    for (i, (size, is_dir, offset, modified)) in metas.into_iter().enumerate() {
+    for (i, (size, offset, modified, mode, kind_raw)) in metas.into_iter().enumerate() {
+        let kind = match kind_raw {
+            EntryKindRaw::File => EntryKind::File,
+            EntryKindRaw::Dir => EntryKind::Dir,
+            EntryKindRaw::Symlink(_) => EntryKind::Symlink {
+                target: std::path::PathBuf::from(&decoded_targets[i]),
+            },
+        };
+        // Strip trailing slash from directory paths (tar stores "d/" for dirs).
+        let path_str = names[i].trim_end_matches('/');
         entries.push(Entry {
             path_raw: raw_names[i].clone(),
-            path: std::path::PathBuf::from(&names[i]),
-            kind: if is_dir {
-                EntryKind::Dir
-            } else {
-                EntryKind::File
-            },
+            path: std::path::PathBuf::from(path_str),
+            kind,
             size,
-            mode: None,
+            mode,
             is_encrypted: false,
             modified,
         });
