@@ -64,7 +64,7 @@ fn list_entries(
     encoding: Option<&str>,
 ) -> Result<(Vec<Entry>, bool)> {
     let mut raw_names: Vec<Vec<u8>> = Vec::new();
-    let mut metas: Vec<(u64, bool, bool)> = Vec::new();
+    let mut metas: Vec<(u64, bool, bool, Option<u32>)> = Vec::new();
 
     // The Iterator impl on OpenArchive<List, CursorBeforeHeader> yields Result<FileHeader>.
     // We use it for listing (payloads are skipped automatically).
@@ -92,10 +92,36 @@ fn list_entries(
         let header = item.map_err(map_rar_err)?;
         let raw = header.filename.to_string_lossy().as_bytes().to_vec();
         raw_names.push(raw);
+        // Best-effort unix mode: for Unix-created RARs the unrar crate exposes
+        // file_attr: u32 on FileHeader.  The host OS field exists in the native
+        // HeaderDataEx struct but is NOT forwarded by the vendored FileHeader.
+        //
+        // On Unix hosts (macOS, Linux) RAR stores the full POSIX st_mode value
+        // directly in file_attr (e.g. 0o100755 = 0x81ED for a regular file
+        // with rwxr-xr-x permissions).  The file-type nibble occupies the top
+        // bits of the low 16 bits (S_IFREG = 0o100000 = 0x8000, etc.).
+        //
+        // On Windows hosts file_attr carries FAT/NTFS attribute flags
+        // (FILE_ATTRIBUTE_READONLY = 0x1, DIRECTORY = 0x10, etc.) which are
+        // always small positive integers that cannot set the high bits used by
+        // Unix file-type nibbles.  We detect Unix attributes by checking for a
+        // known POSIX file-type nibble (S_IFREG, S_IFDIR, S_IFLNK).
+        const S_IFMT: u32 = 0o170000;
+        const S_IFREG: u32 = 0o100000;
+        const S_IFDIR: u32 = 0o040000;
+        const S_IFLNK: u32 = 0o120000;
+        let attr = header.file_attr;
+        let file_type = attr & S_IFMT;
+        let mode = if file_type == S_IFREG || file_type == S_IFDIR || file_type == S_IFLNK {
+            Some(attr & 0o7777)
+        } else {
+            None
+        };
         metas.push((
             header.unpacked_size,
             header.is_directory(),
             header.is_encrypted(),
+            mode,
         ));
     }
 
@@ -104,7 +130,7 @@ fn list_entries(
         .into_iter()
         .zip(metas)
         .enumerate()
-        .map(|(i, (raw, (size, is_dir, is_encrypted)))| Entry {
+        .map(|(i, (raw, (size, is_dir, is_encrypted, mode)))| Entry {
             path_raw: raw,
             path: PathBuf::from(&names[i]),
             kind: if is_dir {
@@ -113,7 +139,7 @@ fn list_entries(
                 EntryKind::File
             },
             size,
-            mode: None,
+            mode,
             is_encrypted,
             modified: None,
         })

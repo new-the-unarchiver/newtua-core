@@ -22,7 +22,7 @@ fn lists_and_extracts_rar() {
 //   printf 'x' > f.txt && chmod 0755 f.txt
 //   rar a meta.rar f.txt && rm f.txt
 // (RAR 7.22, Host OS: Unix, Attributes: -rwxr-xr-x)
-// file_attr field: unix mode in high 16 bits; (file_attr >> 16) & 0o7777 == 0o755
+// file_attr = 0o100755 (full POSIX st_mode); file_attr & 0o7777 = 0o755.
 const META_FIXTURE: &[u8] = include_bytes!("fixtures/meta.rar");
 
 #[test]
@@ -37,8 +37,9 @@ fn rar_populates_mode_when_available() {
         .find(|e| e.path.to_str() == Some("f.txt"))
         .expect("f.txt not found in meta.rar");
     // The unrar crate exposes file_attr: u32 on FileHeader.
-    // For Unix-created RARs, file_attr >> 16 is the full st_mode; & 0o7777 strips the type bits.
-    // Host OS is not exposed by FileHeader, but file_attr >> 16 != 0 signals unix attributes.
+    // For Unix-created RARs, file_attr is the full POSIX st_mode (e.g. 0o100755).
+    // We detect Unix attributes by checking the file-type nibble (S_IFREG/S_IFDIR/S_IFLNK),
+    // then mask with 0o7777 to get permission bits only.
     assert_eq!(f.mode, Some(0o755));
 }
 
