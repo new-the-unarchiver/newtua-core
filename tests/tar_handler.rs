@@ -1,6 +1,6 @@
 use newtua_core::error::Error;
 use newtua_core::format::TarHandler;
-use newtua_core::{FormatHandler, OpenOptions, Source};
+use newtua_core::{EntryKind, FormatHandler, OpenOptions, Source};
 
 fn make_tar() -> tempfile::NamedTempFile {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -235,4 +235,71 @@ fn buffer_strategy_corrupt_size_no_panic() {
             );
         }
     }
+}
+
+// ── Task 3: mode + symlink tests ─────────────────────────────────────────────
+
+fn make_tar_with_meta() -> tempfile::NamedTempFile {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let mut b = tar::Builder::new(std::fs::File::create(tmp.path()).unwrap());
+
+    // regular file, mode 0755
+    let data = b"hello";
+    let mut h = tar::Header::new_gnu();
+    h.set_size(data.len() as u64);
+    h.set_mode(0o755);
+    h.set_entry_type(tar::EntryType::Regular);
+    h.set_cksum();
+    b.append_data(&mut h, "exec.sh", &data[..]).unwrap();
+
+    // directory
+    let mut hd = tar::Header::new_gnu();
+    hd.set_size(0);
+    hd.set_mode(0o750);
+    hd.set_entry_type(tar::EntryType::Directory);
+    hd.set_cksum();
+    b.append_data(&mut hd, "d/", &[][..]).unwrap();
+
+    // symlink link -> exec.sh
+    let mut hs = tar::Header::new_gnu();
+    hs.set_size(0);
+    hs.set_entry_type(tar::EntryType::Symlink);
+    hs.set_mode(0o777);
+    b.append_link(&mut hs, "link", "exec.sh").unwrap();
+
+    b.finish().unwrap();
+    tmp
+}
+
+#[test]
+fn tar_populates_mode_and_symlink() {
+    let tmp = make_tar_with_meta();
+    let mut ar = newtua_core::format::TarHandler
+        .open(Source::path(tmp.path()).unwrap(), &OpenOptions::default())
+        .unwrap();
+    let entries = ar.entries().unwrap().to_vec();
+
+    let file = entries
+        .iter()
+        .find(|e| e.path.to_str() == Some("exec.sh"))
+        .unwrap();
+    assert_eq!(file.mode, Some(0o755));
+    assert_eq!(file.kind, EntryKind::File);
+
+    let dir = entries
+        .iter()
+        .find(|e| e.path.to_str() == Some("d"))
+        .unwrap();
+    assert!(dir.is_dir());
+
+    let link = entries
+        .iter()
+        .find(|e| e.path.to_str() == Some("link"))
+        .unwrap();
+    assert_eq!(
+        link.kind,
+        EntryKind::Symlink {
+            target: std::path::PathBuf::from("exec.sh")
+        }
+    );
 }
