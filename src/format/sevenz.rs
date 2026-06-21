@@ -89,7 +89,7 @@ impl FormatHandler for SevenZHandler {
             })
             .collect();
 
-        let entries: Vec<Entry> = archive
+        let mut entries: Vec<Entry> = archive
             .files
             .iter()
             .enumerate()
@@ -154,45 +154,61 @@ impl FormatHandler for SevenZHandler {
 
         // Second pass: populate symlink targets.
         // Symlink content (the link target path) is stored as the entry's payload.
-        // We re-open the archive and iterate once to collect all symlink targets.
-        let has_symlinks = entries
+        // For each symlink we open a SEPARATE SevenZReader, iterate to that entry,
+        // verify the name, read its content, then stop immediately.
+        // This avoids decompressing the full archive and avoids assuming iteration order
+        // — we verify entry.name() matches our expected path_raw before reading.
+        let symlink_indices: Vec<usize> = entries
             .iter()
-            .any(|e| matches!(e.kind, EntryKind::Symlink { .. }));
+            .enumerate()
+            .filter(|(_, e)| matches!(e.kind, EntryKind::Symlink { .. }))
+            .map(|(i, _)| i)
+            .collect();
 
-        let mut entries = entries;
+        for sym_idx in symlink_indices {
+            let expected_name = entries[sym_idx].path_raw.clone();
+            // best-effort: ignore errors — open() must not fail due to symlink target reads
+            let _ = (|| -> Option<()> {
+                let sym_file = File::open(&file_path).ok()?;
+                let mut seven = sevenz_rust2::SevenZReader::new(sym_file, password.clone()).ok()?;
+                let mut counter: usize = 0;
+                let mut target_bytes: Option<Vec<u8>> = None;
 
-        if has_symlinks {
-            // Best-effort: if we can't read targets, leave them empty rather than failing open().
-            if let Ok(sym_file) = File::open(&file_path) {
-                if let Ok(mut seven) = sevenz_rust2::SevenZReader::new(sym_file, password.clone()) {
-                    let mut counter: usize = 0;
-                    let _ = seven.for_each_entries(|_entry, reader| {
-                        if matches!(entries.get(counter), Some(e) if matches!(e.kind, EntryKind::Symlink { .. }))
-                        {
+                let _ = seven.for_each_entries(|entry, reader| {
+                    if counter == sym_idx {
+                        // Verify name matches — defense against ordering assumptions.
+                        if entry.name().as_bytes() == expected_name.as_slice() {
                             let mut buf = Vec::new();
                             if std::io::copy(reader, &mut buf).is_ok() {
-                                // Trim any trailing null bytes and decode.
-                                let s = String::from_utf8_lossy(
-                                    buf.iter()
-                                        .rposition(|&b| b != 0)
-                                        .map(|p| &buf[..=p])
-                                        .unwrap_or(&[]),
-                                );
-                                if let Some(e) = entries.get_mut(counter) {
-                                    e.kind = EntryKind::Symlink {
-                                        target: std::path::PathBuf::from(s.as_ref()),
-                                    };
-                                }
+                                target_bytes = Some(buf);
                             }
-                        } else {
-                            // Skip non-symlink payloads.
-                            let _ = std::io::copy(reader, &mut std::io::sink());
                         }
+                        Ok(false) // stop after this entry
+                    } else {
+                        // Skip preceding entries; for solid archives this still decompresses
+                        // them (unavoidable), but we do not retain the data.
+                        std::io::copy(reader, &mut std::io::sink())?;
                         counter += 1;
                         Ok(true)
-                    });
+                    }
+                });
+
+                if let Some(buf) = target_bytes {
+                    // Trim any trailing null bytes and decode.
+                    let s = String::from_utf8_lossy(
+                        buf.iter()
+                            .rposition(|&b| b != 0)
+                            .map(|p| &buf[..=p])
+                            .unwrap_or(&[]),
+                    );
+                    if !s.is_empty() {
+                        entries[sym_idx].kind = EntryKind::Symlink {
+                            target: std::path::PathBuf::from(s.as_ref()),
+                        };
+                    }
                 }
-            }
+                Some(())
+            })();
         }
 
         Ok(Box::new(SevenZReader {
