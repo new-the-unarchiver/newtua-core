@@ -167,8 +167,9 @@ impl FormatHandler for SevenZHandler {
 
         for sym_idx in symlink_indices {
             let expected_name = entries[sym_idx].path_raw.clone();
-            // best-effort: ignore errors — open() must not fail due to symlink target reads
-            let _ = (|| -> Option<()> {
+            // best-effort: ignore errors — open() must not fail due to symlink target reads.
+            // Returns the decoded, non-empty target if one was successfully read.
+            let target: Option<PathBuf> = (|| -> Option<PathBuf> {
                 let sym_file = File::open(&file_path).ok()?;
                 let mut seven = sevenz_rust2::SevenZReader::new(sym_file, password.clone()).ok()?;
                 let mut counter: usize = 0;
@@ -193,22 +194,31 @@ impl FormatHandler for SevenZHandler {
                     }
                 });
 
-                if let Some(buf) = target_bytes {
-                    // Trim any trailing null bytes and decode.
-                    let s = String::from_utf8_lossy(
-                        buf.iter()
-                            .rposition(|&b| b != 0)
-                            .map(|p| &buf[..=p])
-                            .unwrap_or(&[]),
-                    );
-                    if !s.is_empty() {
-                        entries[sym_idx].kind = EntryKind::Symlink {
-                            target: std::path::PathBuf::from(s.as_ref()),
-                        };
-                    }
+                let buf = target_bytes?;
+                // Trim any trailing null bytes, then decode the target with the
+                // SAME charset as entry names (honoring opts.encoding_override),
+                // matching how tar/zip decode their symlink targets.
+                let trimmed: Vec<u8> = buf
+                    .iter()
+                    .rposition(|&b| b != 0)
+                    .map(|p| buf[..=p].to_vec())
+                    .unwrap_or_default();
+                let s = decode_names(&[trimmed], opts.encoding_override.as_deref())
+                    .pop()
+                    .unwrap_or_default();
+                if s.is_empty() {
+                    return None;
                 }
-                Some(())
+                Some(PathBuf::from(s))
             })();
+
+            match target {
+                Some(target) => entries[sym_idx].kind = EntryKind::Symlink { target },
+                // No usable target was read (empty/unreadable): fall back to a
+                // regular File so extraction produces a real file, not a dangling
+                // symlink pointing at "".
+                None => entries[sym_idx].kind = EntryKind::File,
+            }
         }
 
         Ok(Box::new(SevenZReader {
@@ -326,5 +336,26 @@ mod tests {
     #[test]
     fn sevenz_handler_id_is_sevenz() {
         assert_eq!(SevenZHandler.id(), FormatId::SevenZ);
+    }
+
+    /// Fix B: the symlink target must be decoded with the SAME charset layer as
+    /// names (honoring an encoding override), not hard-coded UTF-8. This mirrors
+    /// the decode applied to the raw target bytes inside `open()`.
+    #[test]
+    fn symlink_target_honors_encoding_override() {
+        // 0xE9 = 'é' in windows-1252; UTF-8 lossy would mangle it to U+FFFD.
+        let raw_target = vec![b'c', b'a', b'f', 0xE9];
+        let decoded = decode_names(&[raw_target], Some("windows-1252"))
+            .pop()
+            .unwrap();
+        assert_eq!(decoded, "café");
+    }
+
+    /// Fix A: an empty (unreadable) target decodes to an empty string, which the
+    /// handler treats as "no usable target" and falls back to `EntryKind::File`.
+    #[test]
+    fn empty_symlink_target_yields_empty_string() {
+        let decoded = decode_names(&[Vec::new()], None).pop().unwrap();
+        assert!(decoded.is_empty());
     }
 }
