@@ -78,3 +78,40 @@ fn non_zip_open_errors() {
     let src = Source::path(tmp.path()).unwrap();
     assert!(ZipHandler.open(src, &OpenOptions::default()).is_err());
 }
+
+fn make_zip_with_symlink() -> tempfile::NamedTempFile {
+    let tmp = tempfile::Builder::new().suffix(".zip").tempfile().unwrap();
+    let mut w = zip::ZipWriter::new(std::fs::File::create(tmp.path()).unwrap());
+
+    // regular file, mode 0644
+    let opts: zip::write::FileOptions<()> =
+        zip::write::FileOptions::default().unix_permissions(0o644);
+    w.start_file("f.txt", opts).unwrap();
+    use std::io::Write as _;
+    w.write_all(b"hi").unwrap();
+
+    // symlink "link" -> "f.txt": unix mode S_IFLNK | 0777, content = target
+    let lopts: zip::write::FileOptions<()> =
+        zip::write::FileOptions::default().unix_permissions(0o120777);
+    w.start_file("link", lopts).unwrap();
+    w.write_all(b"f.txt").unwrap();
+
+    w.finish().unwrap();
+    tmp
+}
+
+#[test]
+fn zip_populates_mode_and_symlink() {
+    use newtua_core::EntryKind;
+    let tmp = make_zip_with_symlink();
+    let mut ar = newtua_core::format::ZipHandler
+        .open(Source::path(tmp.path()).unwrap(), &OpenOptions::default())
+        .unwrap();
+    let entries = ar.entries().unwrap().to_vec();
+
+    let f = entries.iter().find(|e| e.path.to_str() == Some("f.txt")).unwrap();
+    assert_eq!(f.mode, Some(0o644));
+
+    let link = entries.iter().find(|e| e.path.to_str() == Some("link")).unwrap();
+    assert_eq!(link.kind, EntryKind::Symlink { target: std::path::PathBuf::from("f.txt") });
+}
