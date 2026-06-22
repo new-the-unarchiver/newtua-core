@@ -51,14 +51,18 @@ impl FormatHandler for ArHandler {
             metas.push((header.size(), mode, modified));
         }
 
-        // ar member names are raw bytes (Unix paths, no `\`); decode like
-        // zip/tar so the `--encoding` override applies uniformly.
+        // ar member names are raw bytes (Unix paths, no `\`); decode the whole
+        // batch at once (single charset detection) like zip/tar so the
+        // `--encoding` override applies uniformly. `raw_names` is not needed
+        // afterwards, so consume both vectors instead of cloning.
         let names = decode_names(&raw_names, opts.encoding_override.as_deref());
         let mut entries = Vec::with_capacity(metas.len());
-        for (i, (size, mode, modified)) in metas.into_iter().enumerate() {
+        for ((path_raw, name), (size, mode, modified)) in
+            raw_names.into_iter().zip(names).zip(metas)
+        {
             entries.push(Entry {
-                path_raw: raw_names[i].clone(),
-                path: std::path::PathBuf::from(&names[i]),
+                path_raw,
+                path: std::path::PathBuf::from(name),
                 kind: EntryKind::File,
                 size,
                 mode,
