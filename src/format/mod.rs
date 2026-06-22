@@ -1,3 +1,6 @@
+pub mod cab;
+pub use cab::CabHandler;
+
 pub mod tar;
 pub use tar::TarHandler;
 
