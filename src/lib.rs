@@ -29,6 +29,7 @@ pub use detect::{detect_compressor, open, registry};
 pub mod extract;
 pub use extract::{
     ExtractOptions, ExtractReport, Flow, ProgressEvent, ProgressFn, common_root, extract_all,
+    wrapper_name,
 };
 
 pub mod macos;

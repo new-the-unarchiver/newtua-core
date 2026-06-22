@@ -129,6 +129,19 @@ pub fn common_root(entries: &[Entry]) -> Option<String> {
     if is_dir_root { root } else { None }
 }
 
+/// The wrapper-folder name for an archive: its file stem when `use_wrapper` is
+/// set, else `None`. Used as `ExtractOptions::wrapper_name` so contents without
+/// a single common root get wrapped in a folder named after the archive.
+pub fn wrapper_name(archive: &Path, use_wrapper: bool) -> Option<String> {
+    if use_wrapper {
+        archive
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
 pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &mut ExtractOptions) -> Result<ExtractReport> {
     let entries: Vec<Entry> = ar.entries()?.to_vec();
     let mut report = ExtractReport::default();
