@@ -22,8 +22,54 @@ impl FormatHandler for CabHandler {
         }
     }
 
-    fn open(&self, src: Source, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
-        open_cab(src, opts)
+    fn open(&self, src: Source, _opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
+        let inner: Box<dyn ReadSeek> = match src {
+            Source::Seekable { inner, .. } => inner,
+            Source::Stream { .. } => {
+                return Err(Error::Unsupported {
+                    format: "cab".into(),
+                    feature: "streaming (cab requires seek)".into(),
+                });
+            }
+        };
+        let cab = cab::Cabinet::new(inner).map_err(map_cab_err)?;
+
+        let mut entries: Vec<Entry> = Vec::new();
+        let mut quantum: Vec<bool> = Vec::new();
+        for folder in cab.folder_entries() {
+            let is_quantum = matches!(
+                folder.compression_type(),
+                cab::CompressionType::Quantum(_, _)
+            );
+            for file in folder.file_entries() {
+                let raw = file.name();
+                // CAB stores local wall-clock time without a timezone; we assume
+                // UTC (matches The Unarchiver's behavior).
+                let modified = file
+                    .datetime()
+                    .map(|dt| dt.assume_utc().unix_timestamp())
+                    .and_then(unix_secs_to_systime);
+                entries.push(Entry {
+                    path_raw: raw.as_bytes().to_vec(),
+                    // CAB uses `\` separators; normalize to `/` so list output and
+                    // common-root/wrapper detection (which read `Entry::path`)
+                    // work. `safe_join` re-normalizes for the on-disk write path.
+                    path: std::path::PathBuf::from(raw.replace('\\', "/")),
+                    kind: EntryKind::File,
+                    size: file.uncompressed_size() as u64,
+                    mode: None,
+                    is_encrypted: false,
+                    modified,
+                });
+                quantum.push(is_quantum);
+            }
+        }
+
+        Ok(Box::new(CabReader {
+            cab,
+            entries,
+            quantum,
+        }))
     }
 }
 
@@ -47,62 +93,9 @@ fn map_cab_err(e: std::io::Error) -> Error {
     }
 }
 
-fn open_cab(src: Source, _opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
-    let inner: Box<dyn ReadSeek> = match src {
-        Source::Seekable { inner, .. } => inner,
-        Source::Stream { .. } => {
-            return Err(Error::Unsupported {
-                format: "cab".into(),
-                feature: "streaming (cab requires seek)".into(),
-            });
-        }
-    };
-    let cab = cab::Cabinet::new(inner).map_err(map_cab_err)?;
-
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut names: Vec<String> = Vec::new();
-    let mut quantum: Vec<bool> = Vec::new();
-    for folder in cab.folder_entries() {
-        let is_quantum = matches!(
-            folder.compression_type(),
-            cab::CompressionType::Quantum(_, _)
-        );
-        for file in folder.file_entries() {
-            let raw = file.name();
-            let path = std::path::PathBuf::from(raw.replace('\\', "/"));
-            // CAB stores local wall-clock time without a timezone; we assume UTC
-            // (matches The Unarchiver's behavior).
-            let modified = file
-                .datetime()
-                .map(|dt| dt.assume_utc().unix_timestamp())
-                .and_then(unix_secs_to_systime);
-            entries.push(Entry {
-                path_raw: raw.as_bytes().to_vec(),
-                path,
-                kind: EntryKind::File,
-                size: file.uncompressed_size() as u64,
-                mode: None,
-                is_encrypted: false,
-                modified,
-            });
-            names.push(raw.to_string());
-            quantum.push(is_quantum);
-        }
-    }
-
-    Ok(Box::new(CabReader {
-        cab,
-        entries,
-        names,
-        quantum,
-    }))
-}
-
 struct CabReader {
     cab: cab::Cabinet<Box<dyn ReadSeek>>,
     entries: Vec<Entry>,
-    /// Original CAB names (with `\`), passed verbatim to `read_file`.
-    names: Vec<String>,
     /// True when entry `i`'s folder uses Quantum compression (unreadable).
     quantum: Vec<bool>,
 }
@@ -126,10 +119,11 @@ impl ArchiveReader for CabReader {
                 feature: "Quantum compression".into(),
             });
         }
-        let name = self.names[idx].clone();
-        // The `cab` crate resolves files by name; CAB archives normally have unique paths,
-        // but if duplicate names existed across folders, `read_file` returns the first match
-        // — accepted for v1 (single-file cabinets).
+        // The `cab` crate resolves files by name; recover the original CAB name
+        // (with `\`) from the stored raw bytes — CAB names arrive as valid UTF-8,
+        // so this is lossless. Duplicate names across folders resolve to the first
+        // match — accepted for v1 (single-file cabinets).
+        let name = String::from_utf8_lossy(&self.entries[idx].path_raw);
         let mut reader = self.cab.read_file(&name).map_err(map_cab_err)?;
         std::io::copy(&mut reader, out)?;
         Ok(())

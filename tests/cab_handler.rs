@@ -16,10 +16,9 @@ fn make_cab(files: &[(&str, &[u8])]) -> tempfile::NamedTempFile {
     }
     let file = std::fs::File::create(tmp.path()).unwrap();
     let mut cw = builder.build(file).unwrap();
-    let mut i = 0;
+    let mut data = files.iter();
     while let Some(mut w) = cw.next_file().unwrap() {
-        w.write_all(files[i].1).unwrap();
-        i += 1;
+        w.write_all(data.next().unwrap().1).unwrap();
     }
     cw.finish().unwrap();
     tmp
