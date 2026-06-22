@@ -70,6 +70,8 @@ fn open_cab(src: Source, _opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> 
         for file in folder.file_entries() {
             let raw = file.name();
             let path = std::path::PathBuf::from(raw.replace('\\', "/"));
+            // CAB stores local wall-clock time without a timezone; we assume UTC
+            // (matches The Unarchiver's behavior).
             let modified = file
                 .datetime()
                 .map(|dt| dt.assume_utc().unix_timestamp())
@@ -125,6 +127,9 @@ impl ArchiveReader for CabReader {
             });
         }
         let name = self.names[idx].clone();
+        // The `cab` crate resolves files by name; CAB archives normally have unique paths,
+        // but if duplicate names existed across folders, `read_file` returns the first match
+        // — accepted for v1 (single-file cabinets).
         let mut reader = self.cab.read_file(&name).map_err(map_cab_err)?;
         std::io::copy(&mut reader, out)?;
         Ok(())
@@ -163,5 +168,17 @@ mod tests {
             Some(SystemTime::UNIX_EPOCH + Duration::from_secs(60))
         );
         assert_eq!(unix_secs_to_systime(-1), None);
+    }
+
+    #[test]
+    fn map_cab_err_invalid_data_is_corrupt() {
+        let e = std::io::Error::from(std::io::ErrorKind::InvalidData);
+        assert!(matches!(map_cab_err(e), Error::Corrupt(_)));
+    }
+
+    #[test]
+    fn map_cab_err_not_found_is_io() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(matches!(map_cab_err(e), Error::Io(_)));
     }
 }
