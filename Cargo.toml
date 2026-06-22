@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+ar.workspace = true
 filetime.workspace = true
 thiserror.workspace = true
 encoding_rs.workspace = true

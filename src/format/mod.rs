@@ -1,3 +1,6 @@
+pub mod ar;
+pub use ar::ArHandler;
+
 pub mod cab;
 pub use cab::CabHandler;
 
