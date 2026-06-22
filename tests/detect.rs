@@ -227,6 +227,29 @@ fn single_bz2_mtime_is_none() {
     );
 }
 
+#[test]
+fn opens_cab_by_magic() {
+    use cab::{CabinetBuilder, CompressionType};
+    let tmp = tempfile::Builder::new().suffix(".cab").tempfile().unwrap();
+    {
+        let mut builder = CabinetBuilder::new();
+        {
+            let folder = builder.add_folder(CompressionType::MsZip);
+            folder.add_file("a.txt".to_string());
+        }
+        let file = std::fs::File::create(tmp.path()).unwrap();
+        let mut cw = builder.build(file).unwrap();
+        while let Some(mut w) = cw.next_file().unwrap() {
+            w.write_all(b"cab!").unwrap();
+        }
+        cw.finish().unwrap();
+    }
+    let mut ar = open(tmp.path(), &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path.to_str().unwrap(), "a.txt");
+}
+
 /// read_entry with out-of-range index on a single-file reader must return an error.
 #[test]
 fn single_gz_out_of_range_index_errors() {

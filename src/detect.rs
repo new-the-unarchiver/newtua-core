@@ -7,7 +7,7 @@ use crate::archive::{
 };
 use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
-use crate::format::{RarHandler, SevenZHandler, TarHandler, ZipHandler};
+use crate::format::{CabHandler, RarHandler, SevenZHandler, TarHandler, ZipHandler};
 use crate::volume::{ConcatReader, volume_members};
 
 /// Returns the full handler registry in priority order.
@@ -17,6 +17,7 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
         Box::new(SevenZHandler),
         Box::new(RarHandler),
         Box::new(TarHandler),
+        Box::new(CabHandler),
     ]
 }
 
@@ -325,8 +326,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_four_handlers() {
-        assert_eq!(registry().len(), 4);
+    fn registry_has_five_handlers() {
+        assert_eq!(registry().len(), 5);
     }
 
     #[test]
