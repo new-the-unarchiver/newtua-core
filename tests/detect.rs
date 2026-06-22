@@ -250,6 +250,23 @@ fn opens_cab_by_magic() {
     assert_eq!(entries[0].path.to_str().unwrap(), "a.txt");
 }
 
+#[test]
+fn opens_ar_by_magic() {
+    use ar::{GnuBuilder, Header};
+    let tmp = tempfile::Builder::new().suffix(".a").tempfile().unwrap();
+    {
+        let file = std::fs::File::create(tmp.path()).unwrap();
+        let mut builder = GnuBuilder::new(file, vec![b"hello.txt".to_vec()]);
+        let header = Header::new(b"hello.txt".to_vec(), 5);
+        builder.append(&header, &b"world"[..]).unwrap();
+        builder.into_inner().unwrap();
+    }
+    let mut ar = open(tmp.path(), &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path.to_str().unwrap(), "hello.txt");
+}
+
 /// read_entry with out-of-range index on a single-file reader must return an error.
 #[test]
 fn single_gz_out_of_range_index_errors() {
