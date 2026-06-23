@@ -311,6 +311,25 @@ impl ArchiveReader for SevenZReader {
         Ok(&self.entries)
     }
 
+    fn verify_password(&mut self) -> Result<()> {
+        let Some(idx) = self.entries.iter().position(|e| e.is_encrypted) else {
+            return Ok(());
+        };
+        if self.password.is_none() {
+            return Err(Error::Encrypted);
+        }
+        // У AES-7z нет дешёвой проверки заголовка: расшифровываем первую
+        // зашифрованную запись «в раковину». Заголовок уже разобран в open(),
+        // поэтому отказ при заданном пароле трактуем как неверный пароль.
+        // (Ограничение sevenz-rust2: на content-7z чужой пароль иногда даёт
+        // мусор без ошибки — см. spec; этот случай поймать нельзя.)
+        match self.read_entry(idx, &mut std::io::sink()) {
+            Ok(()) => Ok(()),
+            Err(Error::Encrypted) => Err(Error::Encrypted),
+            Err(_) => Err(Error::WrongPassword),
+        }
+    }
+
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
         // Validate index before doing any I/O.
         if idx >= self.entries.len() {
