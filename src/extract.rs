@@ -144,6 +144,13 @@ pub fn wrapper_name(archive: &Path, use_wrapper: bool) -> Option<String> {
 
 pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &mut ExtractOptions) -> Result<ExtractReport> {
     let entries: Vec<Entry> = ar.entries()?.to_vec();
+
+    // Пароль-пре-флайт. До создания каких-либо файлов убеждаемся, что архив
+    // расшифровывается заданным паролем. Так ошибка пароля поднимается наверх
+    // единообразно для всех форматов (а не тонет в report.failed) и не остаётся
+    // частичных файлов. Листинг (open/entries) пароля по-прежнему не требует.
+    ar.verify_password()?;
+
     let mut report = ExtractReport::default();
 
     // Selected subset for wrapper/common-root computation.
