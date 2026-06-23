@@ -205,6 +205,19 @@ impl ArchiveReader for ZipReader {
         Ok(&self.entries)
     }
 
+    fn verify_password(&mut self) -> Result<()> {
+        let Some(idx) = self.entries.iter().position(|e| e.is_encrypted) else {
+            return Ok(());
+        };
+        let pw = self.password.clone().ok_or(Error::Encrypted)?;
+        // Конструирование дешифратора проверяет пароль по заголовку записи
+        // (ZipCrypto — контрольный байт, AES — верификатор), без чтения тела.
+        self.zip
+            .by_index_decrypt(idx, pw.as_bytes())
+            .map(|_| ())
+            .map_err(map_zip_err)
+    }
+
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
         let is_encrypted = self
             .entries
