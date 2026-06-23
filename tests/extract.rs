@@ -31,6 +31,14 @@ fn make_zip(entries: &[(&str, &[u8])]) -> tempfile::NamedTempFile {
 }
 
 #[test]
+fn verify_password_ok_on_unencrypted_archive() {
+    // Незашифрованный архив: дефолтная реализация verify_password → Ok(()).
+    let zip = make_zip(&[("a.txt", b"A"), ("b.txt", b"B")]);
+    let mut ar = open(zip.path(), &OpenOptions::default()).unwrap();
+    assert!(ar.verify_password().is_ok());
+}
+
+#[test]
 fn extracts_files_to_dest() {
     let zip = make_zip(&[("root/a.txt", b"A"), ("root/b.txt", b"B")]);
     let dest = tempfile::tempdir().unwrap();
