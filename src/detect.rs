@@ -64,6 +64,10 @@ impl ArchiveReader for TempBackedReader {
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
         self.inner.read_entry(idx, out)
     }
+
+    fn verify_password(&mut self) -> Result<()> {
+        self.inner.verify_password()
+    }
 }
 
 // ── SingleFileReader ──────────────────────────────────────────────────────────
