@@ -72,6 +72,46 @@ fn wrong_password_reported() {
 }
 
 #[test]
+fn verify_password_without_password_is_encrypted() {
+    let tmp = make_zip(Some("secret"));
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = ZipHandler.open(src, &OpenOptions::default()).unwrap();
+    assert!(matches!(ar.verify_password(), Err(Error::Encrypted)));
+}
+
+#[test]
+fn verify_password_with_wrong_password_is_wrong_password() {
+    let tmp = make_zip(Some("secret"));
+    let src = Source::path(tmp.path()).unwrap();
+    let opts = OpenOptions {
+        password: Some("WRONG".into()),
+        encoding_override: None,
+    };
+    let mut ar = ZipHandler.open(src, &opts).unwrap();
+    assert!(matches!(ar.verify_password(), Err(Error::WrongPassword)));
+}
+
+#[test]
+fn verify_password_with_correct_password_is_ok() {
+    let tmp = make_zip(Some("secret"));
+    let src = Source::path(tmp.path()).unwrap();
+    let opts = OpenOptions {
+        password: Some("secret".into()),
+        encoding_override: None,
+    };
+    let mut ar = ZipHandler.open(src, &opts).unwrap();
+    assert!(ar.verify_password().is_ok());
+}
+
+#[test]
+fn verify_password_ok_on_plain_zip() {
+    let tmp = make_zip(None);
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = ZipHandler.open(src, &OpenOptions::default()).unwrap();
+    assert!(ar.verify_password().is_ok());
+}
+
+#[test]
 fn non_zip_open_errors() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), b"plain text").unwrap();
