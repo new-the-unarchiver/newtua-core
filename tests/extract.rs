@@ -400,3 +400,84 @@ fn no_preserve_skips_mtime() {
     // With preserve=false the file keeps "now", far from 2020.
     assert!(mtime.duration_since(expected).unwrap() > Duration::from_secs(60 * 60 * 24));
 }
+
+// secret.zip: ZipCrypto-encrypted (classic `zip -P pw`), two entries
+// (a.txt, inner.txt), password "pw". The encrypted-extract guard must surface
+// as a top-level error and leave NOTHING on disk.
+const ENC_ZIP_FIXTURE: &[u8] = include_bytes!("fixtures/secret.zip");
+
+fn write_secret_zip() -> tempfile::NamedTempFile {
+    let tmp = tempfile::Builder::new().suffix(".zip").tempfile().unwrap();
+    std::fs::write(tmp.path(), ENC_ZIP_FIXTURE).unwrap();
+    tmp
+}
+
+fn extract_opts(dest: &std::path::Path) -> ExtractOptions {
+    ExtractOptions {
+        dest: dest.to_path_buf(),
+        wrapper_name: Some("secret".into()),
+        strict: false,
+        preserve: false,
+        selection: None,
+        progress: None,
+        keep_macos_metadata: false,
+    }
+}
+
+fn dest_is_empty(dest: &std::path::Path) -> bool {
+    std::fs::read_dir(dest).unwrap().next().is_none()
+}
+
+#[test]
+fn extract_encrypted_zip_without_password_is_encrypted_and_writes_nothing() {
+    use newtua_core::Error;
+    let zip = write_secret_zip();
+    let dest = tempfile::tempdir().unwrap();
+    let mut ar = open(zip.path(), &OpenOptions::default()).unwrap();
+    let err = extract_all(&mut *ar, &mut extract_opts(dest.path())).unwrap_err();
+    assert!(matches!(err, Error::Encrypted));
+    assert!(
+        dest_is_empty(dest.path()),
+        "dest must be empty on auth failure"
+    );
+}
+
+#[test]
+fn extract_encrypted_zip_with_wrong_password_is_wrong_password_and_writes_nothing() {
+    use newtua_core::Error;
+    let zip = write_secret_zip();
+    let dest = tempfile::tempdir().unwrap();
+    let opts = OpenOptions {
+        password: Some("WRONG".into()),
+        encoding_override: None,
+    };
+    let mut ar = open(zip.path(), &opts).unwrap();
+    let err = extract_all(&mut *ar, &mut extract_opts(dest.path())).unwrap_err();
+    assert!(matches!(err, Error::WrongPassword));
+    assert!(
+        dest_is_empty(dest.path()),
+        "dest must be empty on auth failure"
+    );
+}
+
+#[test]
+fn extract_encrypted_zip_with_correct_password_succeeds() {
+    let zip = write_secret_zip();
+    let dest = tempfile::tempdir().unwrap();
+    let opts = OpenOptions {
+        password: Some("pw".into()),
+        encoding_override: None,
+    };
+    let mut ar = open(zip.path(), &opts).unwrap();
+    let report = extract_all(&mut *ar, &mut extract_opts(dest.path())).unwrap();
+    assert_eq!(report.extracted, 2);
+    assert!(report.failed.is_empty());
+    assert_eq!(
+        std::fs::read(dest.path().join("secret/a.txt")).unwrap(),
+        b"hello zip"
+    );
+    assert_eq!(
+        std::fs::read(dest.path().join("secret/inner.txt")).unwrap(),
+        b"inside"
+    );
+}
