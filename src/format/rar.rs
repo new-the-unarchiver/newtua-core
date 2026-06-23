@@ -178,6 +178,22 @@ impl ArchiveReader for RarReader {
         Ok(&self.entries)
     }
 
+    fn verify_password(&mut self) -> Result<()> {
+        let Some(idx) = self.entries.iter().position(|e| e.is_encrypted) else {
+            return Ok(());
+        };
+        // read_entry уже маппит libunrar BadPassword→WrongPassword,
+        // MissingPassword→Encrypted. Расшифровываем первую зашифрованную
+        // запись «в раковину»; прочие ошибки относим к паролю по тому,
+        // был ли он задан.
+        match self.read_entry(idx, &mut std::io::sink()) {
+            Ok(()) => Ok(()),
+            Err(e @ (Error::Encrypted | Error::WrongPassword)) => Err(e),
+            Err(_) if self.password.is_none() => Err(Error::Encrypted),
+            Err(_) => Err(Error::WrongPassword),
+        }
+    }
+
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
         let target = self
             .entries

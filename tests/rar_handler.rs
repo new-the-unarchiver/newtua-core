@@ -68,3 +68,45 @@ fn wrong_password_errors() {
         Error::WrongPassword | Error::Encrypted | Error::Corrupt(_)
     ));
 }
+
+#[test]
+fn verify_password_without_password_is_encrypted() {
+    use newtua_core::Error;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), ENC_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = RarHandler.open(src, &OpenOptions::default()).unwrap();
+    // Listing works without a password; the guard comes from verify_password.
+    ar.entries().unwrap();
+    assert!(matches!(ar.verify_password(), Err(Error::Encrypted)));
+}
+
+#[test]
+fn verify_password_with_wrong_password_errors() {
+    use newtua_core::Error;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), ENC_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let opts = OpenOptions {
+        password: Some("WRONG".into()),
+        encoding_override: None,
+    };
+    let mut ar = RarHandler.open(src, &opts).unwrap();
+    assert!(matches!(
+        ar.verify_password(),
+        Err(Error::WrongPassword) | Err(Error::Encrypted) | Err(Error::Corrupt(_))
+    ));
+}
+
+#[test]
+fn verify_password_with_correct_password_is_ok() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), ENC_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let opts = OpenOptions {
+        password: Some("pw".into()),
+        encoding_override: None,
+    };
+    let mut ar = RarHandler.open(src, &opts).unwrap();
+    assert!(ar.verify_password().is_ok());
+}
