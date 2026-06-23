@@ -15,6 +15,46 @@ const ENC_FIXTURE: &[u8] = include_bytes!("fixtures/secret.7z");
 //   7zz a multi.7z f1.txt f2.txt
 const MULTI_FIXTURE: &[u8] = include_bytes!("fixtures/multi.7z");
 
+// secret_content.7z: CONTENT-only encryption (no -mhe), password "pw":
+//   printf 'hello 7z' > a.txt && 7zz a -ppw secret_content.7z a.txt
+// Header is plaintext, so open()/listing succeed without a password and the
+// encrypted-extract guard must come from verify_password, not open().
+const ENC_CONTENT_FIXTURE: &[u8] = include_bytes!("fixtures/secret_content.7z");
+
+#[test]
+fn content_encrypted_lists_without_password() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), ENC_CONTENT_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = SevenZHandler.open(src, &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].is_encrypted);
+}
+
+#[test]
+fn content_encrypted_verify_without_password_is_encrypted() {
+    use newtua_core::Error;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), ENC_CONTENT_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = SevenZHandler.open(src, &OpenOptions::default()).unwrap();
+    assert!(matches!(ar.verify_password(), Err(Error::Encrypted)));
+}
+
+#[test]
+fn content_encrypted_verify_with_correct_password_is_ok() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), ENC_CONTENT_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let opts = OpenOptions {
+        password: Some("pw".into()),
+        encoding_override: None,
+    };
+    let mut ar = SevenZHandler.open(src, &opts).unwrap();
+    assert!(ar.verify_password().is_ok());
+}
+
 #[test]
 fn lists_and_extracts_7z() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
