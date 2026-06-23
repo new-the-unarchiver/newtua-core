@@ -323,11 +323,8 @@ impl ArchiveReader for SevenZReader {
         // поэтому отказ при заданном пароле трактуем как неверный пароль.
         // (Ограничение sevenz-rust2: на content-7z чужой пароль иногда даёт
         // мусор без ошибки — см. spec; этот случай поймать нельзя.)
-        match self.read_entry(idx, &mut std::io::sink()) {
-            Ok(()) => Ok(()),
-            Err(Error::Encrypted) => Err(Error::Encrypted),
-            Err(_) => Err(Error::WrongPassword),
-        }
+        self.read_entry(idx, &mut std::io::sink())
+            .map_err(|_| Error::WrongPassword)
     }
 
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {

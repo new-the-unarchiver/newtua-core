@@ -209,7 +209,7 @@ impl ArchiveReader for ZipReader {
         let Some(idx) = self.entries.iter().position(|e| e.is_encrypted) else {
             return Ok(());
         };
-        let pw = self.password.clone().ok_or(Error::Encrypted)?;
+        let pw = self.password.as_deref().ok_or(Error::Encrypted)?;
         // Конструирование дешифратора проверяет пароль по заголовку записи
         // (ZipCrypto — контрольный байт, AES — верификатор), без чтения тела.
         self.zip
