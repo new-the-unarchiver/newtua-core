@@ -4,12 +4,13 @@ use crate::archive::{ArchiveReader, Confidence, FormatHandler, FormatId, OpenOpt
 use crate::detect::{TempBackedReader, open_single};
 use crate::error::{Error, Result};
 
-/// Magic byte sequences to search for appended archives in an SFX `.exe`.
-const MAGICS: &[(&[u8], &str)] = &[
-    (b"PK\x03\x04", "zip"),
-    (&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C], "7z"),
-    (b"Rar!\x1A\x07", "rar"),
-    (b"MSCF", "cab"),
+/// Magic byte sequences to search for appended archives in an SFX `.exe`
+/// (zip, 7z, rar, cab).
+const MAGICS: &[&[u8]] = &[
+    b"PK\x03\x04",
+    &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C],
+    b"Rar!\x1A\x07",
+    b"MSCF",
 ];
 
 /// Compute the PE overlay offset — the byte position immediately after the last
@@ -27,21 +28,13 @@ fn pe_overlay_offset(bytes: &[u8]) -> usize {
     }
 }
 
-/// Find the first occurrence of any recognized archive magic in `data`.
-/// Returns the absolute offset (relative to the start of `data`) of the match,
-/// paired with a human-readable format name for diagnostics.
+/// Find the earliest occurrence of any recognized archive magic in `data`,
+/// returning its offset relative to the start of `data`.
 fn find_archive_magic(data: &[u8]) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    for (magic, _label) in MAGICS {
-        // Sliding search for magic in the slice.
-        if let Some(pos) = data.windows(magic.len()).position(|w| w == *magic) {
-            best = Some(match best {
-                None => pos,
-                Some(prev) => prev.min(pos),
-            });
-        }
-    }
-    best
+    MAGICS
+        .iter()
+        .filter_map(|magic| data.windows(magic.len()).position(|w| w == *magic))
+        .min()
 }
 
 pub struct SfxHandler;
@@ -89,22 +82,16 @@ impl FormatHandler for SfxHandler {
         // If parsing fails, floor = 0 (scan the whole file).
         let floor = pe_overlay_offset(&bytes);
 
-        let search_region = if floor < bytes.len() {
-            &bytes[floor..]
-        } else {
-            &bytes[..]
-        };
-
-        // Find the first embedded archive magic in the search region.
-        let rel_offset = find_archive_magic(search_region).ok_or(Error::UnknownFormat)?;
+        // Clamp the floor: a crafted PE could report a section past EOF; an empty
+        // slice just yields no match.
+        let floor = floor.min(bytes.len());
+        let rel_offset = find_archive_magic(&bytes[floor..]).ok_or(Error::UnknownFormat)?;
         let abs_offset = floor + rel_offset;
 
-        // Carve the appended archive into a named temp file.
-        let tmp = tempfile::NamedTempFile::new()?;
-        {
-            let mut f = std::fs::File::create(tmp.path())?;
-            f.write_all(&bytes[abs_offset..])?;
-        }
+        // Carve the appended archive into a named temp file (written through the
+        // NamedTempFile's own handle — no second open).
+        let mut tmp = tempfile::NamedTempFile::new()?;
+        tmp.write_all(&bytes[abs_offset..])?;
         let temp_path = tmp.into_temp_path();
 
         // Reopen via the full pipeline (zip/7z/rar/cab handle the carved file).
