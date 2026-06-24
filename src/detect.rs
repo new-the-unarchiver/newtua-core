@@ -28,6 +28,7 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
 /// - Gzip:  `1f 8b`
 /// - Bzip2: `BZh`
 /// - Xz:    `fd 37 7a 58 5a 00`
+/// - Zstd:  `28 b5 2f fd`
 pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     if header.starts_with(&[0x1f, 0x8b]) {
         return Some(Compressor::Gzip);
@@ -37,6 +38,9 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     }
     if header.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]) {
         return Some(Compressor::Xz);
+    }
+    if header.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        return Some(Compressor::Zstd);
     }
     None
 }
@@ -169,7 +173,7 @@ impl ArchiveReader for SingleFileReader {
 fn stem_without_compressor_ext(path: &Path) -> String {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
 
-    for ext in &[".gz", ".bz2", ".xz"] {
+    for ext in &[".gz", ".bz2", ".xz", ".zst"] {
         if let Some(stem) = name.strip_suffix(ext) {
             return stem.to_string();
         }
@@ -322,6 +326,10 @@ mod tests {
             detect_compressor(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]),
             Some(Compressor::Xz)
         );
+        assert_eq!(
+            detect_compressor(&[0x28, 0xB5, 0x2F, 0xFD]),
+            Some(Compressor::Zstd)
+        );
         assert_eq!(detect_compressor(b"PK\x03\x04"), None);
     }
 
@@ -353,6 +361,18 @@ mod tests {
         assert_eq!(
             stem_without_compressor_ext(Path::new("/path/to/archive.tar.xz")),
             "archive.tar"
+        );
+    }
+
+    #[test]
+    fn stem_strips_zst() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/tmp/data.tar.zst")),
+            "data.tar"
+        );
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("notes.txt.zst")),
+            "notes.txt"
         );
     }
 
