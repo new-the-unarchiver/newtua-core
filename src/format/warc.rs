@@ -237,6 +237,13 @@ fn parse_warc_date(date_str: &str) -> Option<SystemTime> {
     let min: u64 = s[14..16].parse().ok()?;
     let sec: u64 = s[17..19].parse().ok()?;
 
+    // Reject out-of-range / pre-epoch values: a crafted WARC-Date must not index
+    // `days_in_month` out of bounds (month > 12 would panic) — it is only an
+    // optional timestamp, so bail to None.
+    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
     // Approximate days since Unix epoch: handle leap years with Gregorian formula.
     let days_in_month = [0u64, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let is_leap = |y: u64| (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
@@ -302,6 +309,17 @@ mod tests {
     #[test]
     fn id_is_warc() {
         assert_eq!(WarcHandler.id(), FormatId::Warc);
+    }
+
+    #[test]
+    fn parse_warc_date_valid_and_out_of_range() {
+        // A well-formed UTC date parses.
+        assert!(parse_warc_date("1970-01-01T00:00:00Z") == Some(SystemTime::UNIX_EPOCH));
+        assert!(parse_warc_date("2020-06-15T12:30:00Z").is_some());
+        // A crafted month > 12 must return None, NOT panic on days_in_month[13].
+        assert_eq!(parse_warc_date("2020-13-01T00:00:00Z"), None);
+        assert_eq!(parse_warc_date("2020-00-01T00:00:00Z"), None);
+        assert_eq!(parse_warc_date("1969-12-31T23:59:59Z"), None); // pre-epoch
     }
 
     #[test]
