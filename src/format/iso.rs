@@ -23,14 +23,12 @@ impl FormatHandler for IsoHandler {
     /// Detect by `.iso` extension only: the CD001 signature lives at offset 0x8001,
     /// far beyond the 512-byte header that the registry peeks.
     fn probe(&self, _header: &[u8], name: Option<&str>) -> Confidence {
-        if name
-            .map(|n| {
-                Path::new(n)
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
-            })
-            .unwrap_or(false)
-        {
+        let is_iso = name.is_some_and(|n| {
+            Path::new(n)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
+        });
+        if is_iso {
             Confidence::MAGIC
         } else {
             Confidence::NONE
@@ -57,36 +55,22 @@ impl FormatHandler for IsoHandler {
         }
         inner.seek(SeekFrom::Start(0))?;
 
-        // Wrap the cdfs ISO construction and directory-tree walk in catch_unwind.
-        //
         // The cdfs crate calls `unimplemented!()` deep in SUSP/Rock Ridge parsing
         // for certain extension records (e.g. IEEE_P1282 / ER version=0), producing
         // a panic that would otherwise crash the calling process or GUI.  There is
         // no header-detectable signature for this condition — it only surfaces during
-        // the tree walk — so catch_unwind is the correct guard.
-        //
-        // AssertUnwindSafe is justified: on a caught panic we only convert it to an
-        // error and discard all cdfs state; no poisoned state is ever reused.
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<_> {
-            // Construct the ISO filesystem.
+        // the tree walk — so we guard the cdfs construction and walk via
+        // catch_iso_panic (see below).
+        let reader = catch_iso_panic(|| {
+            // Construct the ISO filesystem, then walk the directory tree from the
+            // best root (Rock Ridge > Joliet > 8.3).
             let iso = ISO9660::new(inner).map_err(map_iso_err)?;
-
-            // Walk the directory tree from the best root (Rock Ridge > Joliet > 8.3).
             let mut entries: Vec<Entry> = Vec::new();
             let mut iso_files: Vec<Option<ISOFile<Box<dyn ReadSeek>>>> = Vec::new();
-
             walk_dir(iso.root(), "", &mut entries, &mut iso_files)?;
-
             Ok(IsoReader { entries, iso_files })
-        }));
-
-        match result {
-            Ok(Ok(reader)) => Ok(Box::new(reader)),
-            Ok(Err(e)) => Err(e),
-            Err(_panic) => Err(Error::Corrupt(
-                "iso: cdfs panicked (unsupported SUSP/Rock Ridge variant)".into(),
-            )),
-        }
+        })?;
+        Ok(Box::new(reader))
     }
 }
 
@@ -121,11 +105,13 @@ where
         match item {
             DirectoryEntry::File(f) => {
                 let modified = offset_datetime_to_systime(f.modify_time());
+                let size = u64::from(f.size());
+                let path = PathBuf::from(&full_path);
                 entries.push(Entry {
-                    path_raw: full_path.as_bytes().to_vec(),
-                    path: PathBuf::from(&full_path),
+                    path_raw: full_path.into_bytes(),
+                    path,
                     kind: EntryKind::File,
-                    size: u64::from(f.size()),
+                    size,
                     mode: None,
                     is_encrypted: false,
                     modified,
@@ -146,13 +132,11 @@ where
                 walk_dir(&d, &full_path, entries, iso_files)?;
             }
             DirectoryEntry::Symlink(s) => {
-                let target = s
-                    .target()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(""));
+                let target = s.target().map(PathBuf::from).unwrap_or_default();
+                let path = PathBuf::from(&full_path);
                 entries.push(Entry {
-                    path_raw: full_path.as_bytes().to_vec(),
-                    path: PathBuf::from(&full_path),
+                    path_raw: full_path.into_bytes(),
+                    path,
                     kind: EntryKind::Symlink { target },
                     size: 0,
                     mode: None,
@@ -192,31 +176,32 @@ impl<T: cdfs::ISO9660Reader> ArchiveReader for IsoReader<T> {
             return Ok(());
         };
 
-        // Wrap the cdfs read in catch_unwind: a malformed data region could also
-        // trigger an unimplemented!() or other panic inside cdfs during reading.
-        //
-        // ISOFile::read() always returns a fresh ISOFileReader starting at seek=0,
-        // so repeated calls to read_entry for the same index are safe and each
-        // returns the complete file contents.
-        //
-        // AssertUnwindSafe is justified: on a caught panic we return Corrupt and
-        // the caller discards any partial data written to `out`.
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        // Guard the cdfs read too: a malformed data region could also trigger a
+        // panic inside cdfs during reading. ISOFile::read() returns a fresh
+        // ISOFileReader at seek=0, so repeated reads of the same index each return
+        // the complete contents.
+        catch_iso_panic(|| {
             let mut reader = iso_file.read();
-            std::io::copy(&mut reader, out)
-        }));
-
-        match result {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(io_err)) => Err(Error::Io(io_err)),
-            Err(_panic) => Err(Error::Corrupt(
-                "iso: cdfs panicked (unsupported SUSP/Rock Ridge variant)".into(),
-            )),
-        }
+            std::io::copy(&mut reader, out).map_err(Error::Io)?;
+            Ok(())
+        })
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Run a cdfs operation, converting a panic from the (panicking) `cdfs` crate
+/// into `Error::Corrupt` instead of letting it unwind past our API. See the
+/// callers for why cdfs panics and why catch_unwind is the right guard.
+/// `AssertUnwindSafe` is justified: on a caught panic we discard all cdfs state.
+fn catch_iso_panic<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(_panic) => Err(Error::Corrupt(
+            "iso: cdfs panicked (unsupported SUSP/Rock Ridge variant)".into(),
+        )),
+    }
+}
 
 /// Map a `cdfs::ISOError` onto our error model.
 fn map_iso_err(e: cdfs::ISOError) -> Error {
@@ -228,14 +213,11 @@ fn map_iso_err(e: cdfs::ISOError) -> Error {
 }
 
 /// Convert a `time::OffsetDateTime` to `SystemTime`.
-/// Returns `None` for pre-epoch timestamps.
+/// Returns `None` for pre-epoch timestamps (`try_from` rejects negatives).
 fn offset_datetime_to_systime(dt: time::OffsetDateTime) -> Option<SystemTime> {
-    let unix_ts = dt.unix_timestamp();
-    if unix_ts < 0 {
-        None
-    } else {
-        Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(unix_ts as u64))
-    }
+    u64::try_from(dt.unix_timestamp())
+        .ok()
+        .map(|secs| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
