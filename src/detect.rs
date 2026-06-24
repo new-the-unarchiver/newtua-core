@@ -28,6 +28,7 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
         // through to ArHandler, since DebHandler probes NONE without debian-binary).
         Box::new(DebHandler),
         Box::new(ArHandler),
+        // RpmHandler: unique lead magic (ED AB EE DB), no tie-break with peers.
         Box::new(RpmHandler),
     ]
 }

@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::Write;
 
 use crate::archive::{
@@ -70,26 +69,20 @@ impl FormatHandler for RpmHandler {
             .unwrap_or("");
         let comp = map_payload_compressor(compressor_str)?;
 
-        // 4. Copy the raw (still-compressed) payload bytes into a temp file.
-        let mut temp_raw = tempfile::NamedTempFile::new()?;
-        temp_raw.write_all(&pkg.payload)?;
-
-        // 5. Decompress into a second temp file (or pass through if uncompressed).
-        let cpio_temp: tempfile::TempPath = match comp {
-            Some(c) => {
-                let raw_file = File::open(temp_raw.path())?;
-                let mut decoded = decompressor(c, Box::new(raw_file))?;
-                let mut temp_cpio = tempfile::NamedTempFile::new()?;
-                std::io::copy(&mut decoded, &mut temp_cpio)?;
-                temp_cpio.into_temp_path()
-            }
-            None => {
-                // Payload is an uncompressed cpio — use the raw temp as-is.
-                temp_raw.into_temp_path()
-            }
+        // 4. The rpm crate already holds the payload in memory; stream it
+        //    (decompressing if needed) into a cpio temp file. CpioHandler.open
+        //    needs a real path, so the cpio temp is required; the still-compressed
+        //    bytes never touch disk.
+        let payload = std::io::Cursor::new(pkg.payload);
+        let mut cpio_bytes: Box<dyn std::io::Read> = match comp {
+            Some(c) => decompressor(c, Box::new(payload))?,
+            None => Box::new(payload), // payload is already an uncompressed cpio
         };
+        let mut temp_cpio = tempfile::NamedTempFile::new()?;
+        std::io::copy(&mut cpio_bytes, &mut temp_cpio)?;
+        let cpio_temp = temp_cpio.into_temp_path();
 
-        // 6. Open the cpio payload with CpioHandler; wrap to report Rpm format.
+        // 5. Open the cpio payload with CpioHandler; wrap to report Rpm format.
         let inner = CpioHandler.open(Source::path(&cpio_temp)?, opts)?;
         Ok(Box::new(RpmReader {
             inner,
