@@ -27,3 +27,6 @@ pub use rar::RarHandler;
 
 pub mod xar;
 pub use xar::XarHandler;
+
+pub mod msi;
+pub use msi::MsiHandler;

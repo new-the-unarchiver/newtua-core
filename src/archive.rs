@@ -19,6 +19,7 @@ pub enum FormatId {
     Cpio,
     Rpm,
     Xar,
+    Msi,
     /// A single decompressed file (no container format; e.g. plain `.gz`).
     Raw,
 }
