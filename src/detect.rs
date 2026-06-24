@@ -7,7 +7,9 @@ use crate::archive::{
 };
 use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
-use crate::format::{ArHandler, CabHandler, RarHandler, SevenZHandler, TarHandler, ZipHandler};
+use crate::format::{
+    ArHandler, CabHandler, DebHandler, RarHandler, SevenZHandler, TarHandler, ZipHandler,
+};
 use crate::volume::{ConcatReader, volume_members};
 
 /// Returns the full handler registry in priority order.
@@ -18,6 +20,7 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
         Box::new(RarHandler),
         Box::new(TarHandler),
         Box::new(CabHandler),
+        Box::new(DebHandler),
         Box::new(ArHandler),
     ]
 }
@@ -184,7 +187,7 @@ fn stem_without_compressor_ext(path: &Path) -> String {
 
 /// Check whether the first 263 bytes of a reader contain the tar `ustar` magic
 /// at offset 257. Rewinds the reader to position 0 after the check.
-fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
+pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
     let mut buf = [0u8; 263];
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -339,8 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_six_handlers() {
-        assert_eq!(registry().len(), 6);
+    fn registry_has_seven_handlers() {
+        assert_eq!(registry().len(), 7);
     }
 
     #[test]

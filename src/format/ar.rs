@@ -81,7 +81,7 @@ fn unix_secs_to_systime(secs: u64) -> SystemTime {
 }
 
 /// Map an `ar`-crate `io::Error` onto our error model.
-fn map_ar_err(e: std::io::Error) -> Error {
+pub(crate) fn map_ar_err(e: std::io::Error) -> Error {
     match e.kind() {
         std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
             Error::Corrupt(e.to_string())

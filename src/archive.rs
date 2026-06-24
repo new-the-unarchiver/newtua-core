@@ -15,6 +15,7 @@ pub enum FormatId {
     Rar,
     Cab,
     Ar,
+    Deb,
     /// A single decompressed file (no container format; e.g. plain `.gz`).
     Raw,
 }
