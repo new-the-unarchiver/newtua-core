@@ -79,23 +79,21 @@ impl FormatHandler for WarcHandler {
 
         // Used for deduplication of derived path names.
         let mut seen_paths: HashMap<String, usize> = HashMap::new();
-        let mut record_counter: usize = 0;
 
         for result in warc_reader.iter_records() {
             let record = result.map_err(|e| Error::Corrupt(e.to_string()))?;
 
             let rec_type = record.warc_type();
-            let keep = matches!(rec_type, RecordType::Response | RecordType::Resource);
-            if !keep {
-                record_counter += 1;
+            if !matches!(rec_type, RecordType::Response | RecordType::Resource) {
                 continue;
             }
 
-            // Derive a safe relative path from the WARC-Target-URI.
+            // Derive a safe relative path from the WARC-Target-URI. Records with
+            // no URI fall back to their position among the emitted entries.
             let uri_opt = record.header(WarcHeader::TargetURI);
             let base_name = match &uri_opt {
                 Some(uri) => uri_to_path(uri),
-                None => format!("record-{record_counter}"),
+                None => format!("record-{}", entries.len()),
             };
 
             // Deduplicate: if the same base_name appeared before, append -1, -2, …
@@ -120,10 +118,10 @@ impl FormatHandler for WarcHandler {
             temp.write_all(payload)?;
             let size = payload.len() as u64;
 
-            let path_raw = entry_name.as_bytes().to_vec();
+            let path = PathBuf::from(&entry_name);
             entries.push(Entry {
-                path_raw,
-                path: PathBuf::from(&entry_name),
+                path_raw: entry_name.into_bytes(),
+                path,
                 kind: EntryKind::File,
                 size,
                 mode: None,
@@ -131,8 +129,6 @@ impl FormatHandler for WarcHandler {
                 modified,
             });
             offsets.push((offset, size));
-
-            record_counter += 1;
         }
 
         let data = temp.into_temp_path();
@@ -160,20 +156,14 @@ impl FormatHandler for WarcHandler {
 /// - `https://example.com/` → `example.com`
 /// - `http://example.com` → `example.com`
 pub(crate) fn uri_to_path(uri: &str) -> String {
-    // Strip scheme.
-    let without_scheme = if let Some(rest) = uri.find("://").map(|i| &uri[i + 3..]) {
-        rest
-    } else {
-        uri
-    };
-    // Drop query and fragment.
-    let without_qs = without_scheme
-        .split('?')
-        .next()
-        .unwrap_or(without_scheme)
-        .split('#')
-        .next()
-        .unwrap_or(without_scheme);
+    // Strip scheme, then drop query (`?…`) and fragment (`#…`).
+    let without_scheme = uri.split_once("://").map_or(uri, |(_, rest)| rest);
+    let without_query = without_scheme
+        .split_once('?')
+        .map_or(without_scheme, |(left, _)| left);
+    let without_qs = without_query
+        .split_once('#')
+        .map_or(without_query, |(left, _)| left);
 
     // Normalize slashes and filter out empty segments, `.`, and `..`.
     let segments: Vec<&str> = without_qs
@@ -192,13 +182,13 @@ pub(crate) fn uri_to_path(uri: &str) -> String {
 /// Ensure `base` is unique in `seen`. Returns the (possibly suffixed) name and
 /// updates the map.
 fn dedup_path(base: &str, seen: &mut HashMap<String, usize>) -> String {
-    if let Some(count) = seen.get_mut(base) {
-        let n = *count;
-        *count += 1;
-        format!("{base}-{n}")
-    } else {
-        seen.insert(base.to_owned(), 1);
+    let count = seen.entry(base.to_owned()).or_insert(0);
+    let n = *count;
+    *count += 1;
+    if n == 0 {
         base.to_owned()
+    } else {
+        format!("{base}-{n}")
     }
 }
 

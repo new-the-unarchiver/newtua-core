@@ -244,8 +244,8 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let lower_name = file_name.to_ascii_lowercase();
     if lower_name.ends_with(".warc") || lower_name.ends_with(".warc.gz") {
-        let fresh_src = Source::path(path)?;
-        return WarcHandler.open(fresh_src, opts);
+        // `src` is already rewound to 0 by peek_header — reuse it directly.
+        return WarcHandler.open(src, opts);
     }
 
     // Compression layer.
