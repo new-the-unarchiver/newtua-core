@@ -6,6 +6,7 @@ pub enum Compressor {
     Bzip2,
     Xz,
     Zstd,
+    Lzma,
 }
 
 pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<Box<dyn Read>> {
@@ -14,6 +15,10 @@ pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<B
         Compressor::Bzip2 => Ok(Box::new(bzip2::read::BzDecoder::new(inner))),
         Compressor::Xz => Ok(Box::new(xz2::read::XzDecoder::new(inner))),
         Compressor::Zstd => Ok(Box::new(zstd::stream::read::Decoder::new(inner)?)),
+        Compressor::Lzma => {
+            let stream = xz2::stream::Stream::new_lzma_decoder(u64::MAX)?;
+            Ok(Box::new(xz2::read::XzDecoder::new_stream(inner, stream)))
+        }
     }
 }
 
@@ -70,6 +75,21 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, b"frame-oneframe-two");
+    }
+
+    #[test]
+    fn lzma_roundtrip() {
+        let payload = b"hello lzma payload";
+        let opts = xz2::stream::LzmaOptions::new_preset(6).unwrap();
+        let stream = xz2::stream::Stream::new_lzma_encoder(&opts).unwrap();
+        let mut enc = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
+        enc.write_all(payload).unwrap();
+        let compressed = enc.finish().unwrap();
+        let mut r =
+            decompressor(Compressor::Lzma, Box::new(std::io::Cursor::new(compressed))).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
     }
 }
 
