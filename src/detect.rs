@@ -9,7 +9,7 @@ use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
     ArHandler, CabHandler, CpioHandler, DebHandler, IsoHandler, MsiHandler, RarHandler, RpmHandler,
-    SevenZHandler, TarHandler, XarHandler, ZipHandler,
+    SevenZHandler, SfxHandler, TarHandler, XarHandler, ZipHandler,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -37,6 +37,9 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
         Box::new(MsiHandler),
         // IsoHandler: detected by .iso extension; CD001 signature verified in open.
         Box::new(IsoHandler),
+        // SfxHandler: MZ → Confidence(50), below MAGIC(100), so real archives always
+        // win. Carves the appended archive past the PE overlay and reopens it.
+        Box::new(SfxHandler),
     ]
 }
 
@@ -70,10 +73,10 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
 ///
 /// Used both for multi-volume reconstruction and for the decompressed temp file
 /// backing a tar-inside-compressed-file.
-struct TempBackedReader {
-    inner: Box<dyn ArchiveReader>,
+pub(crate) struct TempBackedReader {
+    pub(crate) inner: Box<dyn ArchiveReader>,
     /// Keeps the temp file alive (deleted on drop).
-    _temp: tempfile::TempPath,
+    pub(crate) _temp: tempfile::TempPath,
 }
 
 impl ArchiveReader for TempBackedReader {
@@ -223,7 +226,7 @@ pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
 ///
 /// This is the original `open()` body, now callable from both the normal code
 /// path and the volume-reconstruction path.
-fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
+pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
     let mut src = Source::path(path)?;
     let header = src.peek_header(512)?;
 
@@ -357,8 +360,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_twelve_handlers() {
-        assert_eq!(registry().len(), 12);
+    fn registry_has_thirteen_handlers() {
+        assert_eq!(registry().len(), 13);
     }
 
     #[test]

@@ -21,6 +21,9 @@ pub enum FormatId {
     Xar,
     Msi,
     Iso,
+    /// Self-extracting `.exe` — the handler reports the inner format via
+    /// `TempBackedReader`; `Sfx` is used only by `SfxHandler::id()`.
+    Sfx,
     /// A single decompressed file (no container format; e.g. plain `.gz`).
     Raw,
 }

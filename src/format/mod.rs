@@ -33,3 +33,6 @@ pub use msi::MsiHandler;
 
 pub mod iso;
 pub use iso::IsoHandler;
+
+pub mod sfx;
+pub use sfx::SfxHandler;

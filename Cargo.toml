@@ -27,6 +27,7 @@ rpm.workspace = true
 apple-xar = { version = "0.20", default-features = false }
 msi.workspace = true
 cdfs = "0.2.3"
+goblin.workspace = true
 
 [dev-dependencies]
 tar.workspace = true
