@@ -1,5 +1,5 @@
 use std::fmt::Debug;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,6 +33,25 @@ impl Read for DebugReadSeek {
 impl Seek for DebugReadSeek {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         self.0.seek(pos)
+    }
+}
+
+// ── Write-proxy: lets us pass `&mut dyn Write` where `impl Write` is needed ──
+
+/// Thin Sized wrapper around `&mut dyn Write`.
+///
+/// `write_file_data_decoded_from_id` requires a concrete `impl Write` (Sized
+/// bound), so we cannot pass `&mut dyn Write` directly.  Wrapping it in this
+/// newtype gives us a concrete type while forwarding all writes to the caller's
+/// writer — no intermediate buffer needed.
+struct WriteProxy<'a>(&'a mut dyn Write);
+
+impl Write for WriteProxy<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
     }
 }
 
@@ -119,7 +138,7 @@ impl FormatHandler for XarHandler {
     }
 
     fn open(&self, src: Source, _opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
-        let inner: Box<dyn ReadSeek> = match src {
+        let mut inner: Box<dyn ReadSeek> = match src {
             Source::Seekable { inner, .. } => inner,
             Source::Stream { .. } => {
                 return Err(Error::Unsupported {
@@ -129,7 +148,30 @@ impl FormatHandler for XarHandler {
             }
         };
 
-        let xar = XarReader::new(DebugReadSeek(inner)).map_err(map_xar_err)?;
+        // ── Guard: validate the 28-byte XAR header before handing the source ──
+        // `apple-xar` panics with integer underflow when the header `size` field
+        // (big-endian u16 at offset 4) is < 28: it computes `size as usize - 28`
+        // to skip extra header bytes.  We read and check the header ourselves so
+        // that a crafted/truncated file returns `Error::Corrupt` instead of
+        // crashing the process.
+        let mut hdr = [0u8; 28];
+        let n = inner.read(&mut hdr).map_err(Error::Io)?;
+        if n < 28 {
+            return Err(Error::Corrupt("xar: file too short (< 28 bytes)".into()));
+        }
+        if &hdr[0..4] != b"xar!" {
+            return Err(Error::Corrupt("xar: bad magic (expected 'xar!')".into()));
+        }
+        let hdr_size = u16::from_be_bytes([hdr[4], hdr[5]]);
+        if hdr_size < 28 {
+            return Err(Error::Corrupt(format!(
+                "xar: header size field {hdr_size} < 28 (malformed)"
+            )));
+        }
+        // Rewind so `XarReader::new` sees the full file from the beginning.
+        inner.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
+
+        let mut xar = XarReader::new(DebugReadSeek(inner)).map_err(map_xar_err)?;
 
         let toc_files = xar.files().map_err(map_xar_err)?;
 
@@ -142,22 +184,40 @@ impl FormatHandler for XarHandler {
             let path_raw = path_str.as_bytes().to_vec();
             let path = PathBuf::from(&path_str);
 
-            // Parse octal mode string e.g. "0100644" → 0o100644
+            // Parse octal mode string e.g. "0100644" → 0o100644.
+            // `from_str_radix` handles leading zeros in radix-8 correctly;
+            // trimming them would break the all-zeros case ("0" → "").
             let mode: Option<u32> = file
                 .mode
                 .as_deref()
-                .and_then(|s| u32::from_str_radix(s.trim_start_matches('0'), 8).ok());
+                .and_then(|s| u32::from_str_radix(s, 8).ok());
 
             let modified: Option<SystemTime> = file.mtime.as_deref().and_then(parse_mtime);
 
             let (kind, size) = match file.file_type {
                 FileType::Directory => (EntryKind::Dir, 0u64),
                 FileType::Link => {
-                    // XAR symlink: the link target is stored in the file body.
-                    // We report it as Symlink with an empty target here and populate
-                    // it below (reading symlink bodies is rare; defer to read_entry).
-                    // Per the brief, writing nothing for symlinks is fine.
-                    let target = PathBuf::new(); // placeholder
+                    // XAR stores the symlink target as the file body in the heap.
+                    // Read it now so the Entry carries the real target path.
+                    // `apple-xar`'s `File` struct has no dedicated `link_target`
+                    // field in its TOC representation; the target is only available
+                    // by decoding the member payload.
+                    let target = if file.data.is_some() {
+                        let mut buf = Vec::new();
+                        if xar
+                            .write_file_data_decoded_from_id(file.id, &mut buf)
+                            .is_ok()
+                        {
+                            // The body is the raw target path bytes (no trailing NUL).
+                            String::from_utf8(buf)
+                                .map(PathBuf::from)
+                                .unwrap_or_default()
+                        } else {
+                            PathBuf::new()
+                        }
+                    } else {
+                        PathBuf::new()
+                    };
                     (EntryKind::Symlink { target }, file.size.unwrap_or(0))
                 }
                 FileType::HardLink => {
@@ -227,15 +287,14 @@ impl ArchiveReader for XarReaderInner {
         }
 
         let id = self.file_ids[idx];
-        // `write_file_data_decoded_from_id` requires `impl Write` (Sized), so
-        // we cannot pass `&mut dyn Write` directly.  Buffer into a Vec first,
-        // then copy to `out`.  For large files this may use significant RAM;
-        // acceptable for v1 (XAR member payloads are usually small pkg scripts).
-        let mut buf: Vec<u8> = Vec::new();
+        // Stream directly into `out` via `WriteProxy` (a thin Sized wrapper
+        // around `&mut dyn Write`), bypassing the need for an intermediate Vec.
+        // `write_file_data_decoded_from_id` requires `impl Write` (Sized), so we
+        // cannot pass `&mut dyn Write` naked — `WriteProxy` bridges that gap.
+        let mut proxy = WriteProxy(out);
         self.xar
-            .write_file_data_decoded_from_id(id, &mut buf)
+            .write_file_data_decoded_from_id(id, &mut proxy)
             .map_err(map_xar_err)?;
-        out.write_all(&buf)?;
         Ok(())
     }
 }
@@ -275,5 +334,33 @@ mod tests {
     #[test]
     fn parse_mtime_short_returns_none() {
         assert!(parse_mtime("2025").is_none());
+    }
+
+    /// Regression test: a XAR header with `size` field = 16 (< 28) must return
+    /// `Err(Error::Corrupt)` rather than panicking with integer underflow.
+    /// Without the header guard in `open`, `apple-xar` would compute
+    /// `16usize - 28` and panic.
+    #[test]
+    fn header_size_below_28_returns_corrupt_not_panic() {
+        use crate::archive::Source;
+        use std::io::Cursor;
+
+        // Craft a minimal 28-byte buffer:
+        //   magic "xar!" | size=0x0010 (16) | version=1 | zeros...
+        let mut buf = [0u8; 28];
+        buf[0..4].copy_from_slice(b"xar!");
+        buf[4..6].copy_from_slice(&16u16.to_be_bytes()); // size = 16 < 28
+        buf[6..8].copy_from_slice(&1u16.to_be_bytes()); // version = 1
+
+        let src = Source::Seekable {
+            inner: Box::new(Cursor::new(buf.to_vec())),
+            path: None,
+        };
+
+        let result = XarHandler.open(src, &OpenOptions::default());
+        assert!(
+            matches!(result, Err(Error::Corrupt(_))),
+            "expected Err(Corrupt) for header size < 28, got Ok or different error variant"
+        );
     }
 }
