@@ -224,6 +224,26 @@ impl ArchiveReader for ZipReader {
             .get(idx)
             .ok_or(Error::InvalidIndex(idx))?
             .is_encrypted;
+
+        // zip 2.x's LZMA decoder cannot read the EOS-terminated streams that real
+        // zip-LZMA producers (7-Zip, Python) emit — it expects an 8-byte
+        // uncompressed-size field the ZIP-LZMA format omits — so extraction fails
+        // with a misleading IO error. Surface it as Unsupported until the crate
+        // handles ZIP-LZMA (listing already works). PPMd reaches the same outcome
+        // via map_zip_err's UnsupportedArchive arm.
+        if self
+            .zip
+            .by_index_raw(idx)
+            .map_err(map_zip_err)?
+            .compression()
+            == zip::CompressionMethod::Lzma
+        {
+            return Err(Error::Unsupported {
+                format: "zip".into(),
+                feature: "LZMA (zip)".into(),
+            });
+        }
+
         if is_encrypted {
             let pw = self.password.clone().ok_or(Error::Encrypted)?;
             let mut f = self

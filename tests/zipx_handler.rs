@@ -18,20 +18,21 @@ fn fixture(name: &str) -> std::path::PathBuf {
     Path::new("tests/fixtures").join(name)
 }
 
-// ── LZMA listing (extraction is broken in zip 2.4.2 lzma_rs integration) ────
+// ── LZMA: listing works, extraction is reported Unsupported ─────────────────
 //
 // NOTE: The zip crate 2.4.2 uses lzma_rs with UnpackedSize::ReadFromHeader,
 // but the ZIP LZMA format (APPNOTE.TXT) does not include the 8-byte size field
 // before the compressed payload — the 5-byte LZMA properties are followed
 // immediately by EOS-terminated compressed data.  This mismatch causes lzma_rs
 // to misinterpret the first bytes of compressed data as the size, producing
-// "LZ distance beyond output size" errors.  The feature is enabled (the `lzma`
-// feature flag is set), but real extraction waits for the zip crate to fix its
-// LZMA decoder (or for us to upgrade to a version that fixes it).
+// "LZ distance beyond output size" errors.  The `lzma` feature is enabled (so
+// listing works), but `read_entry` returns Error::Unsupported for LZMA members
+// rather than leaking that misleading IO error — until the zip crate fixes its
+// ZIP-LZMA decoder (or we upgrade to a version that does).
 
 #[test]
 fn lzma_zipx_lists_entries() {
-    // Listing must succeed even when extraction is broken.
+    // Listing must succeed even when extraction is unsupported.
     let mut ar = open(&fixture("lzma.zipx"), &OpenOptions::default()).unwrap();
     let entries = ar.entries().unwrap();
     assert_eq!(entries.len(), 1, "expected exactly one entry in lzma.zipx");
@@ -39,6 +40,20 @@ fn lzma_zipx_lists_entries() {
         ar.format(),
         FormatId::Zip,
         "format must be Zip, not a new FormatId"
+    );
+}
+
+#[test]
+fn lzma_zipx_read_entry_is_unsupported_not_io() {
+    // The broken ZIP-LZMA decoder must surface as Unsupported, not a cryptic IO
+    // error, mirroring how PPMd is reported.
+    let mut ar = open(&fixture("lzma.zipx"), &OpenOptions::default()).unwrap();
+    ar.entries().unwrap();
+    let mut out = Vec::new();
+    let err = ar.read_entry(0, &mut out).unwrap_err();
+    assert!(
+        matches!(err, newtua_core::Error::Unsupported { .. }),
+        "expected Unsupported, got {err:?}"
     );
 }
 
