@@ -36,3 +36,6 @@ pub use iso::IsoHandler;
 
 pub mod sfx;
 pub use sfx::SfxHandler;
+
+pub mod warc;
+pub use warc::WarcHandler;

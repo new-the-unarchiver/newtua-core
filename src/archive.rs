@@ -24,6 +24,8 @@ pub enum FormatId {
     /// Self-extracting `.exe` — the handler reports the inner format via
     /// `TempBackedReader`; `Sfx` is used only by `SfxHandler::id()`.
     Sfx,
+    /// WARC web archive (`.warc`, `.warc.gz`).
+    Warc,
     /// A single decompressed file (no container format; e.g. plain `.gz`).
     Raw,
 }

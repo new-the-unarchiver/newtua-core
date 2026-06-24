@@ -9,7 +9,7 @@ use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
     ArHandler, CabHandler, CpioHandler, DebHandler, IsoHandler, MsiHandler, RarHandler, RpmHandler,
-    SevenZHandler, SfxHandler, TarHandler, XarHandler, ZipHandler,
+    SevenZHandler, SfxHandler, TarHandler, WarcHandler, XarHandler, ZipHandler,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -40,6 +40,9 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
         // SfxHandler: MZ → Confidence(50), below MAGIC(100), so real archives always
         // win. Carves the appended archive past the PE overlay and reopens it.
         Box::new(SfxHandler),
+        // WarcHandler: WARC/1.x magic; .warc.gz is handled by the early
+        // extension branch in open_single and never reaches this registry probe.
+        Box::new(WarcHandler),
     ]
 }
 
@@ -230,6 +233,21 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
     let mut src = Source::path(path)?;
     let header = src.peek_header(512)?;
 
+    // Early WARC extension branch — MUST come before detect_compressor.
+    //
+    // A `.warc.gz` file uses per-record gzip (each WARC record is a separate
+    // gzip member, concatenated). Its file magic is the gzip signature `1f 8b`,
+    // so the generic compressor layer would decompress it as a single byte
+    // stream and lose the record boundaries.  By routing `.warc` and `.warc.gz`
+    // straight to WarcHandler here, we bypass that layer entirely and let the
+    // handler apply MultiGzDecoder itself (which handles concatenated members).
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let lower_name = file_name.to_ascii_lowercase();
+    if lower_name.ends_with(".warc") || lower_name.ends_with(".warc.gz") {
+        let fresh_src = Source::path(path)?;
+        return WarcHandler.open(fresh_src, opts);
+    }
+
     // Compression layer.
     if let Some(comp) = detect_compressor(&header) {
         // Step 1: decompress to a temp file via streaming io::copy (no RAM spike).
@@ -360,8 +378,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_thirteen_handlers() {
-        assert_eq!(registry().len(), 13);
+    fn registry_has_fourteen_handlers() {
+        assert_eq!(registry().len(), 14);
     }
 
     #[test]

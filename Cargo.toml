@@ -28,6 +28,7 @@ apple-xar = { version = "0.20", default-features = false }
 msi.workspace = true
 cdfs = "0.2.3"
 goblin.workspace = true
+warc.workspace = true
 
 [dev-dependencies]
 tar.workspace = true
@@ -35,3 +36,4 @@ tempfile.workspace = true
 zip.workspace = true
 msi.workspace = true
 cab.workspace = true
+flate2.workspace = true
