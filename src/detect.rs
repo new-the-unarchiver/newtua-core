@@ -209,7 +209,7 @@ fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>
     if let Some(comp) = detect_compressor(&header) {
         // Step 1: decompress to a temp file via streaming io::copy (no RAM spike).
         let file = std::fs::File::open(path)?;
-        let mut decoded: Box<dyn Read> = decompressor(comp, Box::new(file));
+        let mut decoded: Box<dyn Read> = decompressor(comp, Box::new(file))?;
         let mut tmp = tempfile::NamedTempFile::new()?;
         let size = std::io::copy(&mut decoded, &mut tmp)?;
 

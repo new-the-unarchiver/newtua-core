@@ -7,11 +7,11 @@ pub enum Compressor {
     Xz,
 }
 
-pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> Box<dyn Read> {
+pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<Box<dyn Read>> {
     match kind {
-        Compressor::Gzip => Box::new(flate2::read::MultiGzDecoder::new(inner)),
-        Compressor::Bzip2 => Box::new(bzip2::read::BzDecoder::new(inner)),
-        Compressor::Xz => Box::new(xz2::read::XzDecoder::new(inner)),
+        Compressor::Gzip => Ok(Box::new(flate2::read::MultiGzDecoder::new(inner))),
+        Compressor::Bzip2 => Ok(Box::new(bzip2::read::BzDecoder::new(inner))),
+        Compressor::Xz => Ok(Box::new(xz2::read::XzDecoder::new(inner))),
     }
 }
 
@@ -30,7 +30,8 @@ mod tests {
     fn gzip_roundtrip() {
         let payload = b"hello newtua";
         let compressed = gzip_bytes(payload);
-        let mut r = decompressor(Compressor::Gzip, Box::new(std::io::Cursor::new(compressed)));
+        let mut r =
+            decompressor(Compressor::Gzip, Box::new(std::io::Cursor::new(compressed))).unwrap();
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, payload);
@@ -51,7 +52,8 @@ mod full {
         let mut r = decompressor(
             Compressor::Bzip2,
             Box::new(std::io::Cursor::new(compressed)),
-        );
+        )
+        .unwrap();
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, payload);
@@ -63,7 +65,8 @@ mod full {
         let mut e = xz2::write::XzEncoder::new(Vec::new(), 6);
         e.write_all(payload).unwrap();
         let compressed = e.finish().unwrap();
-        let mut r = decompressor(Compressor::Xz, Box::new(std::io::Cursor::new(compressed)));
+        let mut r =
+            decompressor(Compressor::Xz, Box::new(std::io::Cursor::new(compressed))).unwrap();
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, payload);
@@ -74,7 +77,8 @@ mod full {
         let mut r = decompressor(
             Compressor::Gzip,
             Box::new(std::io::Cursor::new(vec![0xFF; 32])),
-        );
+        )
+        .unwrap();
         let mut out = Vec::new();
         assert!(r.read_to_end(&mut out).is_err());
     }
