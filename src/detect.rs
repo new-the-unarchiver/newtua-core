@@ -234,7 +234,7 @@ fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>
         } else {
             // Plain compressed file — present as one entry.
             // For gzip only: read the original-file mtime from the header (bytes 4..8).
-            // bzip2 and xz carry no mtime in their standard headers.
+            // bzip2, xz, and zstd carry no mtime in their standard headers.
             let modified = if comp == Compressor::Gzip {
                 read_gz_mtime(path)
             } else {
