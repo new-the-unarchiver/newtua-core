@@ -5,6 +5,7 @@ pub enum Compressor {
     Gzip,
     Bzip2,
     Xz,
+    Zstd,
 }
 
 pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<Box<dyn Read>> {
@@ -12,6 +13,7 @@ pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<B
         Compressor::Gzip => Ok(Box::new(flate2::read::MultiGzDecoder::new(inner))),
         Compressor::Bzip2 => Ok(Box::new(bzip2::read::BzDecoder::new(inner))),
         Compressor::Xz => Ok(Box::new(xz2::read::XzDecoder::new(inner))),
+        Compressor::Zstd => Ok(Box::new(zstd::stream::read::Decoder::new(inner)?)),
     }
 }
 
@@ -35,6 +37,39 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn zstd_roundtrip() {
+        let payload = b"hello zstd payload";
+        let compressed = zstd::encode_all(&payload[..], 0).unwrap();
+        let mut r =
+            decompressor(Compressor::Zstd, Box::new(std::io::Cursor::new(compressed))).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn corrupt_zstd_errors_on_read() {
+        // Valid zstd magic followed by garbage — must error during read.
+        let mut bytes = vec![0x28, 0xB5, 0x2F, 0xFD];
+        bytes.extend_from_slice(&[0xFF; 32]);
+        let mut r = decompressor(Compressor::Zstd, Box::new(std::io::Cursor::new(bytes))).unwrap();
+        let mut out = Vec::new();
+        assert!(r.read_to_end(&mut out).is_err());
+    }
+
+    #[test]
+    fn zstd_multi_frame_reads_all_frames() {
+        // zstd allows concatenated frames in one stream; the decoder must read all.
+        let mut compressed = zstd::encode_all(&b"frame-one"[..], 0).unwrap();
+        compressed.extend_from_slice(&zstd::encode_all(&b"frame-two"[..], 0).unwrap());
+        let mut r =
+            decompressor(Compressor::Zstd, Box::new(std::io::Cursor::new(compressed))).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"frame-oneframe-two");
     }
 }
 
