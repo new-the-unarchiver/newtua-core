@@ -46,6 +46,59 @@ fn opens_tar_gz() {
     assert_eq!(entries[0].path.to_str().unwrap(), "f.txt");
 }
 
+/// Single compressed non-tar .zst file should yield exactly one entry.
+#[test]
+fn single_zst_non_tar_yields_one_entry() {
+    let payload = b"zstd payload data\n";
+    let zst_bytes = zstd::encode_all(&payload[..], 0).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("report.txt.zst");
+    std::fs::write(&path, zst_bytes).unwrap();
+
+    let mut ar = open(&path, &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap();
+    assert_eq!(entries.len(), 1, "expected exactly 1 entry");
+
+    let entry_name = entries[0].path.to_str().unwrap().to_string();
+    assert_eq!(
+        entry_name, "report.txt",
+        "unexpected entry name: {entry_name}"
+    );
+
+    let mut out = Vec::new();
+    ar.read_entry(0, &mut out).unwrap();
+    assert_eq!(out, payload, "extracted content mismatch");
+}
+
+/// tar → zstd — .tar.zst must yield the inner tar entries.
+#[test]
+fn opens_tar_zst() {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut b = tar::Builder::new(&mut tar_bytes);
+        let data = b"inside";
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, "f.txt", &data[..]).unwrap();
+        b.finish().unwrap();
+    }
+    let zst_bytes = zstd::encode_all(&tar_bytes[..], 0).unwrap();
+
+    let tmp = tempfile::Builder::new()
+        .suffix(".tar.zst")
+        .tempfile()
+        .unwrap();
+    std::fs::write(tmp.path(), zst_bytes).unwrap();
+
+    let mut ar = open(tmp.path(), &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path.to_str().unwrap(), "f.txt");
+}
+
 #[test]
 fn unknown_format_errors() {
     use newtua_core::Error;

@@ -7,7 +7,9 @@ use crate::archive::{
 };
 use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
-use crate::format::{ArHandler, CabHandler, RarHandler, SevenZHandler, TarHandler, ZipHandler};
+use crate::format::{
+    ArHandler, CabHandler, DebHandler, RarHandler, SevenZHandler, TarHandler, ZipHandler,
+};
 use crate::volume::{ConcatReader, volume_members};
 
 /// Returns the full handler registry in priority order.
@@ -18,6 +20,11 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
         Box::new(RarHandler),
         Box::new(TarHandler),
         Box::new(CabHandler),
+        // DebHandler MUST precede ArHandler: a .deb shares the `!<arch>\n` magic
+        // with a plain ar archive, so both probe MAGIC. The selector keeps the
+        // first MAGIC on a tie, so order is the tie-break (a plain ar still falls
+        // through to ArHandler, since DebHandler probes NONE without debian-binary).
+        Box::new(DebHandler),
         Box::new(ArHandler),
     ]
 }
@@ -28,6 +35,7 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
 /// - Gzip:  `1f 8b`
 /// - Bzip2: `BZh`
 /// - Xz:    `fd 37 7a 58 5a 00`
+/// - Zstd:  `28 b5 2f fd`
 pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     if header.starts_with(&[0x1f, 0x8b]) {
         return Some(Compressor::Gzip);
@@ -37,6 +45,9 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     }
     if header.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]) {
         return Some(Compressor::Xz);
+    }
+    if header.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        return Some(Compressor::Zstd);
     }
     None
 }
@@ -169,7 +180,7 @@ impl ArchiveReader for SingleFileReader {
 fn stem_without_compressor_ext(path: &Path) -> String {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
 
-    for ext in &[".gz", ".bz2", ".xz"] {
+    for ext in &[".gz", ".bz2", ".xz", ".zst"] {
         if let Some(stem) = name.strip_suffix(ext) {
             return stem.to_string();
         }
@@ -180,7 +191,7 @@ fn stem_without_compressor_ext(path: &Path) -> String {
 
 /// Check whether the first 263 bytes of a reader contain the tar `ustar` magic
 /// at offset 257. Rewinds the reader to position 0 after the check.
-fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
+pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
     let mut buf = [0u8; 263];
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -209,7 +220,7 @@ fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>
     if let Some(comp) = detect_compressor(&header) {
         // Step 1: decompress to a temp file via streaming io::copy (no RAM spike).
         let file = std::fs::File::open(path)?;
-        let mut decoded: Box<dyn Read> = decompressor(comp, Box::new(file));
+        let mut decoded: Box<dyn Read> = decompressor(comp, Box::new(file))?;
         let mut tmp = tempfile::NamedTempFile::new()?;
         let size = std::io::copy(&mut decoded, &mut tmp)?;
 
@@ -230,7 +241,7 @@ fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>
         } else {
             // Plain compressed file — present as one entry.
             // For gzip only: read the original-file mtime from the header (bytes 4..8).
-            // bzip2 and xz carry no mtime in their standard headers.
+            // bzip2, xz, and zstd carry no mtime in their standard headers.
             let modified = if comp == Compressor::Gzip {
                 read_gz_mtime(path)
             } else {
@@ -322,6 +333,10 @@ mod tests {
             detect_compressor(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]),
             Some(Compressor::Xz)
         );
+        assert_eq!(
+            detect_compressor(&[0x28, 0xB5, 0x2F, 0xFD]),
+            Some(Compressor::Zstd)
+        );
         assert_eq!(detect_compressor(b"PK\x03\x04"), None);
     }
 
@@ -331,8 +346,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_six_handlers() {
-        assert_eq!(registry().len(), 6);
+    fn registry_has_seven_handlers() {
+        assert_eq!(registry().len(), 7);
     }
 
     #[test]
@@ -353,6 +368,18 @@ mod tests {
         assert_eq!(
             stem_without_compressor_ext(Path::new("/path/to/archive.tar.xz")),
             "archive.tar"
+        );
+    }
+
+    #[test]
+    fn stem_strips_zst() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/tmp/data.tar.zst")),
+            "data.tar"
+        );
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("notes.txt.zst")),
+            "notes.txt"
         );
     }
 

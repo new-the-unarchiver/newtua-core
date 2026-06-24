@@ -1,6 +1,9 @@
 pub mod ar;
 pub use ar::ArHandler;
 
+pub mod deb;
+pub use deb::DebHandler;
+
 pub mod cab;
 pub use cab::CabHandler;
 
