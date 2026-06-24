@@ -24,6 +24,7 @@ unrar.workspace = true
 tempfile.workspace = true
 cpio.workspace = true
 rpm.workspace = true
+apple-xar = { version = "0.20", default-features = false }
 
 [dev-dependencies]
 tar.workspace = true

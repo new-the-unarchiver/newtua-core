@@ -9,7 +9,7 @@ use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
     ArHandler, CabHandler, CpioHandler, DebHandler, RarHandler, RpmHandler, SevenZHandler,
-    TarHandler, ZipHandler,
+    TarHandler, XarHandler, ZipHandler,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -30,6 +30,8 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
         Box::new(ArHandler),
         // RpmHandler: unique lead magic (ED AB EE DB), no tie-break with peers.
         Box::new(RpmHandler),
+        // XarHandler: unique magic "xar!" (78 61 72 21), used for .xar and .pkg.
+        Box::new(XarHandler),
     ]
 }
 
@@ -350,8 +352,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_nine_handlers() {
-        assert_eq!(registry().len(), 9);
+    fn registry_has_ten_handlers() {
+        assert_eq!(registry().len(), 10);
     }
 
     #[test]

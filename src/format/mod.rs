@@ -24,3 +24,6 @@ pub use sevenz::SevenZHandler;
 
 pub mod rar;
 pub use rar::RarHandler;
+
+pub mod xar;
+pub use xar::XarHandler;
