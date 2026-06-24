@@ -1,6 +1,9 @@
 pub mod ar;
 pub use ar::ArHandler;
 
+pub mod rpm;
+pub use rpm::RpmHandler;
+
 pub mod cpio;
 pub use cpio::CpioHandler;
 

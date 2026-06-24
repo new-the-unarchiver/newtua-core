@@ -23,6 +23,7 @@ sevenz-rust2.workspace = true
 unrar.workspace = true
 tempfile.workspace = true
 cpio.workspace = true
+rpm.workspace = true
 
 [dev-dependencies]
 tar.workspace = true

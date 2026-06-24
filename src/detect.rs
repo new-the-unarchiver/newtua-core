@@ -8,8 +8,8 @@ use crate::archive::{
 use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
-    ArHandler, CabHandler, CpioHandler, DebHandler, RarHandler, SevenZHandler, TarHandler,
-    ZipHandler,
+    ArHandler, CabHandler, CpioHandler, DebHandler, RarHandler, RpmHandler, SevenZHandler,
+    TarHandler, ZipHandler,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -28,6 +28,7 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
         // through to ArHandler, since DebHandler probes NONE without debian-binary).
         Box::new(DebHandler),
         Box::new(ArHandler),
+        Box::new(RpmHandler),
     ]
 }
 
@@ -348,8 +349,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_eight_handlers() {
-        assert_eq!(registry().len(), 8);
+    fn registry_has_nine_handlers() {
+        assert_eq!(registry().len(), 9);
     }
 
     #[test]
