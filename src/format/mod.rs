@@ -30,3 +30,6 @@ pub use xar::XarHandler;
 
 pub mod msi;
 pub use msi::MsiHandler;
+
+pub mod iso;
+pub use iso::IsoHandler;

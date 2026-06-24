@@ -8,7 +8,7 @@ use crate::archive::{
 use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
-    ArHandler, CabHandler, CpioHandler, DebHandler, MsiHandler, RarHandler, RpmHandler,
+    ArHandler, CabHandler, CpioHandler, DebHandler, IsoHandler, MsiHandler, RarHandler, RpmHandler,
     SevenZHandler, TarHandler, XarHandler, ZipHandler,
 };
 use crate::volume::{ConcatReader, volume_members};
@@ -35,6 +35,8 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
         // MsiHandler: CFB magic + .msi extension (model B — reuses CabHandler
         // for the embedded CAB streams in the Media table).
         Box::new(MsiHandler),
+        // IsoHandler: detected by .iso extension; CD001 signature verified in open.
+        Box::new(IsoHandler),
     ]
 }
 
@@ -355,8 +357,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_eleven_handlers() {
-        assert_eq!(registry().len(), 11);
+    fn registry_has_twelve_handlers() {
+        assert_eq!(registry().len(), 12);
     }
 
     #[test]
