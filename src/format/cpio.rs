@@ -169,7 +169,15 @@ impl FormatHandler for CpioHandler {
                 is_encrypted: false,
                 modified: meta.modified,
             });
-            offsets.push((meta.offset, meta.size));
+            // For non-regular entries (dirs, symlinks) always store (0, 0)
+            // so that read_entry's `size == 0` guard triggers correctly.
+            // (Symlink entries have meta.size == target-path length, which
+            // would otherwise fall through into the seek+copy branch.)
+            let offset_entry = match meta.kind {
+                KindRaw::File => (meta.offset, meta.size),
+                _ => (0, 0),
+            };
+            offsets.push(offset_entry);
         }
 
         let temp_path = temp.into_temp_path();
