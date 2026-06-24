@@ -20,6 +20,10 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
         Box::new(RarHandler),
         Box::new(TarHandler),
         Box::new(CabHandler),
+        // DebHandler MUST precede ArHandler: a .deb shares the `!<arch>\n` magic
+        // with a plain ar archive, so both probe MAGIC. The selector keeps the
+        // first MAGIC on a tie, so order is the tie-break (a plain ar still falls
+        // through to ArHandler, since DebHandler probes NONE without debian-binary).
         Box::new(DebHandler),
         Box::new(ArHandler),
     ]

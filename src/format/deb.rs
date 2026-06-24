@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 
 use crate::archive::{
     ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, ReadSeek, Source,
@@ -40,23 +40,21 @@ impl FormatHandler for DebHandler {
             }
         };
 
-        // 1. Locate the first `data.tar*` member (record its index and name).
+        // 1. Locate the first `data.tar*` member (its index and lowercased name).
         let mut archive = ar::Archive::new(inner);
-        let mut data_idx: Option<usize> = None;
-        let mut data_name = String::new();
+        let mut found: Option<(usize, String)> = None;
         let mut idx = 0usize;
         while let Some(entry) = archive.next_entry() {
             let entry = entry.map_err(map_ar_err)?;
             let name = entry.header().identifier();
             if name.starts_with(b"data.tar") {
-                data_idx = Some(idx);
-                data_name = String::from_utf8_lossy(name).to_lowercase();
+                found = Some((idx, String::from_utf8_lossy(name).to_lowercase()));
                 break;
             }
             idx += 1;
         }
-        let data_idx =
-            data_idx.ok_or_else(|| Error::Corrupt("deb: missing data.tar member".into()))?;
+        let (data_idx, data_name) =
+            found.ok_or_else(|| Error::Corrupt("deb: missing data.tar member".into()))?;
 
         // 2. Copy that member (still compressed) to a temp file.
         let mut temp_raw = tempfile::NamedTempFile::new()?;
@@ -66,25 +64,26 @@ impl FormatHandler for DebHandler {
         }
         drop(archive);
 
-        // 3. Select the compressor: content magic first, then name-based .lzma
-        //    (the alone-format .lzma has no reliable magic — extension only).
-        let header = Source::path(temp_raw.path())?.peek_header(6)?;
-        let mut comp = detect_compressor(&header);
-        if comp.is_none() && data_name.ends_with(".lzma") {
-            comp = Some(Compressor::Lzma);
-        }
+        // 3. Detect the compressor from the member's first bytes, reusing one
+        //    open handle. Content magic first; the alone-format `.lzma` has no
+        //    reliable magic, so it is selected only by the member-name extension.
+        let mut file = std::fs::File::open(temp_raw.path())?;
+        let mut head = [0u8; 6];
+        let n = file.read(&mut head)?;
+        file.rewind()?;
+        let comp = detect_compressor(&head[..n])
+            .or_else(|| data_name.ends_with(".lzma").then_some(Compressor::Lzma));
 
         // 4. Produce the tar temp file (decompress, or pass through if uncompressed).
         let tar_temp: tempfile::TempPath = match comp {
             Some(c) => {
-                let file = std::fs::File::open(temp_raw.path())?;
                 let mut decoded = decompressor(c, Box::new(file))?;
                 let mut temp_tar = tempfile::NamedTempFile::new()?;
                 std::io::copy(&mut decoded, &mut temp_tar)?;
                 temp_tar.into_temp_path()
             }
             None => {
-                if !is_tar(&mut std::fs::File::open(temp_raw.path())?)? {
+                if !is_tar(&mut file)? {
                     return Err(Error::Unsupported {
                         format: "deb".into(),
                         feature: "data.tar compression".into(),
