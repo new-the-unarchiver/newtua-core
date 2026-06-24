@@ -109,8 +109,12 @@ impl FormatHandler for CpioHandler {
                     });
                 }
                 S_IFLNK => {
-                    // Symlink: body is the link target (at most file_size bytes).
-                    let mut target_bytes = Vec::with_capacity(file_size as usize);
+                    // Symlink: body is the link target. `file_size` is an
+                    // attacker-controlled header field, so cap the capacity hint
+                    // (the Vec still grows as `to_writer` streams the real bytes)
+                    // to avoid a multi-GB eager allocation on a crafted header.
+                    let cap = (file_size as usize).min(64 * 1024);
+                    let mut target_bytes = Vec::with_capacity(cap);
                     current = Box::new(
                         entry_reader
                             .to_writer(&mut target_bytes)
