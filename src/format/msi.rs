@@ -118,17 +118,16 @@ impl FormatHandler for MsiHandler {
             std::io::copy(&mut stream_reader, &mut temp_cab)?;
             let temp_path = temp_cab.into_temp_path();
 
-            // Open via CabHandler.
-            let mut cab_reader = CabHandler
-                .open(Source::path(&temp_path)?, opts)
-                .map_err(|e| {
-                    Error::Corrupt(format!("msi: opening embedded cab {stream_name}: {e}"))
-                })?;
+            // Open via CabHandler.  Propagate the inner error variant unchanged
+            // so that callers can distinguish Unsupported (e.g. Quantum
+            // compression) from Corrupt.  Wrapping every CabHandler error into
+            // Error::Corrupt would mask the variant and mislead the orchestrator.
+            let mut cab_reader = CabHandler.open(Source::path(&temp_path)?, opts)?;
 
             // Collect entries; apply stream-name prefix when there is >1 cab.
-            let cab_entries = cab_reader
-                .entries()
-                .map_err(|e| Error::Corrupt(format!("msi: listing cab {stream_name}: {e}")))?;
+            // Propagate the inner error variant unchanged (same rationale as the
+            // open call above).
+            let cab_entries = cab_reader.entries()?;
 
             for (inner_idx, entry) in cab_entries.iter().enumerate() {
                 let mut e = entry.clone();
