@@ -36,7 +36,11 @@ impl FormatHandler for MsiHandler {
     fn probe(&self, header: &[u8], name: Option<&str>) -> Confidence {
         let has_cfb_magic = header.starts_with(CFB_MAGIC);
         let has_msi_ext = name
-            .map(|n| n.to_ascii_lowercase().ends_with(".msi"))
+            .map(|n| {
+                std::path::Path::new(n)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("msi"))
+            })
             .unwrap_or(false);
         if has_cfb_magic && has_msi_ext {
             Confidence::MAGIC
@@ -86,12 +90,11 @@ impl FormatHandler for MsiHandler {
             let mut names = Vec::new();
             for row in rows {
                 // Cabinet values: `#streamname` = embedded, plain name = external.
-                // We only support embedded cabs (leading `#`).
-                if let Some(cabinet) = row["Cabinet"].as_str() {
-                    if let Some(stream_name) = cabinet.strip_prefix('#') {
-                        names.push(stream_name.to_owned());
-                    }
-                    // External cabs (no '#') are silently skipped.
+                // We only support embedded cabs (leading `#`); external cabs
+                // (no `#`) and Null values are silently skipped.
+                if let Some(stream_name) = row["Cabinet"].as_str().and_then(|c| c.strip_prefix('#'))
+                {
+                    names.push(stream_name.to_owned());
                 }
             }
             names
@@ -134,15 +137,8 @@ impl FormatHandler for MsiHandler {
                 if needs_prefix {
                     // Prefix path with the stream name to keep names unique
                     // across multiple embedded cabs.
-                    let prefixed = PathBuf::from(stream_name).join(&e.path);
-                    let prefixed_raw = {
-                        let mut raw = stream_name.as_bytes().to_vec();
-                        raw.push(b'/');
-                        raw.extend_from_slice(&e.path_raw);
-                        raw
-                    };
-                    e.path = prefixed;
-                    e.path_raw = prefixed_raw;
+                    e.path = PathBuf::from(stream_name).join(&e.path);
+                    e.path_raw = [stream_name.as_bytes(), b"/", &e.path_raw].concat();
                 }
                 routing.push((cab_idx, inner_idx));
                 all_entries.push(e);
@@ -165,6 +161,8 @@ impl FormatHandler for MsiHandler {
 /// embedded cab stream) plus the temp files that back them (deleted on drop).
 /// Reports `FormatId::Msi`.
 struct MsiReader {
+    // Field order matters for drop: `inner_readers` (which hold open handles to
+    // the temp cabs) must drop before `_temps` (which delete those files).
     inner_readers: Vec<Box<dyn ArchiveReader>>,
     /// Temp files for the extracted CAB bytes; kept alive until drop.
     _temps: Vec<tempfile::TempPath>,

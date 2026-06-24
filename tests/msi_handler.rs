@@ -42,6 +42,19 @@ fn make_cab_bytes(file_name: &str, content: &[u8]) -> Vec<u8> {
 /// - A CFB binary stream named `cabstream` holding a valid CAB.
 ///
 /// Returns a `NamedTempFile` so the MSI file stays alive for the test.
+/// The standard MSI `Media`-table schema: DiskId (PK int16), LastSequence
+/// (int16), DiskPrompt / Cabinet / VolumeLabel / Source (nullable strings).
+fn media_columns() -> Vec<msi::Column> {
+    vec![
+        msi::Column::build("DiskId").primary_key().int16(),
+        msi::Column::build("LastSequence").int16(),
+        msi::Column::build("DiskPrompt").nullable().text_string(64),
+        msi::Column::build("Cabinet").nullable().text_string(255),
+        msi::Column::build("VolumeLabel").nullable().text_string(32),
+        msi::Column::build("Source").nullable().id_string(72),
+    ]
+}
+
 fn make_msi_fixture(file_name: &str, content: &[u8]) -> tempfile::NamedTempFile {
     let cab_bytes = make_cab_bytes(file_name, content);
 
@@ -60,20 +73,8 @@ fn make_msi_fixture(file_name: &str, content: &[u8]) -> tempfile::NamedTempFile 
     let mut package =
         msi::Package::create(msi::PackageType::Installer, file).expect("create msi package");
 
-    // Create the Media table with the standard MSI Media schema.
-    // Column order: DiskId (PK int16), LastSequence (int16), DiskPrompt
-    // (nullable text), Cabinet (nullable text), VolumeLabel (nullable text),
-    // Source (nullable text).
-    let columns = vec![
-        msi::Column::build("DiskId").primary_key().int16(),
-        msi::Column::build("LastSequence").int16(),
-        msi::Column::build("DiskPrompt").nullable().text_string(64),
-        msi::Column::build("Cabinet").nullable().text_string(255),
-        msi::Column::build("VolumeLabel").nullable().text_string(32),
-        msi::Column::build("Source").nullable().id_string(72),
-    ];
     package
-        .create_table("Media", columns)
+        .create_table("Media", media_columns())
         .expect("create Media table");
 
     // Insert one row: DiskId=1, LastSequence=1, Cabinet="#cabstream",
@@ -132,17 +133,8 @@ fn make_multi_cab_msi_fixture(cabs: &[CabEntry<'_>]) -> tempfile::NamedTempFile 
     let mut package =
         msi::Package::create(msi::PackageType::Installer, file).expect("create msi package");
 
-    // Create the Media table.
-    let columns = vec![
-        msi::Column::build("DiskId").primary_key().int16(),
-        msi::Column::build("LastSequence").int16(),
-        msi::Column::build("DiskPrompt").nullable().text_string(64),
-        msi::Column::build("Cabinet").nullable().text_string(255),
-        msi::Column::build("VolumeLabel").nullable().text_string(32),
-        msi::Column::build("Source").nullable().id_string(72),
-    ];
     package
-        .create_table("Media", columns)
+        .create_table("Media", media_columns())
         .expect("create Media table");
 
     for (i, cab) in cabs.iter().enumerate() {
@@ -242,16 +234,8 @@ fn msi_empty_media_table_gives_zero_entries() {
     let mut package =
         msi::Package::create(msi::PackageType::Installer, file).expect("create msi package");
 
-    let columns = vec![
-        msi::Column::build("DiskId").primary_key().int16(),
-        msi::Column::build("LastSequence").int16(),
-        msi::Column::build("DiskPrompt").nullable().text_string(64),
-        msi::Column::build("Cabinet").nullable().text_string(255),
-        msi::Column::build("VolumeLabel").nullable().text_string(32),
-        msi::Column::build("Source").nullable().id_string(72),
-    ];
     package
-        .create_table("Media", columns)
+        .create_table("Media", media_columns())
         .expect("create Media table");
     // No rows inserted.
     package.flush().expect("flush");
