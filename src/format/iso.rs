@@ -1,4 +1,5 @@
 use std::io::{Read, SeekFrom, Write};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -56,16 +57,36 @@ impl FormatHandler for IsoHandler {
         }
         inner.seek(SeekFrom::Start(0))?;
 
-        // Construct the ISO filesystem.
-        let iso = ISO9660::new(inner).map_err(map_iso_err)?;
+        // Wrap the cdfs ISO construction and directory-tree walk in catch_unwind.
+        //
+        // The cdfs crate calls `unimplemented!()` deep in SUSP/Rock Ridge parsing
+        // for certain extension records (e.g. IEEE_P1282 / ER version=0), producing
+        // a panic that would otherwise crash the calling process or GUI.  There is
+        // no header-detectable signature for this condition — it only surfaces during
+        // the tree walk — so catch_unwind is the correct guard.
+        //
+        // AssertUnwindSafe is justified: on a caught panic we only convert it to an
+        // error and discard all cdfs state; no poisoned state is ever reused.
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<_> {
+            // Construct the ISO filesystem.
+            let iso = ISO9660::new(inner).map_err(map_iso_err)?;
 
-        // Walk the directory tree from the best root (Rock Ridge > Joliet > 8.3).
-        let mut entries: Vec<Entry> = Vec::new();
-        let mut iso_files: Vec<Option<ISOFile<Box<dyn ReadSeek>>>> = Vec::new();
+            // Walk the directory tree from the best root (Rock Ridge > Joliet > 8.3).
+            let mut entries: Vec<Entry> = Vec::new();
+            let mut iso_files: Vec<Option<ISOFile<Box<dyn ReadSeek>>>> = Vec::new();
 
-        walk_dir(iso.root(), "", &mut entries, &mut iso_files)?;
+            walk_dir(iso.root(), "", &mut entries, &mut iso_files)?;
 
-        Ok(Box::new(IsoReader { entries, iso_files }))
+            Ok(IsoReader { entries, iso_files })
+        }));
+
+        match result {
+            Ok(Ok(reader)) => Ok(Box::new(reader)),
+            Ok(Err(e)) => Err(e),
+            Err(_panic) => Err(Error::Corrupt(
+                "iso: cdfs panicked (unsupported SUSP/Rock Ridge variant)".into(),
+            )),
+        }
     }
 }
 
@@ -170,9 +191,28 @@ impl<T: cdfs::ISO9660Reader> ArchiveReader for IsoReader<T> {
             // Directory or symlink — no body.
             return Ok(());
         };
-        let mut reader = iso_file.read();
-        std::io::copy(&mut reader, out)?;
-        Ok(())
+
+        // Wrap the cdfs read in catch_unwind: a malformed data region could also
+        // trigger an unimplemented!() or other panic inside cdfs during reading.
+        //
+        // ISOFile::read() always returns a fresh ISOFileReader starting at seek=0,
+        // so repeated calls to read_entry for the same index are safe and each
+        // returns the complete file contents.
+        //
+        // AssertUnwindSafe is justified: on a caught panic we return Corrupt and
+        // the caller discards any partial data written to `out`.
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut reader = iso_file.read();
+            std::io::copy(&mut reader, out)
+        }));
+
+        match result {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(io_err)) => Err(Error::Io(io_err)),
+            Err(_panic) => Err(Error::Corrupt(
+                "iso: cdfs panicked (unsupported SUSP/Rock Ridge variant)".into(),
+            )),
+        }
     }
 }
 

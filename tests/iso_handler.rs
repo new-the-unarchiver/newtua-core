@@ -1,10 +1,14 @@
 /// Integration tests for the ISO 9660 format handler.
 ///
-/// Fixture: `tests/fixtures/sample.iso`
-/// Created with pycdlib (Joliet-only, no Rock Ridge) containing:
-///   hello.txt  (10 bytes: "hello iso\n")
-///   sub/       (directory)
-///   sub/inner.txt  (7 bytes: "nested\n")
+/// Fixtures:
+///   `tests/fixtures/sample.iso`   — Joliet-only, no Rock Ridge; created with pycdlib
+///     hello.txt  (10 bytes: "hello iso\n")
+///     sub/       (directory)
+///     sub/inner.txt  (7 bytes: "nested\n")
+///
+///   `tests/fixtures/susp_er0.iso` — hdiutil makehybrid (ISO + Rock Ridge / SUSP IEEE_P1282);
+///     triggers an `unimplemented!()` panic inside cdfs when traversed without the
+///     catch_unwind guard.
 use std::io::Cursor;
 use std::path::Path;
 
@@ -126,5 +130,62 @@ fn fake_iso_file_returns_unknown_format() {
     assert!(
         matches!(result, Err(Error::UnknownFormat)),
         "expected UnknownFormat for garbage .iso"
+    );
+}
+
+/// Regression: opening an ISO produced by `hdiutil makehybrid` (Rock Ridge / SUSP
+/// IEEE_P1282) must NOT panic the test process — it must return `Err` instead.
+///
+/// Fixture `susp_er0.iso` was created with:
+///   mkdir -p /tmp/susproot && printf 'x\n' > /tmp/susproot/f.txt
+///   hdiutil makehybrid -iso -o /tmp/susp_rr.iso /tmp/susproot
+///
+/// Without the catch_unwind guard, cdfs calls `unimplemented!()` in its SUSP parser
+/// when it encounters the IEEE_P1282 Rock Ridge extension record, crashing the process.
+#[test]
+fn susp_er0_iso_returns_err_not_panic() {
+    let path = fixture("susp_er0.iso");
+    let opts = OpenOptions::default();
+    let result = detect::open(&path, &opts);
+    assert!(
+        result.is_err(),
+        "expected Err for susp_er0.iso (cdfs panics on SUSP IEEE_P1282), got Ok"
+    );
+    // Verify it is specifically a Corrupt error (from the catch_unwind guard),
+    // not some other variant like UnknownFormat or Io.
+    assert!(
+        matches!(result, Err(Error::Corrupt(_))),
+        "expected Err(Corrupt) for susp_er0.iso"
+    );
+}
+
+/// Fix 2 regression: calling read_entry for the same file index twice must return
+/// identical, complete bytes both times.
+///
+/// ISOFile::read() always creates a fresh ISOFileReader starting at seek=0, so
+/// repeated reads are expected to work — this test locks in that guarantee.
+#[test]
+fn read_entry_twice_returns_identical_complete_bytes() {
+    let opts = OpenOptions::default();
+    let mut reader = detect::open(&fixture("sample.iso"), &opts).expect("open sample.iso");
+
+    let entries = reader.entries().expect("entries");
+    let idx = entries
+        .iter()
+        .position(|e| e.path.to_str().unwrap_or("") == "hello.txt")
+        .expect("hello.txt not found");
+
+    let mut buf1 = Vec::new();
+    reader.read_entry(idx, &mut buf1).expect("first read_entry");
+
+    let mut buf2 = Vec::new();
+    reader
+        .read_entry(idx, &mut buf2)
+        .expect("second read_entry");
+
+    assert_eq!(buf1, b"hello iso\n", "first read returned wrong content");
+    assert_eq!(
+        buf1, buf2,
+        "second read returned different bytes than the first"
     );
 }
