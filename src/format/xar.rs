@@ -1,5 +1,5 @@
 use std::fmt::Debug;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -137,26 +137,22 @@ impl FormatHandler for XarHandler {
         }
     }
 
-    fn open(&self, src: Source, _opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
-        let mut inner: Box<dyn ReadSeek> = match src {
-            Source::Seekable { inner, .. } => inner,
-            Source::Stream { .. } => {
-                return Err(Error::Unsupported {
-                    format: "xar".into(),
-                    feature: "streaming (xar requires seek)".into(),
-                });
-            }
-        };
+    fn open(&self, mut src: Source, _opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
+        if matches!(src, Source::Stream { .. }) {
+            return Err(Error::Unsupported {
+                format: "xar".into(),
+                feature: "streaming (xar requires seek)".into(),
+            });
+        }
 
         // ── Guard: validate the 28-byte XAR header before handing the source ──
         // `apple-xar` panics with integer underflow when the header `size` field
         // (big-endian u16 at offset 4) is < 28: it computes `size as usize - 28`
-        // to skip extra header bytes.  We read and check the header ourselves so
-        // that a crafted/truncated file returns `Error::Corrupt` instead of
-        // crashing the process.
-        let mut hdr = [0u8; 28];
-        let n = inner.read(&mut hdr).map_err(Error::Io)?;
-        if n < 28 {
+        // to skip extra header bytes.  Validate the header ourselves — reusing
+        // `Source::peek_header` (reads and rewinds) — so a crafted or truncated
+        // file returns `Error::Corrupt` instead of crashing the process.
+        let hdr = src.peek_header(28)?;
+        if hdr.len() < 28 {
             return Err(Error::Corrupt("xar: file too short (< 28 bytes)".into()));
         }
         if &hdr[0..4] != b"xar!" {
@@ -168,9 +164,11 @@ impl FormatHandler for XarHandler {
                 "xar: header size field {hdr_size} < 28 (malformed)"
             )));
         }
-        // Rewind so `XarReader::new` sees the full file from the beginning.
-        inner.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
 
+        let inner: Box<dyn ReadSeek> = match src {
+            Source::Seekable { inner, .. } => inner,
+            Source::Stream { .. } => unreachable!("stream rejected above"),
+        };
         let mut xar = XarReader::new(DebugReadSeek(inner)).map_err(map_xar_err)?;
 
         let toc_files = xar.files().map_err(map_xar_err)?;
@@ -194,6 +192,7 @@ impl FormatHandler for XarHandler {
 
             let modified: Option<SystemTime> = file.mtime.as_deref().and_then(parse_mtime);
 
+            let body_size = file.size.unwrap_or(0);
             let (kind, size) = match file.file_type {
                 FileType::Directory => (EntryKind::Dir, 0u64),
                 FileType::Link => {
@@ -204,27 +203,18 @@ impl FormatHandler for XarHandler {
                     // by decoding the member payload.
                     let target = if file.data.is_some() {
                         let mut buf = Vec::new();
-                        if xar
-                            .write_file_data_decoded_from_id(file.id, &mut buf)
-                            .is_ok()
-                        {
-                            // The body is the raw target path bytes (no trailing NUL).
-                            String::from_utf8(buf)
-                                .map(PathBuf::from)
-                                .unwrap_or_default()
-                        } else {
-                            PathBuf::new()
-                        }
+                        xar.write_file_data_decoded_from_id(file.id, &mut buf)
+                            .ok()
+                            .and_then(|_| String::from_utf8(buf).ok())
+                            .map(PathBuf::from)
+                            .unwrap_or_default()
                     } else {
                         PathBuf::new()
                     };
-                    (EntryKind::Symlink { target }, file.size.unwrap_or(0))
+                    (EntryKind::Symlink { target }, body_size)
                 }
-                FileType::HardLink => {
-                    // Hard links: expose as regular files; body is in the heap.
-                    (EntryKind::File, file.size.unwrap_or(0))
-                }
-                FileType::File => (EntryKind::File, file.size.unwrap_or(0)),
+                // Hard links expose as regular files; body is in the heap.
+                FileType::HardLink | FileType::File => (EntryKind::File, body_size),
             };
 
             entries.push(Entry {
