@@ -8,7 +8,8 @@ use crate::archive::{
 use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
-    ArHandler, CabHandler, DebHandler, RarHandler, SevenZHandler, TarHandler, ZipHandler,
+    ArHandler, CabHandler, CpioHandler, DebHandler, RarHandler, SevenZHandler, TarHandler,
+    ZipHandler,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -16,6 +17,7 @@ use crate::volume::{ConcatReader, volume_members};
 pub fn registry() -> Vec<Box<dyn FormatHandler>> {
     vec![
         Box::new(ZipHandler),
+        Box::new(CpioHandler),
         Box::new(SevenZHandler),
         Box::new(RarHandler),
         Box::new(TarHandler),
@@ -346,8 +348,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_seven_handlers() {
-        assert_eq!(registry().len(), 7);
+    fn registry_has_eight_handlers() {
+        assert_eq!(registry().len(), 8);
     }
 
     #[test]

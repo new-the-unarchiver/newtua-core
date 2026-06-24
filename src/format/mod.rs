@@ -1,6 +1,9 @@
 pub mod ar;
 pub use ar::ArHandler;
 
+pub mod cpio;
+pub use cpio::CpioHandler;
+
 pub mod deb;
 pub use deb::DebHandler;
 
