@@ -54,8 +54,11 @@ impl FormatHandler for ZipHandler {
         let mut zip = zip::ZipArchive::new(inner).map_err(map_zip_err)?;
         let mut raw_names: Vec<Vec<u8>> = Vec::new();
         let mut metas: Vec<EntryMeta> = Vec::new();
+        // Parallel to `entries`: which members use the LZMA method (see read_entry).
+        let mut is_lzma: Vec<bool> = Vec::new();
         for i in 0..zip.len() {
             let f = zip.by_index_raw(i).map_err(map_zip_err)?;
+            is_lzma.push(f.compression() == zip::CompressionMethod::Lzma);
             // unix_mode() returns the full 16-bit value (type bits + perms).
             // Use the crate's is_symlink() for detection: unix_permissions() on
             // write strips type bits and always sets S_IFREG, so checking raw
@@ -135,6 +138,7 @@ impl FormatHandler for ZipHandler {
         Ok(Box::new(ZipReader {
             zip,
             entries,
+            is_lzma,
             password: opts.password.clone(),
         }))
     }
@@ -193,6 +197,8 @@ fn map_zip_err(e: zip::result::ZipError) -> Error {
 struct ZipReader {
     zip: ZipArc,
     entries: Vec<Entry>,
+    /// Parallel to `entries`: true where the member uses the LZMA method.
+    is_lzma: Vec<bool>,
     password: Option<String>,
 }
 
@@ -230,14 +236,9 @@ impl ArchiveReader for ZipReader {
         // uncompressed-size field the ZIP-LZMA format omits — so extraction fails
         // with a misleading IO error. Surface it as Unsupported until the crate
         // handles ZIP-LZMA (listing already works). PPMd reaches the same outcome
-        // via map_zip_err's UnsupportedArchive arm.
-        if self
-            .zip
-            .by_index_raw(idx)
-            .map_err(map_zip_err)?
-            .compression()
-            == zip::CompressionMethod::Lzma
-        {
+        // via map_zip_err's UnsupportedArchive arm. The method was captured at
+        // open() time, so no second local-header read is needed here.
+        if self.is_lzma[idx] {
             return Err(Error::Unsupported {
                 format: "zip".into(),
                 feature: "LZMA (zip)".into(),

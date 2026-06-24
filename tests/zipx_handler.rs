@@ -18,6 +18,26 @@ fn fixture(name: &str) -> std::path::PathBuf {
     Path::new("tests/fixtures").join(name)
 }
 
+/// Assert a `.zipx` lists exactly one entry and reports `FormatId::Zip`.
+fn assert_lists_single_zip_entry(name: &str) {
+    let mut ar = open(&fixture(name), &OpenOptions::default()).unwrap();
+    assert_eq!(
+        ar.entries().unwrap().len(),
+        1,
+        "expected one entry in {name}"
+    );
+    assert_eq!(ar.format(), FormatId::Zip, "format must be Zip for {name}");
+}
+
+/// Assert extracting entry 0 of a `.zipx` yields exactly `expected`.
+fn assert_extracts(name: &str, expected: &[u8]) {
+    let mut ar = open(&fixture(name), &OpenOptions::default()).unwrap();
+    ar.entries().unwrap();
+    let mut out = Vec::new();
+    ar.read_entry(0, &mut out).unwrap();
+    assert_eq!(out, expected);
+}
+
 // ── LZMA: listing works, extraction is reported Unsupported ─────────────────
 //
 // NOTE: The zip crate 2.4.2 uses lzma_rs with UnpackedSize::ReadFromHeader,
@@ -33,14 +53,7 @@ fn fixture(name: &str) -> std::path::PathBuf {
 #[test]
 fn lzma_zipx_lists_entries() {
     // Listing must succeed even when extraction is unsupported.
-    let mut ar = open(&fixture("lzma.zipx"), &OpenOptions::default()).unwrap();
-    let entries = ar.entries().unwrap();
-    assert_eq!(entries.len(), 1, "expected exactly one entry in lzma.zipx");
-    assert_eq!(
-        ar.format(),
-        FormatId::Zip,
-        "format must be Zip, not a new FormatId"
-    );
+    assert_lists_single_zip_entry("lzma.zipx");
 }
 
 #[test]
@@ -61,64 +74,42 @@ fn lzma_zipx_read_entry_is_unsupported_not_io() {
 
 #[test]
 fn bzip2_zipx_lists_entries() {
-    let mut ar = open(&fixture("bzip2.zipx"), &OpenOptions::default()).unwrap();
-    let entries = ar.entries().unwrap();
-    assert_eq!(entries.len(), 1, "expected exactly one entry in bzip2.zipx");
-    assert_eq!(ar.format(), FormatId::Zip);
+    assert_lists_single_zip_entry("bzip2.zipx");
 }
 
 #[test]
 fn bzip2_zipx_extracts_correct_bytes() {
-    let expected: Vec<u8> = "bzip2 zipx payload\n".repeat(200).into_bytes();
-    let mut ar = open(&fixture("bzip2.zipx"), &OpenOptions::default()).unwrap();
-    ar.entries().unwrap();
-    let mut out = Vec::new();
-    ar.read_entry(0, &mut out).unwrap();
-    assert_eq!(out, expected);
+    assert_extracts(
+        "bzip2.zipx",
+        &"bzip2 zipx payload\n".repeat(200).into_bytes(),
+    );
 }
 
 // ── XZ happy path ─────────────────────────────────────────────────────────────
 
 #[test]
 fn xz_zipx_lists_entries() {
-    let mut ar = open(&fixture("xz.zipx"), &OpenOptions::default()).unwrap();
-    let entries = ar.entries().unwrap();
-    assert_eq!(entries.len(), 1, "expected exactly one entry in xz.zipx");
-    assert_eq!(ar.format(), FormatId::Zip);
+    assert_lists_single_zip_entry("xz.zipx");
 }
 
 #[test]
 fn xz_zipx_extracts_correct_bytes() {
-    let expected: Vec<u8> = "xz zipx payload\n".repeat(200).into_bytes();
-    let mut ar = open(&fixture("xz.zipx"), &OpenOptions::default()).unwrap();
-    ar.entries().unwrap();
-    let mut out = Vec::new();
-    ar.read_entry(0, &mut out).unwrap();
-    assert_eq!(out, expected);
+    assert_extracts("xz.zipx", &"xz zipx payload\n".repeat(200).into_bytes());
 }
 
 // ── Deflate64 happy path ──────────────────────────────────────────────────────
 
 #[test]
 fn deflate64_zipx_lists_entries() {
-    let mut ar = open(&fixture("deflate64.zipx"), &OpenOptions::default()).unwrap();
-    let entries = ar.entries().unwrap();
-    assert_eq!(
-        entries.len(),
-        1,
-        "expected exactly one entry in deflate64.zipx"
-    );
-    assert_eq!(ar.format(), FormatId::Zip);
+    assert_lists_single_zip_entry("deflate64.zipx");
 }
 
 #[test]
 fn deflate64_zipx_extracts_correct_bytes() {
-    let expected: Vec<u8> = "deflate64 payload\n".repeat(200).into_bytes();
-    let mut ar = open(&fixture("deflate64.zipx"), &OpenOptions::default()).unwrap();
-    ar.entries().unwrap();
-    let mut out = Vec::new();
-    ar.read_entry(0, &mut out).unwrap();
-    assert_eq!(out, expected);
+    assert_extracts(
+        "deflate64.zipx",
+        &"deflate64 payload\n".repeat(200).into_bytes(),
+    );
 }
 
 // ── PPMd → must surface as Error::Unsupported, not Corrupt or a panic ────────
@@ -126,10 +117,7 @@ fn deflate64_zipx_extracts_correct_bytes() {
 #[test]
 fn ppmd_zipx_listing_succeeds() {
     // Listing (entries()) must work even for PPMd — the header is readable.
-    let mut ar = open(&fixture("ppmd.zipx"), &OpenOptions::default()).unwrap();
-    let entries = ar.entries().unwrap();
-    assert_eq!(entries.len(), 1, "expected exactly one entry in ppmd.zipx");
-    assert_eq!(ar.format(), FormatId::Zip);
+    assert_lists_single_zip_entry("ppmd.zipx");
 }
 
 #[test]
