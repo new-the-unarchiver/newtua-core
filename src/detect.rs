@@ -493,6 +493,8 @@ mod tests {
             stem_without_compressor_ext(Path::new("/tmp/data.tar.Z")),
             "data.tar"
         );
+        // Lowercase ".z" is NOT a compress extension — must be left intact.
+        assert_eq!(stem_without_compressor_ext(Path::new("file.z")), "file.z");
     }
 
     #[test]

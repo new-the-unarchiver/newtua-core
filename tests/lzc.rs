@@ -44,4 +44,13 @@ fn tar_dot_z_lists_members() {
     let mut body = Vec::new();
     reader.read_entry(idx, &mut body).expect("read a.txt");
     assert_eq!(body, b"one\n");
+
+    let entries = reader.entries().expect("entries");
+    let idx_b = entries
+        .iter()
+        .position(|e| e.path.to_string_lossy() == "b.txt")
+        .unwrap();
+    let mut body_b = Vec::new();
+    reader.read_entry(idx_b, &mut body_b).expect("read b.txt");
+    assert_eq!(body_b, b"two\n");
 }
