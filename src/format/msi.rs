@@ -189,6 +189,29 @@ impl ArchiveReader for MsiReader {
     }
 }
 
+/// Extracts the install (long) directory name from a `Directory.DefaultDir`
+/// value. `DefaultDir` is `[target][:source]`; each side is `[short|]long`. We
+/// take the **target** side's long name. Returns `None` for `.` ("same as
+/// parent" — no path segment) and for an empty value.
+fn parse_defaultdir_name(default_dir: &str) -> Option<String> {
+    // The target dir is everything before the first ':' (the source dir, if
+    // present, follows it and is irrelevant for the install layout).
+    let target = default_dir.split(':').next().unwrap_or(default_dir);
+    // The long name is everything after the last '|' (the short name precedes
+    // it); if there is no '|', the whole target is the name.
+    let long = target.rsplit('|').next().unwrap_or(target);
+    if long.is_empty() || long == "." {
+        None
+    } else {
+        Some(long.to_owned())
+    }
+}
+
+/// Extracts the long name from a `File.FileName` value (`[short|]long`).
+fn parse_filename_long(file_name: &str) -> String {
+    file_name.rsplit('|').next().unwrap_or(file_name).to_owned()
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -244,5 +267,30 @@ mod tests {
     fn probe_negative_no_name() {
         // CFB magic but no file name → NONE.
         assert_eq!(MsiHandler.probe(&cfb_header(), None), Confidence::NONE);
+    }
+
+    #[test]
+    fn defaultdir_takes_long_target_name() {
+        // `short|long` → long; `target:source` → target side.
+        assert_eq!(parse_defaultdir_name("APP|MyApp"), Some("MyApp".to_owned()));
+        assert_eq!(
+            parse_defaultdir_name("APP|MyApp:SRC|MySrc"),
+            Some("MyApp".to_owned())
+        );
+        assert_eq!(parse_defaultdir_name("ProgramFilesFolder"), Some("ProgramFilesFolder".to_owned()));
+    }
+
+    #[test]
+    fn defaultdir_dot_and_empty_are_none() {
+        assert_eq!(parse_defaultdir_name("."), None);
+        assert_eq!(parse_defaultdir_name(""), None);
+        // `.` on the target side with a source still yields no segment.
+        assert_eq!(parse_defaultdir_name(".:SRC|src"), None);
+    }
+
+    #[test]
+    fn filename_takes_long_name() {
+        assert_eq!(parse_filename_long("app.exe"), "app.exe".to_owned());
+        assert_eq!(parse_filename_long("APP~1.EXE|app.exe"), "app.exe".to_owned());
     }
 }
