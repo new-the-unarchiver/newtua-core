@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use apple_xar::reader::XarReader;
 use apple_xar::table_of_contents::FileType;
@@ -77,42 +77,19 @@ fn map_xar_err(e: apple_xar::Error) -> Error {
 /// `SystemTime`. We do a best-effort parse; returns `None` on any parse failure.
 fn parse_mtime(s: &str) -> Option<SystemTime> {
     // XAR stores mtime as e.g. "2025-01-02T03:04:05" (no timezone = UTC assumed).
-    // We do a minimal manual parse to avoid pulling in chrono.
+    // Parse the fields and let the shared helper do the (range-checked) conversion.
     let s = s.trim();
-    // Expect at least "YYYY-MM-DDTHH:MM:SS" (19 chars)
+    // Expect at least "YYYY-MM-DDTHH:MM:SS" (19 chars).
     if s.len() < 19 {
         return None;
     }
-    let year: i64 = s[0..4].parse().ok()?;
-    let month: u64 = s[5..7].parse().ok()?;
-    let day: u64 = s[8..10].parse().ok()?;
+    let year: i32 = s[0..4].parse().ok()?;
+    let month: u32 = s[5..7].parse().ok()?;
+    let day: u32 = s[8..10].parse().ok()?;
     let hour: u64 = s[11..13].parse().ok()?;
     let min: u64 = s[14..16].parse().ok()?;
     let sec: u64 = s[17..19].parse().ok()?;
-
-    if year < 1970 {
-        return None;
-    }
-
-    // Rough days-since-epoch calculation (ignoring leap seconds, good enough for
-    // display purposes — matches how other handlers approach mtime).
-    let days_in_month = [0u64, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let year = year as u64;
-    let mut days: u64 = 0;
-    for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
-    }
-    for m in 1..month {
-        let extra = if m == 2 && is_leap(year) { 1 } else { 0 };
-        days += days_in_month[m as usize] + extra;
-    }
-    days += day - 1;
-    let secs = days * 86400 + hour * 3600 + min * 60 + sec;
-    Some(UNIX_EPOCH + Duration::from_secs(secs))
-}
-
-fn is_leap(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    crate::datetime::civil_to_systime(year, month, day, hour, min, sec)
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -313,7 +290,7 @@ mod tests {
     #[test]
     fn parse_mtime_basic() {
         let t = parse_mtime("2025-01-02T03:04:05").unwrap();
-        assert!(t > UNIX_EPOCH);
+        assert!(t > SystemTime::UNIX_EPOCH);
     }
 
     #[test]

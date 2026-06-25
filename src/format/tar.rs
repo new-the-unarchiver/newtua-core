@@ -5,7 +5,7 @@ use crate::archive::{
     ArchiveReader, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
 };
 use crate::encoding::decode_names;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, io_err_to_corrupt};
 
 pub struct TarHandler;
 
@@ -119,12 +119,12 @@ fn index_from_reader<R: Read + Seek>(
     let mut metas: Vec<EntryMeta> = Vec::new();
 
     let mut ar = tar::Archive::new(reader);
-    for entry in ar.entries().map_err(|e| Error::Corrupt(e.to_string()))? {
-        let entry = entry.map_err(|e| Error::Corrupt(e.to_string()))?;
+    for entry in ar.entries().map_err(io_err_to_corrupt)? {
+        let entry = entry.map_err(io_err_to_corrupt)?;
         let header = entry.header();
         let entry_type = header.entry_type();
         let mode = header.mode().ok();
-        let size = header.size().map_err(|e| Error::Corrupt(e.to_string()))?;
+        let size = header.size().map_err(io_err_to_corrupt)?;
         let path_bytes = entry.path_bytes().to_vec();
         let offset = entry.raw_file_position();
         let modified = header
