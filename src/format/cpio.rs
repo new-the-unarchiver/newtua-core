@@ -6,7 +6,7 @@ use crate::archive::{
     ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
 };
 use crate::encoding::decode_names;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, io_err_to_corrupt};
 
 // ── Mode constants (POSIX S_IFMT family) ────────────────────────────────────
 
@@ -14,17 +14,6 @@ const S_IFMT: u32 = 0o170000;
 const S_IFLNK: u32 = 0o120000; // symbolic link
 const S_IFDIR: u32 = 0o040000; // directory
 const S_IFREG: u32 = 0o100000; // regular file
-
-/// Map a `cpio`-crate `io::Error` onto our error model (mirrors `map_cab_err`
-/// / `map_ar_err`): structural problems are `Corrupt`, everything else is `Io`.
-fn map_cpio_err(e: std::io::Error) -> Error {
-    match e.kind() {
-        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
-            Error::Corrupt(e.to_string())
-        }
-        _ => Error::Io(e),
-    }
-}
 
 // ── Handler ──────────────────────────────────────────────────────────────────
 
@@ -64,7 +53,7 @@ impl FormatHandler for CpioHandler {
         let mut current: Box<dyn Read> = reader;
 
         loop {
-            let entry_reader = cpio::NewcReader::new(current).map_err(map_cpio_err)?;
+            let entry_reader = cpio::NewcReader::new(current).map_err(io_err_to_corrupt)?;
 
             if entry_reader.entry().is_trailer() {
                 // Consume the trailer; we don't need the underlying reader.
@@ -87,7 +76,11 @@ impl FormatHandler for CpioHandler {
                 S_IFREG => {
                     // Regular file: stream body into the shared temp file.
                     let offset = temp.seek(SeekFrom::End(0))?;
-                    current = Box::new(entry_reader.to_writer(&mut temp).map_err(map_cpio_err)?);
+                    current = Box::new(
+                        entry_reader
+                            .to_writer(&mut temp)
+                            .map_err(io_err_to_corrupt)?,
+                    );
                     raw_names.push(name_str.into_bytes());
                     metas.push(EntryMeta {
                         kind: KindRaw::File,
@@ -98,7 +91,7 @@ impl FormatHandler for CpioHandler {
                     });
                 }
                 S_IFDIR => {
-                    current = Box::new(entry_reader.finish().map_err(map_cpio_err)?);
+                    current = Box::new(entry_reader.finish().map_err(io_err_to_corrupt)?);
                     raw_names.push(name_str.into_bytes());
                     metas.push(EntryMeta {
                         kind: KindRaw::Dir,
@@ -118,7 +111,7 @@ impl FormatHandler for CpioHandler {
                     current = Box::new(
                         entry_reader
                             .to_writer(&mut target_bytes)
-                            .map_err(map_cpio_err)?,
+                            .map_err(io_err_to_corrupt)?,
                     );
                     // Trim trailing NUL if any.
                     while target_bytes.last() == Some(&0) {
@@ -136,7 +129,7 @@ impl FormatHandler for CpioHandler {
                 _ => {
                     // Special node (char/block device, fifo, socket) or hardlink —
                     // skip silently per the spec.
-                    current = Box::new(entry_reader.finish().map_err(map_cpio_err)?);
+                    current = Box::new(entry_reader.finish().map_err(io_err_to_corrupt)?);
                 }
             }
         }

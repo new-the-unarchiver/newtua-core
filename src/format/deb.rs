@@ -5,9 +5,8 @@ use crate::archive::{
 };
 use crate::decompress::{Compressor, decompressor};
 use crate::detect::{detect_compressor, is_tar};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, io_err_to_corrupt};
 use crate::format::TarHandler;
-use crate::format::ar::map_ar_err;
 
 pub struct DebHandler;
 
@@ -45,7 +44,7 @@ impl FormatHandler for DebHandler {
         let mut found: Option<(usize, String)> = None;
         let mut idx = 0usize;
         while let Some(entry) = archive.next_entry() {
-            let entry = entry.map_err(map_ar_err)?;
+            let entry = entry.map_err(io_err_to_corrupt)?;
             let name = entry.header().identifier();
             if name.starts_with(b"data.tar") {
                 found = Some((idx, String::from_utf8_lossy(name).to_lowercase()));
@@ -59,7 +58,7 @@ impl FormatHandler for DebHandler {
         // 2. Copy that member (still compressed) to a temp file.
         let mut temp_raw = tempfile::NamedTempFile::new()?;
         {
-            let mut member = archive.jump_to_entry(data_idx).map_err(map_ar_err)?;
+            let mut member = archive.jump_to_entry(data_idx).map_err(io_err_to_corrupt)?;
             std::io::copy(&mut member, &mut temp_raw)?;
         }
         drop(archive);

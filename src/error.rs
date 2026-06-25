@@ -32,9 +32,32 @@ pub enum Error {
     InvalidIndex(usize),
 }
 
+/// Map a third-party crate's `io::Error` onto our error model: structural
+/// problems (`InvalidData` / `UnexpectedEof`) become `Corrupt`, everything else
+/// stays `Io`. Shared by the format handlers (cab, ar, cpio, deb, xar) so the
+/// classification lives in one place.
+pub(crate) fn io_err_to_corrupt(e: std::io::Error) -> Error {
+    match e.kind() {
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
+            Error::Corrupt(e.to_string())
+        }
+        _ => Error::Io(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn io_err_to_corrupt_classifies_kinds() {
+        let corrupt = io_err_to_corrupt(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        assert!(matches!(corrupt, Error::Corrupt(_)));
+        let eof = io_err_to_corrupt(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        assert!(matches!(eof, Error::Corrupt(_)));
+        let io = io_err_to_corrupt(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(matches!(io, Error::Io(_)));
+    }
 
     #[test]
     fn display_messages_are_human_readable() {

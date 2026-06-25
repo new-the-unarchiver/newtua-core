@@ -6,7 +6,7 @@ use crate::archive::{
     Source,
 };
 use crate::encoding::decode_names;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, io_err_to_corrupt};
 
 pub struct ArHandler;
 
@@ -42,7 +42,7 @@ impl FormatHandler for ArHandler {
         let mut raw_names: Vec<Vec<u8>> = Vec::new();
         let mut metas: Vec<(u64, Option<u32>, Option<SystemTime>)> = Vec::new();
         while let Some(entry) = archive.next_entry() {
-            let entry = entry.map_err(map_ar_err)?;
+            let entry = entry.map_err(io_err_to_corrupt)?;
             let header = entry.header();
             raw_names.push(header.identifier().to_vec());
             // ar stores unix permissions; keep only the permission bits.
@@ -80,16 +80,6 @@ fn unix_secs_to_systime(secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(secs)
 }
 
-/// Map an `ar`-crate `io::Error` onto our error model.
-pub(crate) fn map_ar_err(e: std::io::Error) -> Error {
-    match e.kind() {
-        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
-            Error::Corrupt(e.to_string())
-        }
-        _ => Error::Io(e),
-    }
-}
-
 struct ArReader {
     archive: ar::Archive<Box<dyn ReadSeek>>,
     entries: Vec<Entry>,
@@ -110,7 +100,7 @@ impl ArchiveReader for ArReader {
         }
         // `jump_to_entry` indexes real members in the same order as `next_entry`
         // (special members skipped), so `idx` matches our `entries` order.
-        let mut entry = self.archive.jump_to_entry(idx).map_err(map_ar_err)?;
+        let mut entry = self.archive.jump_to_entry(idx).map_err(io_err_to_corrupt)?;
         std::io::copy(&mut entry, out)?;
         Ok(())
     }
@@ -153,17 +143,5 @@ mod tests {
             unix_secs_to_systime(60),
             UNIX_EPOCH + Duration::from_secs(60)
         );
-    }
-
-    #[test]
-    fn map_ar_err_invalid_data_is_corrupt() {
-        let e = std::io::Error::from(std::io::ErrorKind::InvalidData);
-        assert!(matches!(map_ar_err(e), Error::Corrupt(_)));
-    }
-
-    #[test]
-    fn map_ar_err_not_found_is_io() {
-        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
-        assert!(matches!(map_ar_err(e), Error::Io(_)));
     }
 }

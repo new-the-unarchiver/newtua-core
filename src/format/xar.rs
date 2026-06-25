@@ -10,7 +10,7 @@ use crate::archive::{
     ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, ReadSeek,
     Source,
 };
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, io_err_to_corrupt};
 
 // ── Debug wrapper ─────────────────────────────────────────────────────────────
 
@@ -60,12 +60,7 @@ impl Write for WriteProxy<'_> {
 /// Map an `apple-xar` error onto our error model.
 fn map_xar_err(e: apple_xar::Error) -> Error {
     match e {
-        apple_xar::Error::Io(io) => match io.kind() {
-            std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
-                Error::Corrupt(io.to_string())
-            }
-            _ => Error::Io(io),
-        },
+        apple_xar::Error::Io(io) => io_err_to_corrupt(io),
         apple_xar::Error::Scroll(_)
         | apple_xar::Error::SerdeXml(_)
         | apple_xar::Error::TableOfContentsCorrupted(_)

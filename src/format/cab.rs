@@ -5,7 +5,7 @@ use crate::archive::{
     ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, ReadSeek,
     Source,
 };
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, io_err_to_corrupt};
 
 pub struct CabHandler;
 
@@ -32,7 +32,7 @@ impl FormatHandler for CabHandler {
                 });
             }
         };
-        let cab = cab::Cabinet::new(inner).map_err(map_cab_err)?;
+        let cab = cab::Cabinet::new(inner).map_err(io_err_to_corrupt)?;
 
         let mut entries: Vec<Entry> = Vec::new();
         let mut quantum: Vec<bool> = Vec::new();
@@ -83,16 +83,6 @@ fn unix_secs_to_systime(secs: i64) -> Option<SystemTime> {
     }
 }
 
-/// Map a `cab`-crate `io::Error` onto our error model.
-fn map_cab_err(e: std::io::Error) -> Error {
-    match e.kind() {
-        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
-            Error::Corrupt(e.to_string())
-        }
-        _ => Error::Io(e),
-    }
-}
-
 struct CabReader {
     cab: cab::Cabinet<Box<dyn ReadSeek>>,
     entries: Vec<Entry>,
@@ -124,7 +114,7 @@ impl ArchiveReader for CabReader {
         // so this is lossless. Duplicate names across folders resolve to the first
         // match — accepted for v1 (single-file cabinets).
         let name = String::from_utf8_lossy(&self.entries[idx].path_raw);
-        let mut reader = self.cab.read_file(&name).map_err(map_cab_err)?;
+        let mut reader = self.cab.read_file(&name).map_err(io_err_to_corrupt)?;
         std::io::copy(&mut reader, out)?;
         Ok(())
     }
@@ -162,17 +152,5 @@ mod tests {
             Some(SystemTime::UNIX_EPOCH + Duration::from_secs(60))
         );
         assert_eq!(unix_secs_to_systime(-1), None);
-    }
-
-    #[test]
-    fn map_cab_err_invalid_data_is_corrupt() {
-        let e = std::io::Error::from(std::io::ErrorKind::InvalidData);
-        assert!(matches!(map_cab_err(e), Error::Corrupt(_)));
-    }
-
-    #[test]
-    fn map_cab_err_not_found_is_io() {
-        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
-        assert!(matches!(map_cab_err(e), Error::Io(_)));
     }
 }
