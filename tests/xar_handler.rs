@@ -1,6 +1,4 @@
-//! Gated behind the `xar` feature (off by default). The whole file compiles to
-//! nothing in the default build; run with `--features xar` to exercise it.
-#![cfg(feature = "xar")]
+//! XAR (.xar/.pkg) integration tests. XAR is built by default (in-house reader).
 
 use newtua_core::archive::{EntryKind, FormatId};
 use newtua_core::detect::open;
@@ -62,6 +60,62 @@ fn reads_exact_bytes_from_fixture() {
     assert_eq!(out, b"hi from xar\n", "decompressed content mismatch");
 }
 
+// ── Integration: nested tree (full paths, dirs, nested read, symlink) ────────
+
+/// `nested.xar` built with /usr/bin/xar from: top.txt, sub/{a.txt,b.txt},
+/// link.txt → top.txt. Exercises full-path reconstruction (zar's top-level-only
+/// API could not do this), directory entries, nested-file reads, and symlinks.
+fn nested_fixture() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/nested.xar"
+    ))
+}
+
+#[test]
+fn nested_full_paths_and_kinds() {
+    let mut ar = open(nested_fixture(), &OpenOptions::default()).unwrap();
+    assert_eq!(ar.format(), FormatId::Xar);
+    let entries = ar.entries().unwrap();
+
+    let by_path = |p: &str| entries.iter().find(|e| e.path.to_str() == Some(p));
+
+    // Nested files carry their full path, not just the leaf name.
+    assert_eq!(
+        by_path("sub/a.txt").map(|e| &e.kind),
+        Some(&EntryKind::File)
+    );
+    assert_eq!(
+        by_path("sub/b.txt").map(|e| &e.kind),
+        Some(&EntryKind::File)
+    );
+    assert_eq!(by_path("top.txt").map(|e| &e.kind), Some(&EntryKind::File));
+
+    // The directory is its own entry.
+    assert_eq!(by_path("sub").map(|e| &e.kind), Some(&EntryKind::Dir));
+
+    // The symlink exposes its target.
+    match by_path("link.txt").map(|e| &e.kind) {
+        Some(EntryKind::Symlink { target }) => assert_eq!(target, Path::new("top.txt")),
+        other => panic!("link.txt should be a symlink to top.txt, got {other:?}"),
+    }
+}
+
+#[test]
+fn nested_reads_file_inside_directory() {
+    let mut ar = open(nested_fixture(), &OpenOptions::default()).unwrap();
+    let idx = {
+        let entries = ar.entries().unwrap();
+        entries
+            .iter()
+            .position(|e| e.path.to_str() == Some("sub/a.txt"))
+            .expect("sub/a.txt not found")
+    };
+    let mut out = Vec::new();
+    ar.read_entry(idx, &mut out).unwrap();
+    assert_eq!(out, b"aaa\n", "nested file body mismatch");
+}
+
 // ── Unit: open via XarHandler directly ───────────────────────────────────────
 
 #[test]
@@ -119,10 +173,8 @@ fn stream_source_returns_unsupported() {
 /// `toc_length_compressed` value followed by `toc_length_uncompressed` and
 /// checksum algorithm, then append `extra_bytes`.
 ///
-/// The header `size` field is set to 28 (the minimum valid value). The
-/// upstream crate computes `header.size as usize - 28` to determine how many
-/// extra header bytes to read; a value < 28 would cause a panic, so we always
-/// pass 28 here.
+/// The header `size` field is set to 28 (the minimum valid value); the reader
+/// rejects anything smaller as `Corrupt`.
 fn make_xar_header(toc_compressed_len: u64, extra_bytes: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"xar!"); // magic (4 bytes)
