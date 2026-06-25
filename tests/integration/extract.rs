@@ -404,7 +404,7 @@ fn no_preserve_skips_mtime() {
 // secret.zip: ZipCrypto-encrypted (classic `zip -P pw`), two entries
 // (a.txt, inner.txt), password "pw". The encrypted-extract guard must surface
 // as a top-level error and leave NOTHING on disk.
-const ENC_ZIP_FIXTURE: &[u8] = include_bytes!("fixtures/secret.zip");
+const ENC_ZIP_FIXTURE: &[u8] = include_bytes!("../fixtures/secret.zip");
 
 fn write_secret_zip() -> tempfile::NamedTempFile {
     let tmp = tempfile::Builder::new().suffix(".zip").tempfile().unwrap();

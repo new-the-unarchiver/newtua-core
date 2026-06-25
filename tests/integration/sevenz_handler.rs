@@ -2,24 +2,24 @@ use newtua_core::format::SevenZHandler;
 use newtua_core::{EntryKind, ExtractOptions, FormatHandler, OpenOptions, Source, extract_all};
 
 // Fixture: pre-built 7z archive with one entry "a.txt" = "hello 7z".
-const FIXTURE: &[u8] = include_bytes!("fixtures/hello.7z");
+const FIXTURE: &[u8] = include_bytes!("../fixtures/hello.7z");
 
 // secret.7z MUST be created with header encryption enabled:
 //   7zz a -ppw -mhe=on secret.7z a.txt
 // Header encryption makes SevenZReader::new fail immediately on a wrong
 // password. Without -mhe=on, sevenz-rust2 may return wrong data instead of
 // an error, which would make the wrong-password test pass silently on bad output.
-const ENC_FIXTURE: &[u8] = include_bytes!("fixtures/secret.7z");
+const ENC_FIXTURE: &[u8] = include_bytes!("../fixtures/secret.7z");
 
 // multi.7z: two-entry archive: f1.txt="first", f2.txt="second"
 //   7zz a multi.7z f1.txt f2.txt
-const MULTI_FIXTURE: &[u8] = include_bytes!("fixtures/multi.7z");
+const MULTI_FIXTURE: &[u8] = include_bytes!("../fixtures/multi.7z");
 
 // secret_content.7z: CONTENT-only encryption (no -mhe), password "pw":
 //   printf 'hello 7z' > a.txt && 7zz a -ppw secret_content.7z a.txt
 // Header is plaintext, so open()/listing succeed without a password and the
 // encrypted-extract guard must come from verify_password, not open().
-const ENC_CONTENT_FIXTURE: &[u8] = include_bytes!("fixtures/secret_content.7z");
+const ENC_CONTENT_FIXTURE: &[u8] = include_bytes!("../fixtures/secret_content.7z");
 
 #[test]
 fn content_encrypted_lists_without_password() {
@@ -142,7 +142,7 @@ fn encrypted_archive_reports_is_encrypted_true() {
 #[test]
 fn sevenz_populates_mode_when_available() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), include_bytes!("fixtures/meta.7z")).unwrap();
+    std::fs::write(tmp.path(), include_bytes!("../fixtures/meta.7z")).unwrap();
     let src = Source::path(tmp.path()).unwrap();
     let mut ar = SevenZHandler.open(src, &OpenOptions::default()).unwrap();
     let entries = ar.entries().unwrap().to_vec();
@@ -159,7 +159,7 @@ fn sevenz_populates_mode_when_available() {
 #[test]
 fn sevenz_symlink_target_populated() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), include_bytes!("fixtures/symlink.7z")).unwrap();
+    std::fs::write(tmp.path(), include_bytes!("../fixtures/symlink.7z")).unwrap();
     let src = Source::path(tmp.path()).unwrap();
     let mut ar = SevenZHandler.open(src, &OpenOptions::default()).unwrap();
     let entries = ar.entries().unwrap();
@@ -183,7 +183,7 @@ fn sevenz_symlink_target_populated() {
 #[test]
 fn sevenz_symlink_extracted_correctly() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), include_bytes!("fixtures/symlink.7z")).unwrap();
+    std::fs::write(tmp.path(), include_bytes!("../fixtures/symlink.7z")).unwrap();
     let src = Source::path(tmp.path()).unwrap();
     let mut ar = SevenZHandler.open(src, &OpenOptions::default()).unwrap();
     let dest = tempfile::tempdir().unwrap();
@@ -245,7 +245,7 @@ fn multi_entry_on_demand_extraction() {
 // header made sevenz-rust2 fall back to a tail-scan recovery and request a
 // ~412 GB allocation, killing the process. Our start-header guard must reject
 // it cleanly. If the guard regresses, this test OOMs/aborts instead of failing.
-const MALFORMED_OOM_FIXTURE: &[u8] = include_bytes!("fixtures/malformed_oom.7z");
+const MALFORMED_OOM_FIXTURE: &[u8] = include_bytes!("../fixtures/malformed_oom.7z");
 
 #[test]
 fn malformed_header_is_rejected_not_oom() {

@@ -1,7 +1,7 @@
 use newtua_core::format::RarHandler;
 use newtua_core::{FormatHandler, OpenOptions, Source};
 
-const FIXTURE: &[u8] = include_bytes!("fixtures/hello.rar");
+const FIXTURE: &[u8] = include_bytes!("../fixtures/hello.rar");
 
 #[test]
 fn lists_and_extracts_rar() {
@@ -23,7 +23,7 @@ fn lists_and_extracts_rar() {
 //   rar a meta.rar f.txt && rm f.txt
 // (RAR 7.22, Host OS: Unix, Attributes: -rwxr-xr-x)
 // file_attr = 0o100755 (full POSIX st_mode); file_attr & 0o7777 = 0o755.
-const META_FIXTURE: &[u8] = include_bytes!("fixtures/meta.rar");
+const META_FIXTURE: &[u8] = include_bytes!("../fixtures/meta.rar");
 
 #[test]
 fn rar_populates_mode_when_available() {
@@ -47,7 +47,7 @@ fn rar_populates_mode_when_available() {
 // Created with: printf 'hello rar' > a.txt && rar a -ppw secret.rar a.txt && rm a.txt
 // (RAR 7.22 no longer supports -ma4; produces RAR5 data-encrypted archive.)
 // The archive lists without a password; extraction with a wrong password errors.
-const ENC_FIXTURE: &[u8] = include_bytes!("fixtures/secret.rar");
+const ENC_FIXTURE: &[u8] = include_bytes!("../fixtures/secret.rar");
 
 #[test]
 fn wrong_password_errors() {

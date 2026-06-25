@@ -93,10 +93,10 @@ fn single_001_file_no_sibling_opens_normally() {
 
 // Fixtures: mv.part1.rar, mv.part2.rar, mv.part3.rar
 // Content:  content.txt — 4000 random bytes (stored verbatim, -m0)
-const RAR_PART1: &[u8] = include_bytes!("fixtures/mv.part1.rar");
-const RAR_PART2: &[u8] = include_bytes!("fixtures/mv.part2.rar");
-const RAR_PART3: &[u8] = include_bytes!("fixtures/mv.part3.rar");
-const EXPECTED_CONTENT: &[u8] = include_bytes!("fixtures/mv_content.txt");
+const RAR_PART1: &[u8] = include_bytes!("../fixtures/mv.part1.rar");
+const RAR_PART2: &[u8] = include_bytes!("../fixtures/mv.part2.rar");
+const RAR_PART3: &[u8] = include_bytes!("../fixtures/mv.part3.rar");
+const EXPECTED_CONTENT: &[u8] = include_bytes!("../fixtures/mv_content.txt");
 
 /// Listing a native multi-volume RAR must succeed and return the correct entry
 /// metadata.  The unrar 0.5.8 library is able to list without crossing volume
