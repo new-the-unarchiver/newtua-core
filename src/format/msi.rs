@@ -22,6 +22,10 @@ use crate::format::CabHandler;
 /// CFB file-format magic (8 bytes).
 const CFB_MAGIC: &[u8] = &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
+/// Upper bound on `Directory_Parent` chain length when resolving a path. Guards
+/// against cyclic or pathologically deep `Directory` trees in crafted files.
+const MAX_DIR_DEPTH: usize = 256;
+
 pub struct MsiHandler;
 
 impl FormatHandler for MsiHandler {
@@ -212,6 +216,43 @@ fn parse_filename_long(file_name: &str) -> String {
     file_name.rsplit('|').next().unwrap_or(file_name).to_owned()
 }
 
+/// Resolves a `Directory` key to its root→leaf install path.
+///
+/// `dir_map` maps each `Directory` key to `(Directory_Parent, long name)`. The
+/// walk ascends parents until it reaches the root (a row whose parent is
+/// `None`, or which points to itself), pushing each non-`None` name, then
+/// reverses to root→leaf order. The root row itself never contributes a
+/// segment. A `visited` set plus `MAX_DIR_DEPTH` make the walk cycle-safe.
+fn resolve_dir_path(
+    start: &str,
+    dir_map: &std::collections::HashMap<String, (Option<String>, Option<String>)>,
+) -> PathBuf {
+    let mut segments: Vec<String> = Vec::new();
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut current = start;
+    for _ in 0..MAX_DIR_DEPTH {
+        if !visited.insert(current) {
+            break; // cycle
+        }
+        let Some((parent, name)) = dir_map.get(current) else {
+            break; // unknown key
+        };
+        match parent {
+            // Non-root node: contribute its name, then ascend.
+            Some(p) if p != current => {
+                if let Some(n) = name {
+                    segments.push(n.clone());
+                }
+                current = p;
+            }
+            // Root (null parent or self-parent): contributes no segment; stop.
+            _ => break,
+        }
+    }
+    segments.reverse();
+    segments.into_iter().collect()
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -292,5 +333,60 @@ mod tests {
     fn filename_takes_long_name() {
         assert_eq!(parse_filename_long("app.exe"), "app.exe".to_owned());
         assert_eq!(parse_filename_long("APP~1.EXE|app.exe"), "app.exe".to_owned());
+    }
+
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    /// Helper: build a dir_map entry.
+    fn dir(parent: Option<&str>, name: Option<&str>) -> (Option<String>, Option<String>) {
+        (parent.map(str::to_owned), name.map(str::to_owned))
+    }
+
+    #[test]
+    fn resolve_nested_drops_root_keeps_property_folder() {
+        // TARGETDIR (root, no parent, no name) → ProgramFilesFolder → MyApp.
+        let mut m = HashMap::new();
+        m.insert("TARGETDIR".to_owned(), dir(None, None));
+        m.insert("ProgramFilesFolder".to_owned(), dir(Some("TARGETDIR"), Some("ProgramFilesFolder")));
+        m.insert("MyApp".to_owned(), dir(Some("ProgramFilesFolder"), Some("MyApp")));
+        assert_eq!(
+            resolve_dir_path("MyApp", &m),
+            PathBuf::from("ProgramFilesFolder/MyApp")
+        );
+    }
+
+    #[test]
+    fn resolve_dot_segment_is_skipped() {
+        // A `.`-named directory contributes no segment.
+        let mut m = HashMap::new();
+        m.insert("TARGETDIR".to_owned(), dir(None, None));
+        m.insert("DOT".to_owned(), dir(Some("TARGETDIR"), None)); // DefaultDir "." → None
+        m.insert("Leaf".to_owned(), dir(Some("DOT"), Some("Leaf")));
+        assert_eq!(resolve_dir_path("Leaf", &m), PathBuf::from("Leaf"));
+    }
+
+    #[test]
+    fn resolve_root_itself_is_empty_path() {
+        let mut m = HashMap::new();
+        m.insert("TARGETDIR".to_owned(), dir(None, None));
+        assert_eq!(resolve_dir_path("TARGETDIR", &m), PathBuf::new());
+    }
+
+    #[test]
+    fn resolve_cycle_is_bounded_no_panic() {
+        // A → B → A cycle must terminate without panic or hang.
+        let mut m = HashMap::new();
+        m.insert("A".to_owned(), dir(Some("B"), Some("A")));
+        m.insert("B".to_owned(), dir(Some("A"), Some("B")));
+        let p = resolve_dir_path("A", &m);
+        // Bounded result; exact value is not important, only that it returns.
+        assert!(p.components().count() <= MAX_DIR_DEPTH);
+    }
+
+    #[test]
+    fn resolve_missing_key_is_empty_path() {
+        let m: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+        assert_eq!(resolve_dir_path("nope", &m), PathBuf::new());
     }
 }
