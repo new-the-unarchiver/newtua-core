@@ -53,6 +53,8 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
 /// - Bzip2: `BZh`
 /// - Xz:    `fd 37 7a 58 5a 00`
 /// - Zstd:  `28 b5 2f fd`
+/// - Lzc:   `1f 9d`
+/// - Lz4:   `04 22 4d 18`
 pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     if header.starts_with(&[0x1f, 0x8b]) {
         return Some(Compressor::Gzip);
@@ -68,6 +70,11 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     }
     if header.starts_with(&[0x1f, 0x9d]) {
         return Some(Compressor::Lzc);
+    }
+    if header.starts_with(&[0x04, 0x22, 0x4D, 0x18]) {
+        // LZ4 frame format. Legacy frame (0x02 0x21 0x4C 0x18) is intentionally
+        // unsupported — lz4_flex's FrameDecoder doesn't decode it. TODO if needed.
+        return Some(Compressor::Lz4);
     }
     None
 }
@@ -246,7 +253,7 @@ impl ArchiveReader for SingleFileReader {
 fn stem_without_compressor_ext(path: &Path) -> String {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
 
-    for ext in &[".gz", ".bz2", ".xz", ".zst", ".Z"] {
+    for ext in &[".gz", ".bz2", ".xz", ".zst", ".Z", ".lz4"] {
         if let Some(stem) = name.strip_suffix(ext) {
             return stem.to_string();
         }
@@ -465,6 +472,26 @@ mod tests {
         assert_eq!(
             detect_compressor(&[0x1f, 0x9d, 0x90]),
             Some(Compressor::Lzc)
+        );
+    }
+
+    #[test]
+    fn detect_compressor_recognizes_lz4() {
+        assert_eq!(
+            detect_compressor(&[0x04, 0x22, 0x4D, 0x18, 0x64]),
+            Some(Compressor::Lz4)
+        );
+    }
+
+    #[test]
+    fn stem_strips_lz4() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/tmp/data.tar.lz4")),
+            "data.tar"
+        );
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("notes.txt.lz4")),
+            "notes.txt"
         );
     }
 
