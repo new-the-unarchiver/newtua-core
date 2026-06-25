@@ -74,6 +74,9 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     if header.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
         return Some(Compressor::Zstd);
     }
+    if header.starts_with(&[0x1f, 0x9d]) {
+        return Some(Compressor::Lzc);
+    }
     None
 }
 
@@ -251,7 +254,7 @@ impl ArchiveReader for SingleFileReader {
 fn stem_without_compressor_ext(path: &Path) -> String {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
 
-    for ext in &[".gz", ".bz2", ".xz", ".zst"] {
+    for ext in &[".gz", ".bz2", ".xz", ".zst", ".Z"] {
         if let Some(stem) = name.strip_suffix(ext) {
             return stem.to_string();
         }
@@ -469,6 +472,26 @@ mod tests {
         assert_eq!(
             stem_without_compressor_ext(Path::new("notes.txt.zst")),
             "notes.txt"
+        );
+    }
+
+    #[test]
+    fn detect_compressor_recognizes_dot_z() {
+        assert_eq!(
+            detect_compressor(&[0x1f, 0x9d, 0x90]),
+            Some(Compressor::Lzc)
+        );
+    }
+
+    #[test]
+    fn stem_strips_dot_z() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/tmp/archive.Z")),
+            "archive"
+        );
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/tmp/data.tar.Z")),
+            "data.tar"
         );
     }
 

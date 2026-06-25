@@ -7,6 +7,7 @@ pub enum Compressor {
     Xz,
     Zstd,
     Lzma,
+    Lzc,
 }
 
 pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<Box<dyn Read>> {
@@ -19,6 +20,7 @@ pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<B
             let stream = xz2::stream::Stream::new_lzma_decoder(u64::MAX)?;
             Ok(Box::new(xz2::read::XzDecoder::new_stream(inner, stream)))
         }
+        Compressor::Lzc => Ok(Box::new(lzw_z::Decoder::new(inner))),
     }
 }
 
@@ -75,6 +77,17 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, b"frame-oneframe-two");
+    }
+
+    #[test]
+    fn lzc_decodes_dot_z_stream() {
+        // Hand-crafted non-block .Z (header 1f 9d 10 + literals 'A','B'),
+        // independent of any fixture file.
+        let bytes = vec![0x1f, 0x9d, 0x10, 0x41, 0x84, 0x00];
+        let mut r = decompressor(Compressor::Lzc, Box::new(std::io::Cursor::new(bytes))).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"AB");
     }
 
     #[test]
