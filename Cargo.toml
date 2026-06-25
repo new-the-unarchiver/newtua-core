@@ -24,11 +24,25 @@ unrar.workspace = true
 tempfile.workspace = true
 cpio.workspace = true
 rpm.workspace = true
-apple-xar = { version = "0.20", default-features = false }
-msi.workspace = true
+# XAR is gated behind the `xar` feature (off by default): apple-xar pulls a
+# heavy crypto stack (x509-certificate → ring). Excluded from the shipped
+# build until the dedicated XAR follow-up phase resolves the dependency.
+apple-xar = { version = "0.20", default-features = false, optional = true }
+# MSI is gated behind the `msi` feature (off by default): the current model-B
+# handler emits raw CAB-member keys, not resolved install paths. Excluded from
+# the shipped build until the dedicated MSI follow-up phase (File/Component/
+# Directory table resolution).
+msi = { workspace = true, optional = true }
 cdfs = "0.2.3"
 goblin.workspace = true
 warc.workspace = true
+
+[features]
+default = []
+# Apple XAR / .pkg support. Off by default — see the dependency note above.
+xar = ["dep:apple-xar"]
+# Windows Installer .msi support. Off by default — see the dependency note above.
+msi = ["dep:msi"]
 
 [dev-dependencies]
 tar.workspace = true

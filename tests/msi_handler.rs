@@ -1,5 +1,8 @@
 //! Integration tests for the MSI installer format handler.
 //!
+//! Gated behind the `msi` feature (off by default). The whole file compiles to
+//! nothing in the default build; run with `--features msi` to exercise it.
+//!
 //! The test fixture is built programmatically using the `msi` and `cab` crates:
 //! 1. A tiny CAB is created in memory (via `cab::CabinetBuilder`) containing
 //!    one file `hello.txt` with known content.
@@ -9,6 +12,7 @@
 //!    written as a CFB stream named `cabstream`.
 //!
 //! This approach requires no external MSI tooling.
+#![cfg(feature = "msi")]
 
 use std::io::{Cursor, Write};
 

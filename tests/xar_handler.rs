@@ -1,3 +1,7 @@
+//! Gated behind the `xar` feature (off by default). The whole file compiles to
+//! nothing in the default build; run with `--features xar` to exercise it.
+#![cfg(feature = "xar")]
+
 use newtua_core::archive::{EntryKind, FormatId};
 use newtua_core::detect::open;
 use newtua_core::format::XarHandler;
