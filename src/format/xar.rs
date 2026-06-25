@@ -1,10 +1,18 @@
-use std::fmt::Debug;
-use std::io::{Read, Seek, Write};
-use std::path::PathBuf;
+//! In-house XAR (`.xar` / `.pkg`) reader — decode only.
+//!
+//! XAR layout: a 28-byte big-endian header, a zlib-compressed XML table of
+//! contents (TOC), then the heap holding each file's (optionally compressed)
+//! bytes. We parse the header and TOC ourselves and read heap slices on demand,
+//! so we depend only on `flate2`/`bzip2`/`xz2` (already in the workspace) plus a
+//! tiny XML DOM (`roxmltree`) — no `apple-xar`, no `ring`.
+
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use apple_xar::reader::XarReader;
-use apple_xar::table_of_contents::FileType;
+use bzip2::read::BzDecoder;
+use flate2::read::ZlibDecoder;
+use xz2::read::XzDecoder;
 
 use crate::archive::{
     ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, ReadSeek,
@@ -12,74 +20,66 @@ use crate::archive::{
 };
 use crate::error::{Error, Result, io_err_to_corrupt};
 
-// ── Debug wrapper ─────────────────────────────────────────────────────────────
+/// Reject absurd TOC sizes early (defends against a crafted header forcing a
+/// huge allocation). Real XAR TOCs are kilobytes to a few megabytes.
+const MAX_TOC_COMPRESSED: u64 = 128 * 1024 * 1024;
 
-/// Wraps `Box<dyn ReadSeek>` with a no-op `Debug` impl so it can satisfy the
-/// `R: Debug` bound required by `XarReader<R>`.
-struct DebugReadSeek(Box<dyn ReadSeek>);
+// ── Heap codec ──────────────────────────────────────────────────────────────
 
-impl Debug for DebugReadSeek {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("DebugReadSeek(<dyn ReadSeek>)")
-    }
+/// Compression codec of a member's bytes in the heap, from `<encoding style>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Codec {
+    /// `application/x-gzip` or `application/zlib` — a raw zlib stream (NOT gzip).
+    Zlib,
+    Bzip2,
+    Xz,
+    /// `application/octet-stream` or absent — stored verbatim.
+    Stored,
 }
 
-impl Read for DebugReadSeek {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
-    }
+/// Map a `<encoding style="…">` value to a codec. Unknown styles are rejected so
+/// we never silently mis-decode a member.
+fn codec_from_style(style: Option<&str>) -> Result<Codec> {
+    Ok(match style {
+        Some("application/x-gzip") | Some("application/zlib") => Codec::Zlib,
+        Some("application/x-bzip2") => Codec::Bzip2,
+        Some("application/x-xz") => Codec::Xz,
+        Some("application/octet-stream") | None => Codec::Stored,
+        Some(other) => {
+            return Err(Error::Unsupported {
+                format: "xar".into(),
+                feature: format!("member codec {other}"),
+            });
+        }
+    })
 }
 
-impl Seek for DebugReadSeek {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.0.seek(pos)
-    }
+/// Where a file's bytes live in the heap, parallel to an `Entry`.
+#[derive(Debug, Clone, Copy)]
+struct HeapItem {
+    /// Offset relative to the heap (i.e. to `heap_offset`).
+    offset: u64,
+    /// Compressed byte count in the heap.
+    length: u64,
+    codec: Codec,
 }
 
-// ── Write-proxy: lets us pass `&mut dyn Write` where `impl Write` is needed ──
+// ── TOC helpers ───────────────────────────────────────────────────────────────
 
-/// Thin Sized wrapper around `&mut dyn Write`.
-///
-/// `write_file_data_decoded_from_id` requires a concrete `impl Write` (Sized
-/// bound), so we cannot pass `&mut dyn Write` directly.  Wrapping it in this
-/// newtype gives us a concrete type while forwarding all writes to the caller's
-/// writer — no intermediate buffer needed.
-struct WriteProxy<'a>(&'a mut dyn Write);
-
-impl Write for WriteProxy<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
+/// Text of the first direct-child element named `tag`, owned to avoid borrowing
+/// the parsed document.
+fn child_text(node: roxmltree::Node, tag: &str) -> Option<String> {
+    node.children()
+        .find(|c| c.is_element() && c.has_tag_name(tag))
+        .and_then(|c| c.text())
+        .map(str::to_string)
 }
 
-// ── Helper ────────────────────────────────────────────────────────────────────
-
-/// Map an `apple-xar` error onto our error model.
-fn map_xar_err(e: apple_xar::Error) -> Error {
-    match e {
-        apple_xar::Error::Io(io) => io_err_to_corrupt(io),
-        apple_xar::Error::Scroll(_)
-        | apple_xar::Error::SerdeXml(_)
-        | apple_xar::Error::TableOfContentsCorrupted(_)
-        | apple_xar::Error::BadChecksum(_) => Error::Corrupt(e.to_string()),
-        apple_xar::Error::UnimplementedFileEncoding(enc) => Error::Unsupported {
-            format: "xar".into(),
-            feature: format!("member codec {enc}"),
-        },
-        _ => Error::Corrupt(e.to_string()),
-    }
-}
-
-/// Parse a XAR mtime string (RFC 3339 / ISO 8601 like "2025-01-02T03:04:05") to
-/// `SystemTime`. We do a best-effort parse; returns `None` on any parse failure.
+/// Parse a XAR mtime string (ISO 8601 like "2025-01-02T03:04:05" or
+/// "…Z") to `SystemTime`. Best-effort; returns `None` on any parse failure.
 fn parse_mtime(s: &str) -> Option<SystemTime> {
-    // XAR stores mtime as e.g. "2025-01-02T03:04:05" (no timezone = UTC assumed).
-    // Parse the fields and let the shared helper do the (range-checked) conversion.
     let s = s.trim();
-    // Expect at least "YYYY-MM-DDTHH:MM:SS" (19 chars).
+    // Expect at least "YYYY-MM-DDTHH:MM:SS" (19 chars); ignore any trailing zone.
     if s.len() < 19 {
         return None;
     }
@@ -90,6 +90,101 @@ fn parse_mtime(s: &str) -> Option<SystemTime> {
     let min: u64 = s[14..16].parse().ok()?;
     let sec: u64 = s[17..19].parse().ok()?;
     crate::datetime::civil_to_systime(year, month, day, hour, min, sec)
+}
+
+/// Recursively collect `<file>` nodes under `node`, joining `parent/name` into
+/// full paths. Appends to `entries` and the parallel `items` (one slot per
+/// entry; `None` for entries with no heap body).
+fn collect(
+    node: roxmltree::Node,
+    parent: &Path,
+    entries: &mut Vec<Entry>,
+    items: &mut Vec<Option<HeapItem>>,
+) -> Result<()> {
+    for file in node
+        .children()
+        .filter(|c| c.is_element() && c.has_tag_name("file"))
+    {
+        let name = match child_text(file, "name") {
+            Some(n) => n,
+            // A `<file>` without a `<name>` is malformed; skip it.
+            None => continue,
+        };
+        let path = parent.join(&name);
+        let kind_str = child_text(file, "type").unwrap_or_else(|| "file".to_string());
+        let mode = child_text(file, "mode").and_then(|s| u32::from_str_radix(s.trim(), 8).ok());
+        let modified = child_text(file, "mtime").as_deref().and_then(parse_mtime);
+
+        // The member body is the DIRECT-child `<data>` — never `<ea>` (extended
+        // attribute streams), which carry their own `<encoding>`/`<offset>`.
+        let data = file
+            .children()
+            .find(|c| c.is_element() && c.has_tag_name("data"));
+
+        let (kind, size, item) = match kind_str.as_str() {
+            "directory" => (EntryKind::Dir, 0u64, None),
+            "symlink" => {
+                let target = file
+                    .children()
+                    .find(|c| c.is_element() && c.has_tag_name("link"))
+                    .and_then(|l| l.text())
+                    .unwrap_or_default();
+                (
+                    EntryKind::Symlink {
+                        target: PathBuf::from(target),
+                    },
+                    0u64,
+                    None,
+                )
+            }
+            // "file", "hardlink", or anything else → a regular file. A hardlink
+            // reference without `<data>` reads as empty.
+            _ => match data {
+                Some(d) => {
+                    let offset = child_text(d, "offset")
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0);
+                    let length = child_text(d, "length")
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0);
+                    let size = child_text(d, "size")
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0);
+                    let style = d
+                        .children()
+                        .find(|c| c.is_element() && c.has_tag_name("encoding"))
+                        .and_then(|e| e.attribute("style"));
+                    let codec = codec_from_style(style)?;
+                    (
+                        EntryKind::File,
+                        size,
+                        Some(HeapItem {
+                            offset,
+                            length,
+                            codec,
+                        }),
+                    )
+                }
+                None => (EntryKind::File, 0u64, None),
+            },
+        };
+
+        entries.push(Entry {
+            path_raw: path.to_string_lossy().as_bytes().to_vec(),
+            path: path.clone(),
+            kind,
+            size,
+            mode,
+            is_encrypted: false,
+            modified,
+        });
+        items.push(item);
+
+        // Recurse into directory contents (only directories carry `<file>`
+        // children; recursing other nodes is harmless).
+        collect(file, &path, entries, items)?;
+    }
+    Ok(())
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -117,12 +212,7 @@ impl FormatHandler for XarHandler {
             });
         }
 
-        // ── Guard: validate the 28-byte XAR header before handing the source ──
-        // `apple-xar` panics with integer underflow when the header `size` field
-        // (big-endian u16 at offset 4) is < 28: it computes `size as usize - 28`
-        // to skip extra header bytes.  Validate the header ourselves — reusing
-        // `Source::peek_header` (reads and rewinds) — so a crafted or truncated
-        // file returns `Error::Corrupt` instead of crashing the process.
+        // Validate the 28-byte header up front (peek rewinds the source).
         let hdr = src.peek_header(28)?;
         if hdr.len() < 28 {
             return Err(Error::Corrupt("xar: file too short (< 28 bytes)".into()));
@@ -130,102 +220,68 @@ impl FormatHandler for XarHandler {
         if &hdr[0..4] != b"xar!" {
             return Err(Error::Corrupt("xar: bad magic (expected 'xar!')".into()));
         }
-        let hdr_size = u16::from_be_bytes([hdr[4], hdr[5]]);
-        if hdr_size < 28 {
+        let header_len = u16::from_be_bytes([hdr[4], hdr[5]]) as u64;
+        if header_len < 28 {
             return Err(Error::Corrupt(format!(
-                "xar: header size field {hdr_size} < 28 (malformed)"
+                "xar: header size field {header_len} < 28 (malformed)"
+            )));
+        }
+        let toc_len_compressed = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
+        if toc_len_compressed == 0 || toc_len_compressed > MAX_TOC_COMPRESSED {
+            return Err(Error::Corrupt(format!(
+                "xar: implausible TOC length {toc_len_compressed}"
             )));
         }
 
-        let inner: Box<dyn ReadSeek> = match src {
+        let mut inner: Box<dyn ReadSeek> = match src {
             Source::Seekable { inner, .. } => inner,
             Source::Stream { .. } => unreachable!("stream rejected above"),
         };
-        let mut xar = XarReader::new(DebugReadSeek(inner)).map_err(map_xar_err)?;
 
-        let toc_files = xar.files().map_err(map_xar_err)?;
+        // Skip the (possibly larger-than-28) header and read the compressed TOC.
+        inner
+            .seek(SeekFrom::Start(header_len))
+            .map_err(io_err_to_corrupt)?;
+        let mut toc_compressed = vec![0u8; toc_len_compressed as usize];
+        inner
+            .read_exact(&mut toc_compressed)
+            .map_err(io_err_to_corrupt)?;
+        let heap_offset = header_len + toc_len_compressed;
 
-        let mut entries: Vec<Entry> = Vec::with_capacity(toc_files.len());
-        // Per-entry file IDs, parallel to `entries`; used in `read_entry` to
-        // locate member data without re-scanning the TOC by path.
-        let mut file_ids: Vec<u64> = Vec::with_capacity(toc_files.len());
+        // Inflate the zlib TOC, then parse the XML.
+        let mut xml = String::new();
+        ZlibDecoder::new(&toc_compressed[..])
+            .read_to_string(&mut xml)
+            .map_err(|e| Error::Corrupt(format!("xar: TOC inflate: {e}")))?;
+        let doc = roxmltree::Document::parse(&xml)
+            .map_err(|e| Error::Corrupt(format!("xar: TOC XML: {e}")))?;
+        let toc = doc
+            .descendants()
+            .find(|n| n.has_tag_name("toc"))
+            .ok_or_else(|| Error::Corrupt("xar: TOC has no <toc> element".into()))?;
 
-        for (path_str, file) in toc_files {
-            let path_raw = path_str.as_bytes().to_vec();
-            let path = PathBuf::from(&path_str);
-
-            // Parse octal mode string e.g. "0100644" → 0o100644.
-            // `from_str_radix` handles leading zeros in radix-8 correctly;
-            // trimming them would break the all-zeros case ("0" → "").
-            let mode: Option<u32> = file
-                .mode
-                .as_deref()
-                .and_then(|s| u32::from_str_radix(s, 8).ok());
-
-            let modified: Option<SystemTime> = file.mtime.as_deref().and_then(parse_mtime);
-
-            let body_size = file.size.unwrap_or(0);
-            let (kind, size) = match file.file_type {
-                FileType::Directory => (EntryKind::Dir, 0u64),
-                FileType::Link => {
-                    // XAR stores the symlink target as the file body in the heap.
-                    // Read it now so the Entry carries the real target path.
-                    // `apple-xar`'s `File` struct has no dedicated `link_target`
-                    // field in its TOC representation; the target is only available
-                    // by decoding the member payload.
-                    let target = if file.data.is_some() {
-                        let mut buf = Vec::new();
-                        xar.write_file_data_decoded_from_id(file.id, &mut buf)
-                            .ok()
-                            .and_then(|_| String::from_utf8(buf).ok())
-                            .map(PathBuf::from)
-                            .unwrap_or_default()
-                    } else {
-                        PathBuf::new()
-                    };
-                    (EntryKind::Symlink { target }, body_size)
-                }
-                // Hard links expose as regular files; body is in the heap.
-                FileType::HardLink | FileType::File => (EntryKind::File, body_size),
-            };
-
-            entries.push(Entry {
-                path_raw,
-                path,
-                kind,
-                size,
-                mode,
-                is_encrypted: false,
-                modified,
-            });
-            file_ids.push(file.id);
-        }
+        let mut entries: Vec<Entry> = Vec::new();
+        let mut items: Vec<Option<HeapItem>> = Vec::new();
+        collect(toc, Path::new(""), &mut entries, &mut items)?;
 
         Ok(Box::new(XarReaderInner {
-            xar,
+            inner,
+            heap_offset,
             entries,
-            file_ids,
+            items,
         }))
     }
 }
 
 // ── Reader ────────────────────────────────────────────────────────────────────
 
-/// Wraps `XarReader` so it implements `ArchiveReader`. The inner reader uses our
-/// `DebugReadSeek` wrapper which satisfies the `R: Debug` bound on `XarReader`.
 struct XarReaderInner {
-    xar: XarReader<DebugReadSeek>,
+    inner: Box<dyn ReadSeek>,
+    heap_offset: u64,
     entries: Vec<Entry>,
-    /// TOC file IDs, parallel to `entries`.
-    file_ids: Vec<u64>,
-}
-
-impl Debug for XarReaderInner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("XarReaderInner")
-            .field("entries_count", &self.entries.len())
-            .finish()
-    }
+    /// Heap location per entry, parallel to `entries`; `None` for dirs, symlinks,
+    /// and empty/bodyless files.
+    items: Vec<Option<HeapItem>>,
 }
 
 impl ArchiveReader for XarReaderInner {
@@ -241,22 +297,34 @@ impl ArchiveReader for XarReaderInner {
         if idx >= self.entries.len() {
             return Err(Error::InvalidIndex(idx));
         }
-
         match &self.entries[idx].kind {
-            EntryKind::Dir => return Ok(()),
-            EntryKind::Symlink { .. } => return Ok(()),
+            EntryKind::Dir | EntryKind::Symlink { .. } => return Ok(()),
             EntryKind::File => {}
         }
+        // No heap body (empty file or hardlink reference) → nothing to write.
+        let Some(item) = self.items[idx] else {
+            return Ok(());
+        };
 
-        let id = self.file_ids[idx];
-        // Stream directly into `out` via `WriteProxy` (a thin Sized wrapper
-        // around `&mut dyn Write`), bypassing the need for an intermediate Vec.
-        // `write_file_data_decoded_from_id` requires `impl Write` (Sized), so we
-        // cannot pass `&mut dyn Write` naked — `WriteProxy` bridges that gap.
-        let mut proxy = WriteProxy(out);
-        self.xar
-            .write_file_data_decoded_from_id(id, &mut proxy)
-            .map_err(map_xar_err)?;
+        self.inner
+            .seek(SeekFrom::Start(self.heap_offset + item.offset))
+            .map_err(io_err_to_corrupt)?;
+        let limited = (&mut self.inner).take(item.length);
+        match item.codec {
+            Codec::Stored => {
+                let mut r = limited;
+                std::io::copy(&mut r, out).map_err(io_err_to_corrupt)?;
+            }
+            Codec::Zlib => {
+                std::io::copy(&mut ZlibDecoder::new(limited), out).map_err(io_err_to_corrupt)?;
+            }
+            Codec::Bzip2 => {
+                std::io::copy(&mut BzDecoder::new(limited), out).map_err(io_err_to_corrupt)?;
+            }
+            Codec::Xz => {
+                std::io::copy(&mut XzDecoder::new(limited), out).map_err(io_err_to_corrupt)?;
+            }
+        }
         Ok(())
     }
 }
@@ -294,25 +362,56 @@ mod tests {
     }
 
     #[test]
+    fn parse_mtime_with_zone_suffix() {
+        // The trailing 'Z' (and anything past second 19) is ignored.
+        assert!(parse_mtime("2026-06-25T08:50:04Z").is_some());
+    }
+
+    #[test]
     fn parse_mtime_short_returns_none() {
         assert!(parse_mtime("2025").is_none());
     }
 
-    /// Regression test: a XAR header with `size` field = 16 (< 28) must return
-    /// `Err(Error::Corrupt)` rather than panicking with integer underflow.
-    /// Without the header guard in `open`, `apple-xar` would compute
-    /// `16usize - 28` and panic.
+    #[test]
+    fn codec_from_style_mapping() {
+        assert_eq!(
+            codec_from_style(Some("application/x-gzip")).unwrap(),
+            Codec::Zlib
+        );
+        assert_eq!(
+            codec_from_style(Some("application/zlib")).unwrap(),
+            Codec::Zlib
+        );
+        assert_eq!(
+            codec_from_style(Some("application/x-bzip2")).unwrap(),
+            Codec::Bzip2
+        );
+        assert_eq!(
+            codec_from_style(Some("application/x-xz")).unwrap(),
+            Codec::Xz
+        );
+        assert_eq!(
+            codec_from_style(Some("application/octet-stream")).unwrap(),
+            Codec::Stored
+        );
+        assert_eq!(codec_from_style(None).unwrap(), Codec::Stored);
+        assert!(matches!(
+            codec_from_style(Some("application/x-lzfse")),
+            Err(Error::Unsupported { .. })
+        ));
+    }
+
+    /// Regression: a XAR header with `size` field < 28 must return
+    /// `Err(Error::Corrupt)` rather than panicking.
     #[test]
     fn header_size_below_28_returns_corrupt_not_panic() {
         use crate::archive::Source;
         use std::io::Cursor;
 
-        // Craft a minimal 28-byte buffer:
-        //   magic "xar!" | size=0x0010 (16) | version=1 | zeros...
         let mut buf = [0u8; 28];
         buf[0..4].copy_from_slice(b"xar!");
         buf[4..6].copy_from_slice(&16u16.to_be_bytes()); // size = 16 < 28
-        buf[6..8].copy_from_slice(&1u16.to_be_bytes()); // version = 1
+        buf[6..8].copy_from_slice(&1u16.to_be_bytes());
 
         let src = Source::Seekable {
             inner: Box::new(Cursor::new(buf.to_vec())),
@@ -320,9 +419,6 @@ mod tests {
         };
 
         let result = XarHandler.open(src, &OpenOptions::default());
-        assert!(
-            matches!(result, Err(Error::Corrupt(_))),
-            "expected Err(Corrupt) for header size < 28, got Ok or different error variant"
-        );
+        assert!(matches!(result, Err(Error::Corrupt(_))));
     }
 }

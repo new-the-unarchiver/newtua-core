@@ -25,14 +25,13 @@ pub use sevenz::SevenZHandler;
 pub mod rar;
 pub use rar::RarHandler;
 
-// XAR and MSI are gated off by default (see crates/newtua-core/Cargo.toml
-// [features]); each is excluded from the shipped build pending its own
-// follow-up phase. The source is kept compiling under the feature flag.
-#[cfg(feature = "xar")]
+// XAR (.xar/.pkg): in-house decode-only reader, always built.
 pub mod xar;
-#[cfg(feature = "xar")]
 pub use xar::XarHandler;
 
+// MSI is gated off by default (see crates/newtua-core/Cargo.toml [features]):
+// the model-B handler emits raw CAB-member keys, not resolved install paths.
+// Excluded from the shipped build pending its follow-up phase (Д2).
 #[cfg(feature = "msi")]
 pub mod msi;
 #[cfg(feature = "msi")]

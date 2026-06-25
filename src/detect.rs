@@ -9,11 +9,9 @@ use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 #[cfg(feature = "msi")]
 use crate::format::MsiHandler;
-#[cfg(feature = "xar")]
-use crate::format::XarHandler;
 use crate::format::{
     ArHandler, CabHandler, CpioHandler, DebHandler, IsoHandler, RarHandler, RpmHandler,
-    SevenZHandler, SfxHandler, TarHandler, WarcHandler, ZipHandler,
+    SevenZHandler, SfxHandler, TarHandler, WarcHandler, XarHandler, ZipHandler,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -35,8 +33,6 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
         // RpmHandler: unique lead magic (ED AB EE DB), no tie-break with peers.
         Box::new(RpmHandler),
         // XarHandler: unique magic "xar!" (78 61 72 21), used for .xar and .pkg.
-        // Gated behind the `xar` feature (off by default) — see format/mod.rs.
-        #[cfg(feature = "xar")]
         Box::new(XarHandler),
         // MsiHandler: CFB magic + .msi extension (model B — reuses CabHandler
         // for the embedded CAB streams in the Media table).
@@ -430,12 +426,9 @@ mod tests {
 
     #[test]
     fn registry_has_expected_handlers() {
-        // 12 always-on handlers; XAR and MSI each add one behind their
+        // 13 always-on handlers (XAR included); MSI adds one behind its
         // (off-by-default) feature flag.
-        let mut expected = 12;
-        if cfg!(feature = "xar") {
-            expected += 1;
-        }
+        let mut expected = 13;
         if cfg!(feature = "msi") {
             expected += 1;
         }
