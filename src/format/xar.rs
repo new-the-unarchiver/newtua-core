@@ -24,6 +24,17 @@ use crate::error::{Error, Result, io_err_to_corrupt};
 /// huge allocation). Real XAR TOCs are kilobytes to a few megabytes.
 const MAX_TOC_COMPRESSED: u64 = 128 * 1024 * 1024;
 
+/// Cap the *decompressed* TOC to bound a zlib-bomb (a tiny compressed TOC that
+/// inflates to gigabytes). Past this the XML is truncated and parsing fails →
+/// `Corrupt`, a safe fail-closed path.
+const MAX_TOC_UNCOMPRESSED: u64 = 256 * 1024 * 1024;
+
+/// Cap XML element nesting. `roxmltree`'s parser recurses once per nesting level
+/// and overflows the stack on a deeply-nested document (~100–150 levels on a
+/// 2 MiB stack — an uncatchable process abort). We reject deeper TOCs *before*
+/// parsing. Real XAR trees nest only a handful of levels, so 64 is generous.
+const MAX_TOC_DEPTH: usize = 64;
+
 // ── Heap codec ──────────────────────────────────────────────────────────────
 
 /// Compression codec of a member's bytes in the heap, from `<encoding style>`.
@@ -92,24 +103,142 @@ fn parse_mtime(s: &str) -> Option<SystemTime> {
     crate::datetime::civil_to_systime(year, month, day, hour, min, sec)
 }
 
-/// Recursively collect `<file>` nodes under `node`, joining `parent/name` into
-/// full paths. Appends to `entries` and the parallel `items` (one slot per
-/// entry; `None` for entries with no heap body).
+/// First index of `needle` in `b[from..]`.
+fn memchr_from(b: &[u8], from: usize, needle: u8) -> Option<usize> {
+    b.get(from..)?
+        .iter()
+        .position(|&c| c == needle)
+        .map(|p| from + p)
+}
+
+/// First index of `pat` in `b[from..]`.
+fn find_from(b: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
+    if pat.is_empty() || from > b.len() || b.len() - from < pat.len() {
+        return None;
+    }
+    b[from..]
+        .windows(pat.len())
+        .position(|w| w == pat)
+        .map(|p| from + p)
+}
+
+/// Conservatively report whether XML element nesting ever exceeds `limit`.
+///
+/// Robust against comments, CDATA, processing instructions/declarations, and
+/// `>` inside quoted attribute values, so a crafted TOC cannot hide nesting
+/// from this guard. Runs before `roxmltree::parse` (which would otherwise
+/// recurse per level and overflow the stack on a deeply-nested document). On
+/// any malformed/unterminated construct it returns `false` and lets the real
+/// parser produce the error.
+fn exceeds_nesting_depth(xml: &str, limit: usize) -> bool {
+    let b = xml.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    let mut depth: usize = 0;
+    while i < n {
+        if b[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        if b[i..].starts_with(b"<!--") {
+            match find_from(b, i + 4, b"-->") {
+                Some(p) => i = p + 3,
+                None => return false,
+            }
+        } else if b[i..].starts_with(b"<![CDATA[") {
+            match find_from(b, i + 9, b"]]>") {
+                Some(p) => i = p + 3,
+                None => return false,
+            }
+        } else if i + 1 < n && (b[i + 1] == b'?' || b[i + 1] == b'!') {
+            // PI or declaration — not element nesting; skip to '>'.
+            match memchr_from(b, i + 2, b'>') {
+                Some(p) => i = p + 1,
+                None => return false,
+            }
+        } else if i + 1 < n && b[i + 1] == b'/' {
+            depth = depth.saturating_sub(1);
+            match memchr_from(b, i + 2, b'>') {
+                Some(p) => i = p + 1,
+                None => return false,
+            }
+        } else {
+            // Opening tag: scan to the unquoted '>', tracking self-closing.
+            let mut j = i + 1;
+            let mut quote = 0u8;
+            let mut prev = 0u8;
+            let mut end = None;
+            while j < n {
+                let c = b[j];
+                if quote != 0 {
+                    if c == quote {
+                        quote = 0;
+                    }
+                } else if c == b'"' || c == b'\'' {
+                    quote = c;
+                } else if c == b'>' {
+                    end = Some(j);
+                    break;
+                }
+                prev = c;
+                j += 1;
+            }
+            match end {
+                Some(e) => {
+                    if prev != b'/' {
+                        depth += 1;
+                        if depth > limit {
+                            return true;
+                        }
+                    }
+                    i = e + 1;
+                }
+                None => return false,
+            }
+        }
+    }
+    false
+}
+
+/// Collect every `<file>` node under the `<toc>`, joining `parent/name` into
+/// full paths, into a flat `entries` list plus the parallel `items` (one slot
+/// per entry; `None` for entries with no heap body).
+///
+/// Iterative DFS (explicit stack of `(node, parent path)`) so a crafted
+/// deeply-nested TOC cannot overflow the stack. Children are pushed reversed so
+/// siblings emerge in document order (pre-order).
 fn collect(
-    node: roxmltree::Node,
-    parent: &Path,
+    toc: roxmltree::Node,
     entries: &mut Vec<Entry>,
     items: &mut Vec<Option<HeapItem>>,
 ) -> Result<()> {
-    for file in node
+    let mut stack: Vec<(roxmltree::Node, PathBuf)> = Vec::new();
+    let seed: Vec<roxmltree::Node> = toc
         .children()
         .filter(|c| c.is_element() && c.has_tag_name("file"))
-    {
+        .collect();
+    for f in seed.into_iter().rev() {
+        stack.push((f, PathBuf::new()));
+    }
+
+    while let Some((file, parent)) = stack.pop() {
         let name = match child_text(file, "name") {
             Some(n) => n,
             // A `<file>` without a `<name>` is malformed; skip it.
             None => continue,
         };
+        // Reject names that cannot map to a safe relative path. Extraction is
+        // already guarded by `safe_join`, but skipping these keeps the listing
+        // metadata honest (no `../` or absolute paths shown). Descendants of a
+        // rejected directory are skipped with it.
+        let np = Path::new(&name);
+        if np.is_absolute()
+            || np
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
         let path = parent.join(&name);
         let kind_str = child_text(file, "type").unwrap_or_else(|| "file".to_string());
         let mode = child_text(file, "mode").and_then(|s| u32::from_str_radix(s.trim(), 8).ok());
@@ -180,9 +309,14 @@ fn collect(
         });
         items.push(item);
 
-        // Recurse into directory contents (only directories carry `<file>`
-        // children; recursing other nodes is harmless).
-        collect(file, &path, entries, items)?;
+        // Queue this node's `<file>` children (reversed → document order).
+        let kids: Vec<roxmltree::Node> = file
+            .children()
+            .filter(|c| c.is_element() && c.has_tag_name("file"))
+            .collect();
+        for c in kids.into_iter().rev() {
+            stack.push((c, path.clone()));
+        }
     }
     Ok(())
 }
@@ -251,8 +385,14 @@ impl FormatHandler for XarHandler {
         // Inflate the zlib TOC, then parse the XML.
         let mut xml = String::new();
         ZlibDecoder::new(&toc_compressed[..])
+            .take(MAX_TOC_UNCOMPRESSED)
             .read_to_string(&mut xml)
             .map_err(|e| Error::Corrupt(format!("xar: TOC inflate: {e}")))?;
+        // Guard before parsing: roxmltree recurses per nesting level and would
+        // overflow the stack (uncatchable abort) on a deeply-nested TOC.
+        if exceeds_nesting_depth(&xml, MAX_TOC_DEPTH) {
+            return Err(Error::Corrupt("xar: TOC nesting too deep".into()));
+        }
         let doc = roxmltree::Document::parse(&xml)
             .map_err(|e| Error::Corrupt(format!("xar: TOC XML: {e}")))?;
         let toc = doc
@@ -262,7 +402,7 @@ impl FormatHandler for XarHandler {
 
         let mut entries: Vec<Entry> = Vec::new();
         let mut items: Vec<Option<HeapItem>> = Vec::new();
-        collect(toc, Path::new(""), &mut entries, &mut items)?;
+        collect(toc, &mut entries, &mut items)?;
 
         Ok(Box::new(XarReaderInner {
             inner,
@@ -306,8 +446,14 @@ impl ArchiveReader for XarReaderInner {
             return Ok(());
         };
 
+        // `item.offset` is attacker-controlled; guard the sum against overflow
+        // (a debug-build panic / release-build wrong seek).
+        let abs_offset = self
+            .heap_offset
+            .checked_add(item.offset)
+            .ok_or_else(|| Error::Corrupt("xar: heap offset overflow".into()))?;
         self.inner
-            .seek(SeekFrom::Start(self.heap_offset + item.offset))
+            .seek(SeekFrom::Start(abs_offset))
             .map_err(io_err_to_corrupt)?;
         let limited = (&mut self.inner).take(item.length);
         match item.codec {
@@ -420,5 +566,116 @@ mod tests {
 
         let result = XarHandler.open(src, &OpenOptions::default());
         assert!(matches!(result, Err(Error::Corrupt(_))));
+    }
+
+    // ── Crafted-input safety regressions ──────────────────────────────────────
+
+    /// Build a XAR (header + zlib-compressed TOC, empty heap) from a TOC XML.
+    fn build_xar(toc_xml: &str) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write as _;
+
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(toc_xml.as_bytes()).unwrap();
+        let toc_comp = enc.finish().unwrap();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"xar!");
+        buf.extend_from_slice(&28u16.to_be_bytes()); // header_len
+        buf.extend_from_slice(&1u16.to_be_bytes()); // version
+        buf.extend_from_slice(&(toc_comp.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&(toc_xml.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes()); // checksum = sha1
+        buf.extend_from_slice(&toc_comp);
+        buf
+    }
+
+    fn open_bytes(buf: Vec<u8>) -> Result<Box<dyn ArchiveReader>> {
+        use crate::archive::Source;
+        use std::io::Cursor;
+        XarHandler.open(
+            Source::Seekable {
+                inner: Box::new(Cursor::new(buf)),
+                path: None,
+            },
+            &OpenOptions::default(),
+        )
+    }
+
+    /// A deeply-nested TOC is rejected as `Corrupt` by the depth guard *before*
+    /// roxmltree parses it — so a crafted file cannot overflow the stack.
+    #[test]
+    fn deeply_nested_toc_is_rejected_before_parse() {
+        let levels = 200; // > MAX_TOC_DEPTH (64)
+        let mut xml = String::from("<xar><toc>");
+        for _ in 0..levels {
+            xml.push_str("<file><name>d</name><type>directory</type>");
+        }
+        for _ in 0..levels {
+            xml.push_str("</file>");
+        }
+        xml.push_str("</toc></xar>");
+        assert!(matches!(
+            open_bytes(build_xar(&xml)),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn nesting_depth_scanner_basics() {
+        assert!(!exceeds_nesting_depth("<a><b><c/></b></a>", 64));
+        assert!(exceeds_nesting_depth("<a><b><c></c></b></a>", 2));
+        assert!(!exceeds_nesting_depth("<a><b><c></c></b></a>", 3));
+        // Self-closing tags do not add depth.
+        assert!(!exceeds_nesting_depth("<a><b/><b/><b/></a>", 2));
+    }
+
+    #[test]
+    fn nesting_depth_scanner_resists_evasion() {
+        // `<a>` is depth 1; the `<x><y><z>` hidden in a comment must NOT count,
+        // so a limit of 3 is not exceeded (a broken scanner would reach 4).
+        assert!(!exceeds_nesting_depth("<a><!-- <x><y><z> --></a>", 3));
+        // Same, hidden inside CDATA.
+        assert!(!exceeds_nesting_depth("<a><![CDATA[<x><y><z>]]></a>", 3));
+        // A '>' inside a quoted attribute must not end the tag early (which
+        // would desync the depth count).
+        assert!(exceeds_nesting_depth(
+            "<a attr=\"b>c\"><d><e></e></d></a>",
+            2
+        ));
+        assert!(!exceeds_nesting_depth(
+            "<a attr=\"b>c\"><d><e></e></d></a>",
+            3
+        ));
+    }
+
+    /// A `<data>` offset that overflows `heap_offset + offset` must yield
+    /// `Corrupt` on read, never a panic or a wrong seek.
+    #[test]
+    fn heap_offset_overflow_is_corrupt_not_panic() {
+        let xml = format!(
+            "<xar><toc><file id=\"1\"><name>f</name><type>file</type>\
+             <data><offset>{}</offset><length>1</length><size>1</size>\
+             <encoding style=\"application/octet-stream\"/></data></file></toc></xar>",
+            u64::MAX
+        );
+        let mut ar = open_bytes(build_xar(&xml)).expect("open should succeed");
+        let mut out = Vec::new();
+        assert!(matches!(ar.read_entry(0, &mut out), Err(Error::Corrupt(_))));
+    }
+
+    /// Names with `..` or absolute paths are skipped from the listing.
+    #[test]
+    fn traversal_names_are_skipped() {
+        let xml = "<xar><toc>\
+            <file id=\"1\"><name>../evil</name><type>file</type></file>\
+            <file id=\"2\"><name>/etc/passwd</name><type>file</type></file>\
+            <file id=\"3\"><name>ok.txt</name><type>file</type></file>\
+            </toc></xar>";
+        let mut ar = open_bytes(build_xar(xml)).expect("open should succeed");
+        let entries = ar.entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path.to_str(), Some("ok.txt"));
     }
 }
