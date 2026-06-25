@@ -279,11 +279,7 @@ impl ArchiveReader for WarcReader_ {
             return Err(Error::InvalidIndex(idx));
         }
         let (offset, size) = self.offsets[idx];
-        let mut file = std::fs::File::open(&self._data)?;
-        file.seek(SeekFrom::Start(offset))?;
-        let mut limited = file.take(size);
-        std::io::copy(&mut limited, out)?;
-        Ok(())
+        crate::detect::read_temp_slice(&self._data, offset, size, out)
     }
 }
 

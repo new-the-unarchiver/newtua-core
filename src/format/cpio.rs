@@ -235,11 +235,7 @@ impl ArchiveReader for CpioReader {
             // Directory or symlink — no body to read.
             return Ok(());
         };
-        let mut file = std::fs::File::open(&self._temp)?;
-        file.seek(SeekFrom::Start(offset))?;
-        let mut limited = file.take(size);
-        std::io::copy(&mut limited, out)?;
-        Ok(())
+        crate::detect::read_temp_slice(&self._temp, offset, size, out)
     }
 }
 

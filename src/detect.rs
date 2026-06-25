@@ -130,6 +130,22 @@ impl ArchiveReader for TempBackedReader {
     }
 }
 
+/// Stream `size` bytes starting at `offset` from the temp file at `path` into
+/// `out`. Shared by handlers (cpio, warc) that concatenate entry bodies into one
+/// temp file and read them back via an `(offset, size)` table.
+pub(crate) fn read_temp_slice(
+    path: &Path,
+    offset: u64,
+    size: u64,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut limited = file.take(size);
+    std::io::copy(&mut limited, out)?;
+    Ok(())
+}
+
 // ── SingleFileReader ──────────────────────────────────────────────────────────
 
 /// Reader that presents a single decompressed file as a one-entry archive.
