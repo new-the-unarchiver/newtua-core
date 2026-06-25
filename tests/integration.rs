@@ -27,6 +27,8 @@ mod detect;
 mod extract;
 #[path = "integration/iso_handler.rs"]
 mod iso_handler;
+#[path = "integration/lz4.rs"]
+mod lz4;
 #[path = "integration/lzc.rs"]
 mod lzc;
 #[path = "integration/macos_skip.rs"]
