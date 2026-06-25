@@ -8,6 +8,7 @@ pub enum Compressor {
     Zstd,
     Lzma,
     Lzc,
+    Lz4,
 }
 
 pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<Box<dyn Read>> {
@@ -21,6 +22,7 @@ pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<B
             Ok(Box::new(xz2::read::XzDecoder::new_stream(inner, stream)))
         }
         Compressor::Lzc => Ok(Box::new(lzw_z::Decoder::new(inner))),
+        Compressor::Lz4 => Ok(Box::new(lz4_flex::frame::FrameDecoder::new(inner))),
     }
 }
 
@@ -103,6 +105,30 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn lz4_roundtrip() {
+        use lz4_flex::frame::FrameEncoder;
+        let payload = b"hello lz4 payload";
+        let mut enc = FrameEncoder::new(Vec::new());
+        enc.write_all(payload).unwrap();
+        let compressed = enc.finish().unwrap();
+        let mut r =
+            decompressor(Compressor::Lz4, Box::new(std::io::Cursor::new(compressed))).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn corrupt_lz4_errors_on_read() {
+        // Valid LZ4 frame magic followed by garbage — must error during read.
+        let mut bytes = vec![0x04, 0x22, 0x4D, 0x18];
+        bytes.extend_from_slice(&[0xFF; 32]);
+        let mut r = decompressor(Compressor::Lz4, Box::new(std::io::Cursor::new(bytes))).unwrap();
+        let mut out = Vec::new();
+        assert!(r.read_to_end(&mut out).is_err());
     }
 }
 

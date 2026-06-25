@@ -17,6 +17,7 @@ cab.workspace = true
 xz2.workspace = true
 zip.workspace = true
 zstd.workspace = true
+lz4_flex.workspace = true
 tar.workspace = true
 time.workspace = true
 sevenz-rust2.workspace = true
