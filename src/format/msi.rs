@@ -154,7 +154,9 @@ impl FormatHandler for MsiHandler {
                     e.path_raw = real.to_string_lossy().into_owned().into_bytes();
                 } else if needs_prefix {
                     // Fallback: keep the CAB member name, prefixed with the stream
-                    // name so files from different cabs stay unique.
+                    // name so files from different cabs stay unique. `path_raw` is
+                    // built from its own pre-mutation bytes — do not reorder these
+                    // two lines or derive one field from the other.
                     e.path = PathBuf::from(stream_name).join(&e.path);
                     e.path_raw = [stream_name.as_bytes(), b"/", &e.path_raw].concat();
                 }
@@ -271,6 +273,11 @@ fn resolve_dir_path(
 /// Directory tables. Returns `None` when any of the three tables is absent, in
 /// which case the caller keeps model-B member names. Read failures on individual
 /// tables degrade to an empty contribution rather than aborting the open.
+///
+/// The resolved paths are NOT sanitized here: a crafted `DefaultDir`/`FileName`
+/// can carry `..` or absolute components. That is safe only because every
+/// on-disk write still flows through `path_safety::safe_join` downstream — never
+/// make this map the sole path to disk.
 fn build_file_paths(package: &mut msi::Package<std::fs::File>) -> Option<HashMap<String, PathBuf>> {
     if !(package.has_table("File")
         && package.has_table("Component")
