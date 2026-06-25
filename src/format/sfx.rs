@@ -99,10 +99,7 @@ impl FormatHandler for SfxHandler {
 
         // TempBackedReader keeps temp alive and delegates format() to the inner
         // reader, so the caller sees Zip / SevenZ / Rar / Cab — not Sfx.
-        Ok(Box::new(TempBackedReader {
-            inner,
-            _temp: temp_path,
-        }))
+        Ok(Box::new(TempBackedReader::new(inner, temp_path)))
     }
 }
 

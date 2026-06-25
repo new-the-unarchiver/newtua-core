@@ -1,9 +1,6 @@
-use std::io::Write;
-
-use crate::archive::{
-    ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
-};
+use crate::archive::{ArchiveReader, Confidence, FormatHandler, FormatId, OpenOptions, Source};
 use crate::decompress::{Compressor, decompressor};
+use crate::detect::TempBackedReader;
 use crate::error::{Error, Result};
 use crate::format::CpioHandler;
 
@@ -82,12 +79,14 @@ impl FormatHandler for RpmHandler {
         std::io::copy(&mut cpio_bytes, &mut temp_cpio)?;
         let cpio_temp = temp_cpio.into_temp_path();
 
-        // 5. Open the cpio payload with CpioHandler; wrap to report Rpm format.
+        // 5. Open the cpio payload with CpioHandler; keep the temp file alive and
+        //    report `Rpm` (not the inner cpio) as the format.
         let inner = CpioHandler.open(Source::path(&cpio_temp)?, opts)?;
-        Ok(Box::new(RpmReader {
+        Ok(Box::new(TempBackedReader::with_format(
             inner,
-            _temp: cpio_temp,
-        }))
+            cpio_temp,
+            FormatId::Rpm,
+        )))
     }
 }
 
@@ -109,34 +108,6 @@ pub(crate) fn map_payload_compressor(s: &str) -> Result<Option<Compressor>> {
             format: "rpm".into(),
             feature: format!("payload compressor {other}"),
         }),
-    }
-}
-
-// ── Reader ────────────────────────────────────────────────────────────────────
-
-/// Delegates all `ArchiveReader` calls to the inner cpio reader while keeping
-/// the decompressed payload temp file alive. Reports `FormatId::Rpm`.
-struct RpmReader {
-    inner: Box<dyn ArchiveReader>,
-    /// Decompressed cpio temp file; deleted on drop.
-    _temp: tempfile::TempPath,
-}
-
-impl ArchiveReader for RpmReader {
-    fn format(&self) -> FormatId {
-        FormatId::Rpm
-    }
-
-    fn entries(&mut self) -> Result<&[Entry]> {
-        self.inner.entries()
-    }
-
-    fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
-        self.inner.read_entry(idx, out)
-    }
-
-    fn verify_password(&mut self) -> Result<()> {
-        self.inner.verify_password()
     }
 }
 

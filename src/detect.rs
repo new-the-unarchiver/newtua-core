@@ -74,17 +74,47 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
 /// Generic wrapper that delegates all [`ArchiveReader`] calls to an inner reader
 /// while keeping a temp file alive (and auto-deleted on drop).
 ///
-/// Used both for multi-volume reconstruction and for the decompressed temp file
-/// backing a tar-inside-compressed-file.
+/// Used for multi-volume reconstruction, the decompressed temp file backing a
+/// tar-inside-compressed-file, SFX carving, and the format-specific readers
+/// (deb/rpm) that decompress a payload to a temp file. By default `format()`
+/// delegates to the inner reader; pass a `format_override` to report a wrapper
+/// format (e.g. `Deb`/`Rpm`) instead of the inner payload format.
 pub(crate) struct TempBackedReader {
-    pub(crate) inner: Box<dyn ArchiveReader>,
+    inner: Box<dyn ArchiveReader>,
     /// Keeps the temp file alive (deleted on drop).
-    pub(crate) _temp: tempfile::TempPath,
+    _temp: tempfile::TempPath,
+    /// When set, `format()` reports this instead of the inner reader's format.
+    format_override: Option<FormatId>,
+}
+
+impl TempBackedReader {
+    /// Wrap `inner`, keeping `temp` alive; `format()` delegates to `inner`.
+    pub(crate) fn new(inner: Box<dyn ArchiveReader>, temp: tempfile::TempPath) -> Self {
+        Self {
+            inner,
+            _temp: temp,
+            format_override: None,
+        }
+    }
+
+    /// Like [`new`](Self::new) but `format()` reports `format` (e.g. the
+    /// container format whose payload was decompressed to `temp`).
+    pub(crate) fn with_format(
+        inner: Box<dyn ArchiveReader>,
+        temp: tempfile::TempPath,
+        format: FormatId,
+    ) -> Self {
+        Self {
+            inner,
+            _temp: temp,
+            format_override: Some(format),
+        }
+    }
 }
 
 impl ArchiveReader for TempBackedReader {
     fn format(&self) -> FormatId {
-        self.inner.format()
+        self.format_override.unwrap_or_else(|| self.inner.format())
     }
 
     fn entries(&mut self) -> Result<&[Entry]> {
@@ -266,10 +296,7 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
             let temp_path = tmp.into_temp_path();
             let tar_src = Source::path(&temp_path)?;
             let inner = TarHandler.open(tar_src, opts)?;
-            return Ok(Box::new(TempBackedReader {
-                inner,
-                _temp: temp_path,
-            }));
+            return Ok(Box::new(TempBackedReader::new(inner, temp_path)));
         } else {
             // Plain compressed file — present as one entry.
             // For gzip only: read the original-file mtime from the header (bytes 4..8).
@@ -339,10 +366,7 @@ pub fn open(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
             // but first persist into a path we can open.
             let temp_path = tmp.into_temp_path();
             let inner = open_single(&temp_path, opts)?;
-            return Ok(Box::new(TempBackedReader {
-                inner,
-                _temp: temp_path,
-            }));
+            return Ok(Box::new(TempBackedReader::new(inner, temp_path)));
         }
         // Exactly 1 member (the .001 file itself, no siblings) — open normally.
     }

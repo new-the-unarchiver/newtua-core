@@ -1,10 +1,10 @@
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek};
 
 use crate::archive::{
-    ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, ReadSeek, Source,
+    ArchiveReader, Confidence, FormatHandler, FormatId, OpenOptions, ReadSeek, Source,
 };
 use crate::decompress::{Compressor, decompressor};
-use crate::detect::{detect_compressor, is_tar};
+use crate::detect::{TempBackedReader, detect_compressor, is_tar};
 use crate::error::{Error, Result, io_err_to_corrupt};
 use crate::format::TarHandler;
 
@@ -92,37 +92,14 @@ impl FormatHandler for DebHandler {
             }
         };
 
-        // 5. Open the payload as tar; keep the temp file alive past the reader.
+        // 5. Open the payload as tar; keep the temp file alive past the reader
+        //    and report `Deb` (not the inner tar) as the format.
         let inner = TarHandler.open(Source::path(&tar_temp)?, opts)?;
-        Ok(Box::new(DebReader {
+        Ok(Box::new(TempBackedReader::with_format(
             inner,
-            _temp: tar_temp,
-        }))
-    }
-}
-
-/// Reader for a .deb: delegates to the inner tar reader while keeping the
-/// decompressed/payload temp file alive (deleted on drop). Reports `Deb`.
-struct DebReader {
-    inner: Box<dyn ArchiveReader>,
-    _temp: tempfile::TempPath,
-}
-
-impl ArchiveReader for DebReader {
-    fn format(&self) -> FormatId {
-        FormatId::Deb
-    }
-
-    fn entries(&mut self) -> Result<&[Entry]> {
-        self.inner.entries()
-    }
-
-    fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
-        self.inner.read_entry(idx, out)
-    }
-
-    fn verify_password(&mut self) -> Result<()> {
-        self.inner.verify_password()
+            tar_temp,
+            FormatId::Deb,
+        )))
     }
 }
 
