@@ -35,6 +35,8 @@ cdfs = "0.2.3"
 goblin.workspace = true
 warc.workspace = true
 lzw-z = { path = "../lzw-z" }
+# ZIP method-14 (LZMA) decode — see format/zip.rs::decode_zip_lzma.
+lzma-rs.workspace = true
 
 [features]
 default = []

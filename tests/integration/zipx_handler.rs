@@ -38,36 +38,24 @@ fn assert_extracts(name: &str, expected: &[u8]) {
     assert_eq!(out, expected);
 }
 
-// ── LZMA: listing works, extraction is reported Unsupported ─────────────────
+// ── LZMA: listing + extraction both work ────────────────────────────────────
 //
-// NOTE: The zip crate 2.4.2 uses lzma_rs with UnpackedSize::ReadFromHeader,
-// but the ZIP LZMA format (APPNOTE.TXT) does not include the 8-byte size field
-// before the compressed payload — the 5-byte LZMA properties are followed
-// immediately by EOS-terminated compressed data.  This mismatch causes lzma_rs
-// to misinterpret the first bytes of compressed data as the size, producing
-// "LZ distance beyond output size" errors.  The `lzma` feature is enabled (so
-// listing works), but `read_entry` returns Error::Unsupported for LZMA members
-// rather than leaking that misleading IO error — until the zip crate fixes its
-// ZIP-LZMA decoder (or we upgrade to a version that does).
+// ZIP-LZMA (APPNOTE 5.8.8) prepends a 4-byte wrapper — [SDK version: 2 bytes]
+// [LZMA properties size: 2 bytes LE] — to the 5 LZMA property bytes, and omits
+// the 8-byte uncompressed-size field, ending the stream with an EOS marker.
+// The zip crate 2.4.2 mis-decodes this (it assumes UnpackedSize::ReadFromHeader
+// and reads the next 8 bytes as a size). Our handler strips the wrapper and
+// decodes via lzma_rs with the size taken from the central directory — see
+// format/zip.rs::decode_zip_lzma.
 
 #[test]
 fn lzma_zipx_lists_entries() {
-    // Listing must succeed even when extraction is unsupported.
     assert_lists_single_zip_entry("lzma.zipx");
 }
 
 #[test]
-fn lzma_zipx_read_entry_is_unsupported_not_io() {
-    // The broken ZIP-LZMA decoder must surface as Unsupported, not a cryptic IO
-    // error, mirroring how PPMd is reported.
-    let mut ar = open(&fixture("lzma.zipx"), &OpenOptions::default()).unwrap();
-    ar.entries().unwrap();
-    let mut out = Vec::new();
-    let err = ar.read_entry(0, &mut out).unwrap_err();
-    assert!(
-        matches!(err, newtua_core::Error::Unsupported { .. }),
-        "expected Unsupported, got {err:?}"
-    );
+fn lzma_zipx_extracts_correct_bytes() {
+    assert_extracts("lzma.zipx", &"lzma zipx payload\n".repeat(200).into_bytes());
 }
 
 // ── BZip2 happy path ──────────────────────────────────────────────────────────

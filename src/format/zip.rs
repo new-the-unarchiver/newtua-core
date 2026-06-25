@@ -171,6 +171,48 @@ fn map_zip_err(e: zip::result::ZipError) -> Error {
     }
 }
 
+/// Upper bound on the LZMA dictionary `lzma_rs` may allocate while decoding a
+/// ZIP member, guarding against a crafted `dict_size` in the properties byte.
+/// Real ZIP-LZMA rarely exceeds a 64 MiB dictionary.
+const MAX_LZMA_DICT: usize = 256 << 20; // 256 MiB
+
+/// Decompress a ZIP method-14 (LZMA) member.
+///
+/// ZIP-LZMA (APPNOTE 5.8.8) prepends a 4-byte wrapper to the LZMA data —
+/// `[SDK version major/minor: 2 bytes][properties size: 2 bytes LE]` — followed
+/// by `properties size` bytes of LZMA properties and then the LZMA1 stream. It
+/// omits the 8-byte uncompressed-size field that `.lzma` files carry and ends
+/// the stream with an EOS marker. We strip the wrapper, then hand the 5 property
+/// bytes + stream to `lzma_rs` with the uncompressed `size` taken from the
+/// central directory (`UseProvided`) — exactly the field the format lacks.
+/// `zip` 2.x instead assumes `ReadFromHeader` and mis-decodes the stream.
+fn decode_zip_lzma<R: Read>(raw: R, size: u64, mut out: &mut dyn Write) -> Result<()> {
+    use lzma_rs::decompress::{Options, UnpackedSize};
+
+    let mut reader = std::io::BufReader::new(raw);
+    // 4-byte ZIP-LZMA wrapper: 2 bytes SDK version, 2 bytes (LE) properties len.
+    let mut head = [0u8; 4];
+    reader
+        .read_exact(&mut head)
+        .map_err(|e| Error::Corrupt(format!("zip-lzma header: {e}")))?;
+    let prop_len = u16::from_le_bytes([head[2], head[3]]);
+    if prop_len != 5 {
+        // lzma_rs consumes a fixed 5-byte property header; any other size is not
+        // a standard ZIP-LZMA member.
+        return Err(Error::Unsupported {
+            format: "zip".into(),
+            feature: "LZMA (zip) with non-standard property size".into(),
+        });
+    }
+    let opts = Options {
+        unpacked_size: UnpackedSize::UseProvided(Some(size)),
+        memlimit: Some(MAX_LZMA_DICT),
+        allow_incomplete: false,
+    };
+    lzma_rs::lzma_decompress_with_options(&mut reader, &mut out, &opts)
+        .map_err(|e| Error::Corrupt(format!("zip-lzma decode: {e}")))
+}
+
 struct ZipReader {
     zip: ZipArc,
     entries: Vec<Entry>,
@@ -208,18 +250,24 @@ impl ArchiveReader for ZipReader {
             .ok_or(Error::InvalidIndex(idx))?
             .is_encrypted;
 
-        // zip 2.x's LZMA decoder cannot read the EOS-terminated streams that real
-        // zip-LZMA producers (7-Zip, Python) emit — it expects an 8-byte
-        // uncompressed-size field the ZIP-LZMA format omits — so extraction fails
-        // with a misleading IO error. Surface it as Unsupported until the crate
-        // handles ZIP-LZMA (listing already works). PPMd reaches the same outcome
-        // via map_zip_err's UnsupportedArchive arm. The method was captured at
+        // zip 2.x's own LZMA decoder cannot read the EOS-terminated streams that
+        // real ZIP-LZMA producers (7-Zip, Python) emit — it assumes an 8-byte
+        // uncompressed-size field the format omits. We decode the member
+        // ourselves instead (see decode_zip_lzma). The method was captured at
         // open() time, so no second local-header read is needed here.
         if self.is_lzma[idx] {
-            return Err(Error::Unsupported {
-                format: "zip".into(),
-                feature: "LZMA (zip)".into(),
-            });
+            if is_encrypted {
+                // Encrypted LZMA: by_index_raw yields still-encrypted bytes and
+                // the decryptor lives inside the zip crate's (broken) LZMA path,
+                // out of our reach. Rare combination; report it honestly.
+                return Err(Error::Unsupported {
+                    format: "zip".into(),
+                    feature: "encrypted LZMA (zip)".into(),
+                });
+            }
+            let size = self.entries[idx].size;
+            let raw = self.zip.by_index_raw(idx).map_err(map_zip_err)?;
+            return decode_zip_lzma(raw, size, out);
         }
 
         if is_encrypted {
@@ -265,5 +313,36 @@ mod tests {
     #[test]
     fn zip_handler_id_is_zip() {
         assert_eq!(ZipHandler.id(), FormatId::Zip);
+    }
+
+    // ── decode_zip_lzma robustness on crafted input ─────────────────────────
+
+    #[test]
+    fn zip_lzma_truncated_header_is_corrupt() {
+        // Fewer than 4 bytes: the ZIP-LZMA wrapper can't be read.
+        let mut out = Vec::new();
+        let err = decode_zip_lzma(&b"\x00\x00"[..], 10, &mut out).unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn zip_lzma_nonstandard_property_size_is_unsupported() {
+        // properties size != 5 is not a standard ZIP-LZMA member.
+        let mut out = Vec::new();
+        let input = [0x00, 0x00, 0x09, 0x00]; // version 0.0, prop_len = 9
+        let err = decode_zip_lzma(&input[..], 10, &mut out).unwrap_err();
+        assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn zip_lzma_garbage_stream_is_corrupt_not_panic() {
+        // Valid 4-byte wrapper + 5 plausible property bytes (1 MiB dict) but a
+        // bogus LZMA1 stream: must error as Corrupt, never panic or hang.
+        let mut input = vec![0x00, 0x00, 0x05, 0x00]; // version 0.0, prop_len = 5
+        input.extend_from_slice(&[0x5d, 0x00, 0x00, 0x10, 0x00]); // lc3lp0pb2, dict 1 MiB
+        input.extend_from_slice(&[0xff; 16]); // garbage range-coder data
+        let mut out = Vec::new();
+        let err = decode_zip_lzma(&input[..], 64, &mut out).unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
     }
 }
