@@ -331,3 +331,353 @@ fn msi_multi_cab_read_entry_routes_correctly() {
     reader.read_entry(1, &mut out1).expect("read_entry(1)");
     assert_eq!(out1, b"BBB", "entry 1 (media2/b.txt) must contain BBB");
 }
+
+// ── Resolution fixtures (File/Component/Directory tables) ────────────────────────
+
+/// Build an uncompressed CAB containing several files (name → content).
+fn make_cab_bytes_multi(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let buf = Cursor::new(Vec::<u8>::new());
+    let mut builder = cab::CabinetBuilder::new();
+    {
+        let folder = builder.add_folder(cab::CompressionType::None);
+        for (name, _) in files {
+            folder.add_file(*name);
+        }
+    }
+    let mut cw = builder.build(buf).unwrap();
+    for (_, content) in files {
+        if let Some(mut fw) = cw.next_file().unwrap() {
+            fw.write_all(content).unwrap();
+        }
+    }
+    cw.finish().unwrap().into_inner()
+}
+
+struct DirRow<'a> {
+    key: &'a str,
+    parent: Option<&'a str>,
+    default_dir: &'a str,
+}
+struct FileRow<'a> {
+    file_key: &'a str,
+    component: &'a str,
+    file_name: &'a str,
+    content: &'a [u8],
+}
+
+/// Create an MSI with one embedded CAB (stream "cab") plus Directory, Component,
+/// and File tables. Each File's CAB member name IS its `File` key.
+fn make_resolved_msi(
+    dirs: &[DirRow<'_>],
+    components: &[(&str, &str)], // (Component, Directory_)
+    files: &[FileRow<'_>],
+) -> tempfile::NamedTempFile {
+    let tmp = tempfile::Builder::new().suffix(".msi").tempfile().unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tmp.path())
+        .unwrap();
+    let mut package = msi::Package::create(msi::PackageType::Installer, file).unwrap();
+
+    // Media + the single embedded CAB stream.
+    package.create_table("Media", media_columns()).unwrap();
+    package
+        .insert_rows(msi::Insert::into("Media").row(vec![
+            msi::Value::from(1i16),
+            msi::Value::from(files.len() as i16),
+            msi::Value::Null,
+            msi::Value::from("#cab"),
+            msi::Value::Null,
+            msi::Value::Null,
+        ]))
+        .unwrap();
+
+    // Directory table.
+    package
+        .create_table(
+            "Directory",
+            vec![
+                msi::Column::build("Directory").primary_key().id_string(72),
+                msi::Column::build("Directory_Parent")
+                    .nullable()
+                    .id_string(72),
+                msi::Column::build("DefaultDir").text_string(255),
+            ],
+        )
+        .unwrap();
+    for d in dirs {
+        package
+            .insert_rows(msi::Insert::into("Directory").row(vec![
+                msi::Value::from(d.key),
+                match d.parent {
+                    Some(p) => msi::Value::from(p),
+                    None => msi::Value::Null,
+                },
+                msi::Value::from(d.default_dir),
+            ]))
+            .unwrap();
+    }
+
+    // Component table.
+    package
+        .create_table(
+            "Component",
+            vec![
+                msi::Column::build("Component").primary_key().id_string(72),
+                msi::Column::build("Directory_").id_string(72),
+            ],
+        )
+        .unwrap();
+    for (comp, dir_) in components {
+        package
+            .insert_rows(
+                msi::Insert::into("Component")
+                    .row(vec![msi::Value::from(*comp), msi::Value::from(*dir_)]),
+            )
+            .unwrap();
+    }
+
+    // File table.
+    package
+        .create_table(
+            "File",
+            vec![
+                msi::Column::build("File").primary_key().id_string(72),
+                msi::Column::build("Component_").id_string(72),
+                msi::Column::build("FileName").text_string(255),
+            ],
+        )
+        .unwrap();
+    for f in files {
+        package
+            .insert_rows(msi::Insert::into("File").row(vec![
+                msi::Value::from(f.file_key),
+                msi::Value::from(f.component),
+                msi::Value::from(f.file_name),
+            ]))
+            .unwrap();
+    }
+
+    // Embedded CAB stream: member names are the File keys.
+    let cab_files: Vec<(&str, &[u8])> = files.iter().map(|f| (f.file_key, f.content)).collect();
+    let cab_bytes = make_cab_bytes_multi(&cab_files);
+    {
+        let mut stream = package.write_stream("cab").unwrap();
+        stream.write_all(&cab_bytes).unwrap();
+    }
+
+    package.flush().unwrap();
+    tmp
+}
+
+#[test]
+fn msi_resolves_nested_install_path() {
+    let dirs = [
+        DirRow {
+            key: "TARGETDIR",
+            parent: None,
+            default_dir: "SourceDir",
+        },
+        DirRow {
+            key: "ProgramFilesFolder",
+            parent: Some("TARGETDIR"),
+            default_dir: "ProgramFilesFolder",
+        },
+        DirRow {
+            key: "MyApp",
+            parent: Some("ProgramFilesFolder"),
+            default_dir: "APP|MyApp",
+        },
+        DirRow {
+            key: "Sub",
+            parent: Some("MyApp"),
+            default_dir: "SUB|sub",
+        },
+    ];
+    let comps = [("cmp", "Sub")];
+    let files = [FileRow {
+        file_key: "fl_hello",
+        component: "cmp",
+        file_name: "HELLO~1.TXT|hello.txt",
+        content: b"hi",
+    }];
+    let msi_file = make_resolved_msi(&dirs, &comps, &files);
+
+    let mut reader = detect::open(msi_file.path(), &OpenOptions::default()).unwrap();
+    let entries = reader.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].path.to_str().unwrap(),
+        "ProgramFilesFolder/MyApp/sub/hello.txt"
+    );
+
+    let mut out = Vec::new();
+    reader.read_entry(0, &mut out).unwrap();
+    assert_eq!(out, b"hi");
+}
+
+#[test]
+fn msi_resolution_drops_dot_directory() {
+    let dirs = [
+        DirRow {
+            key: "TARGETDIR",
+            parent: None,
+            default_dir: "SourceDir",
+        },
+        DirRow {
+            key: "INSTALLDIR",
+            parent: Some("TARGETDIR"),
+            default_dir: ".",
+        },
+        DirRow {
+            key: "Bin",
+            parent: Some("INSTALLDIR"),
+            default_dir: "bin",
+        },
+    ];
+    let comps = [("cmp", "Bin")];
+    let files = [FileRow {
+        file_key: "fl_app",
+        component: "cmp",
+        file_name: "app.exe",
+        content: b"X",
+    }];
+    let msi_file = make_resolved_msi(&dirs, &comps, &files);
+
+    let mut reader = detect::open(msi_file.path(), &OpenOptions::default()).unwrap();
+    let entries = reader.entries().unwrap();
+    // INSTALLDIR has DefaultDir "." → contributes no segment.
+    assert_eq!(entries[0].path.to_str().unwrap(), "bin/app.exe");
+}
+
+#[test]
+fn msi_unknown_file_key_falls_back_to_member_name() {
+    // CAB has two members ("known", "orphan") but the File table lists only
+    // "known"; the unlisted "orphan" member keeps its CAB name. Built inline
+    // because the CAB must hold a member absent from the File table.
+    let tmp = tempfile::Builder::new().suffix(".msi").tempfile().unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tmp.path())
+        .unwrap();
+    let mut package = msi::Package::create(msi::PackageType::Installer, file).unwrap();
+    package.create_table("Media", media_columns()).unwrap();
+    package
+        .insert_rows(msi::Insert::into("Media").row(vec![
+            msi::Value::from(1i16),
+            msi::Value::from(2i16),
+            msi::Value::Null,
+            msi::Value::from("#cab"),
+            msi::Value::Null,
+            msi::Value::Null,
+        ]))
+        .unwrap();
+    package
+        .create_table(
+            "Directory",
+            vec![
+                msi::Column::build("Directory").primary_key().id_string(72),
+                msi::Column::build("Directory_Parent")
+                    .nullable()
+                    .id_string(72),
+                msi::Column::build("DefaultDir").text_string(255),
+            ],
+        )
+        .unwrap();
+    package
+        .insert_rows(msi::Insert::into("Directory").row(vec![
+            msi::Value::from("TARGETDIR"),
+            msi::Value::Null,
+            msi::Value::from("SourceDir"),
+        ]))
+        .unwrap();
+    package
+        .insert_rows(msi::Insert::into("Directory").row(vec![
+            msi::Value::from("Bin"),
+            msi::Value::from("TARGETDIR"),
+            msi::Value::from("bin"),
+        ]))
+        .unwrap();
+    package
+        .create_table(
+            "Component",
+            vec![
+                msi::Column::build("Component").primary_key().id_string(72),
+                msi::Column::build("Directory_").id_string(72),
+            ],
+        )
+        .unwrap();
+    package
+        .insert_rows(
+            msi::Insert::into("Component")
+                .row(vec![msi::Value::from("cmp"), msi::Value::from("Bin")]),
+        )
+        .unwrap();
+    package
+        .create_table(
+            "File",
+            vec![
+                msi::Column::build("File").primary_key().id_string(72),
+                msi::Column::build("Component_").id_string(72),
+                msi::Column::build("FileName").text_string(255),
+            ],
+        )
+        .unwrap();
+    package
+        .insert_rows(msi::Insert::into("File").row(vec![
+            msi::Value::from("known"),
+            msi::Value::from("cmp"),
+            msi::Value::from("known.txt"),
+        ]))
+        .unwrap();
+    let cab_bytes = make_cab_bytes_multi(&[("known", b"K"), ("orphan", b"O")]);
+    {
+        let mut s = package.write_stream("cab").unwrap();
+        s.write_all(&cab_bytes).unwrap();
+    }
+    package.flush().unwrap();
+
+    let mut reader = detect::open(tmp.path(), &OpenOptions::default()).unwrap();
+    let entries = reader.entries().unwrap();
+    let paths: Vec<&str> = entries.iter().map(|e| e.path.to_str().unwrap()).collect();
+    assert!(
+        paths.contains(&"bin/known.txt"),
+        "known file resolves; got {paths:?}"
+    );
+    assert!(
+        paths.contains(&"orphan"),
+        "orphan keeps CAB member name; got {paths:?}"
+    );
+}
+
+#[test]
+fn msi_directory_cycle_does_not_hang() {
+    // Self-referential / cyclic Directory_Parent must not panic or hang.
+    let dirs = [
+        DirRow {
+            key: "A",
+            parent: Some("B"),
+            default_dir: "A",
+        },
+        DirRow {
+            key: "B",
+            parent: Some("A"),
+            default_dir: "B",
+        },
+    ];
+    let comps = [("cmp", "A")];
+    let files = [FileRow {
+        file_key: "fl",
+        component: "cmp",
+        file_name: "f.txt",
+        content: b"Z",
+    }];
+    let msi_file = make_resolved_msi(&dirs, &comps, &files);
+
+    let mut reader = detect::open(msi_file.path(), &OpenOptions::default()).unwrap();
+    let entries = reader.entries().unwrap();
+    // Resolution terminates and yields a path ending in the file name.
+    assert!(entries[0].path.to_str().unwrap().ends_with("f.txt"));
+}

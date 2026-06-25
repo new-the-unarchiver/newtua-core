@@ -10,6 +10,7 @@
 //! we return `Confidence::NONE` so that Office CFB files (`.doc`, `.xls`, …)
 //! are not hijacked.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -114,7 +115,12 @@ impl FormatHandler for MsiHandler {
         // routing[outer_idx] = (cab_reader_idx, inner_idx)
         let mut routing: Vec<(usize, usize)> = Vec::new();
 
-        let needs_prefix = cab_stream_names.len() > 1;
+        // Resolve File/Component/Directory tables to real install paths. `None`
+        // means the package lacks one of those tables → keep model-B behavior.
+        let resolution = build_file_paths(&mut package);
+        // The stream-name prefix is only a fallback uniqueness device; with
+        // resolution active, resolved paths are already globally unique.
+        let needs_prefix = resolution.is_none() && cab_stream_names.len() > 1;
 
         for (cab_idx, stream_name) in cab_stream_names.iter().enumerate() {
             // Read the CFB stream into a temp file.
@@ -138,9 +144,17 @@ impl FormatHandler for MsiHandler {
 
             for (inner_idx, entry) in cab_entries.iter().enumerate() {
                 let mut e = entry.clone();
-                if needs_prefix {
-                    // Prefix path with the stream name to keep names unique
-                    // across multiple embedded cabs.
+                // The CAB member name is the MSI `File` key. Resolve it to a real
+                // install path when the resolution map has it.
+                let resolved = resolution
+                    .as_ref()
+                    .and_then(|m| m.get(entry.path.to_string_lossy().as_ref()));
+                if let Some(real) = resolved {
+                    e.path = real.clone();
+                    e.path_raw = real.to_string_lossy().into_owned().into_bytes();
+                } else if needs_prefix {
+                    // Fallback: keep the CAB member name, prefixed with the stream
+                    // name so files from different cabs stay unique.
                     e.path = PathBuf::from(stream_name).join(&e.path);
                     e.path_raw = [stream_name.as_bytes(), b"/", &e.path_raw].concat();
                 }
@@ -253,6 +267,83 @@ fn resolve_dir_path(
     segments.into_iter().collect()
 }
 
+/// Builds a `File`-key → resolved-path map by joining the File, Component, and
+/// Directory tables. Returns `None` when any of the three tables is absent, in
+/// which case the caller keeps model-B member names. Read failures on individual
+/// tables degrade to an empty contribution rather than aborting the open.
+fn build_file_paths(package: &mut msi::Package<std::fs::File>) -> Option<HashMap<String, PathBuf>> {
+    if !(package.has_table("File")
+        && package.has_table("Component")
+        && package.has_table("Directory"))
+    {
+        return None;
+    }
+
+    // Directory: key -> (parent, long name).
+    let mut dir_map: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    if let Ok(rows) = package.select_rows(msi::Select::table("Directory").columns(&[
+        "Directory",
+        "Directory_Parent",
+        "DefaultDir",
+    ])) {
+        for row in rows {
+            let Some(key) = row["Directory"].as_str() else {
+                continue;
+            };
+            let parent = row["Directory_Parent"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let name = row["DefaultDir"].as_str().and_then(parse_defaultdir_name);
+            dir_map.insert(key.to_owned(), (parent, name));
+        }
+    }
+
+    // Component: component -> directory key.
+    let mut comp_map: HashMap<String, String> = HashMap::new();
+    if let Ok(rows) =
+        package.select_rows(msi::Select::table("Component").columns(&["Component", "Directory_"]))
+    {
+        for row in rows {
+            let (Some(comp), Some(dir_)) = (row["Component"].as_str(), row["Directory_"].as_str())
+            else {
+                continue;
+            };
+            comp_map.insert(comp.to_owned(), dir_.to_owned());
+        }
+    }
+
+    // File: file key -> resolved path. Cache resolved directory paths.
+    let mut dir_path_cache: HashMap<String, PathBuf> = HashMap::new();
+    let mut file_paths: HashMap<String, PathBuf> = HashMap::new();
+    if let Ok(rows) =
+        package.select_rows(msi::Select::table("File").columns(&["File", "Component_", "FileName"]))
+    {
+        for row in rows {
+            let Some(file_key) = row["File"].as_str() else {
+                continue;
+            };
+            let Some(comp) = row["Component_"].as_str() else {
+                continue;
+            };
+            let long_name = row["FileName"]
+                .as_str()
+                .map(parse_filename_long)
+                .unwrap_or_else(|| file_key.to_owned());
+            let dir_path = match comp_map.get(comp) {
+                Some(dir_key) => dir_path_cache
+                    .entry(dir_key.clone())
+                    .or_insert_with(|| resolve_dir_path(dir_key, &dir_map))
+                    .clone(),
+                None => PathBuf::new(),
+            };
+            file_paths.insert(file_key.to_owned(), dir_path.join(long_name));
+        }
+    }
+
+    Some(file_paths)
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -318,7 +409,10 @@ mod tests {
             parse_defaultdir_name("APP|MyApp:SRC|MySrc"),
             Some("MyApp".to_owned())
         );
-        assert_eq!(parse_defaultdir_name("ProgramFilesFolder"), Some("ProgramFilesFolder".to_owned()));
+        assert_eq!(
+            parse_defaultdir_name("ProgramFilesFolder"),
+            Some("ProgramFilesFolder".to_owned())
+        );
     }
 
     #[test]
@@ -332,7 +426,10 @@ mod tests {
     #[test]
     fn filename_takes_long_name() {
         assert_eq!(parse_filename_long("app.exe"), "app.exe".to_owned());
-        assert_eq!(parse_filename_long("APP~1.EXE|app.exe"), "app.exe".to_owned());
+        assert_eq!(
+            parse_filename_long("APP~1.EXE|app.exe"),
+            "app.exe".to_owned()
+        );
     }
 
     use std::collections::HashMap;
@@ -348,8 +445,14 @@ mod tests {
         // TARGETDIR (root, no parent, no name) → ProgramFilesFolder → MyApp.
         let mut m = HashMap::new();
         m.insert("TARGETDIR".to_owned(), dir(None, None));
-        m.insert("ProgramFilesFolder".to_owned(), dir(Some("TARGETDIR"), Some("ProgramFilesFolder")));
-        m.insert("MyApp".to_owned(), dir(Some("ProgramFilesFolder"), Some("MyApp")));
+        m.insert(
+            "ProgramFilesFolder".to_owned(),
+            dir(Some("TARGETDIR"), Some("ProgramFilesFolder")),
+        );
+        m.insert(
+            "MyApp".to_owned(),
+            dir(Some("ProgramFilesFolder"), Some("MyApp")),
+        );
         assert_eq!(
             resolve_dir_path("MyApp", &m),
             PathBuf::from("ProgramFilesFolder/MyApp")
