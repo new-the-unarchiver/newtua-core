@@ -29,12 +29,8 @@ pub use rar::RarHandler;
 pub mod xar;
 pub use xar::XarHandler;
 
-// MSI is gated off by default (see crates/newtua-core/Cargo.toml [features]):
-// the model-B handler emits raw CAB-member keys, not resolved install paths.
-// Excluded from the shipped build pending its follow-up phase (Д2).
-#[cfg(feature = "msi")]
+// MSI (.msi): CFB + embedded CAB, with File/Component/Directory path resolution.
 pub mod msi;
-#[cfg(feature = "msi")]
 pub use msi::MsiHandler;
 
 pub mod iso;

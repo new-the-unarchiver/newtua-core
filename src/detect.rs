@@ -7,10 +7,8 @@ use crate::archive::{
 };
 use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
-#[cfg(feature = "msi")]
-use crate::format::MsiHandler;
 use crate::format::{
-    ArHandler, CabHandler, CpioHandler, DebHandler, IsoHandler, RarHandler, RpmHandler,
+    ArHandler, CabHandler, CpioHandler, DebHandler, IsoHandler, MsiHandler, RarHandler, RpmHandler,
     SevenZHandler, SfxHandler, TarHandler, WarcHandler, XarHandler, ZipHandler,
 };
 use crate::volume::{ConcatReader, volume_members};
@@ -34,10 +32,8 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
         Box::new(RpmHandler),
         // XarHandler: unique magic "xar!" (78 61 72 21), used for .xar and .pkg.
         Box::new(XarHandler),
-        // MsiHandler: CFB magic + .msi extension (model B — reuses CabHandler
-        // for the embedded CAB streams in the Media table).
-        // Gated behind the `msi` feature (off by default) — see format/mod.rs.
-        #[cfg(feature = "msi")]
+        // MsiHandler: CFB magic + .msi extension. Reuses CabHandler for embedded
+        // CAB streams; resolves File/Component/Directory tables to install paths.
         Box::new(MsiHandler),
         // IsoHandler: detected by .iso extension; CD001 signature verified in open.
         Box::new(IsoHandler),
@@ -426,13 +422,9 @@ mod tests {
 
     #[test]
     fn registry_has_expected_handlers() {
-        // 13 always-on handlers (XAR included); MSI adds one behind its
-        // (off-by-default) feature flag.
-        let mut expected = 13;
-        if cfg!(feature = "msi") {
-            expected += 1;
-        }
-        assert_eq!(registry().len(), expected);
+        // 14 handlers: zip, cpio, 7z, rar, tar, cab, deb, ar, rpm, xar, msi, iso,
+        // sfx, warc.
+        assert_eq!(registry().len(), 14);
     }
 
     #[test]

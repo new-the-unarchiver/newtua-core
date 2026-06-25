@@ -27,11 +27,10 @@ rpm.workspace = true
 # XAR (.xar/.pkg): in-house decode-only reader (header + zlib TOC + heap). Uses
 # the workspace flate2/bzip2/xz2 plus a tiny XML DOM; no apple-xar, no `ring`.
 roxmltree = "0.21"
-# MSI is gated behind the `msi` feature (off by default): the current model-B
-# handler emits raw CAB-member keys, not resolved install paths. Excluded from
-# the shipped build until the dedicated MSI follow-up phase (File/Component/
-# Directory table resolution).
-msi = { workspace = true, optional = true }
+# MSI (.msi): CFB database with embedded CAB stream(s). The handler resolves the
+# File/Component/Directory tables to real install paths (model C) and reuses
+# CabHandler for the embedded CAB bytes. Always built.
+msi.workspace = true
 cdfs = "0.2.3"
 goblin.workspace = true
 warc.workspace = true
@@ -39,13 +38,10 @@ lzw-z = { path = "../lzw-z" }
 
 [features]
 default = []
-# Windows Installer .msi support. Off by default — see the dependency note above.
-msi = ["dep:msi"]
 
 [dev-dependencies]
 tar.workspace = true
 tempfile.workspace = true
 zip.workspace = true
-msi.workspace = true
 cab.workspace = true
 flate2.workspace = true
