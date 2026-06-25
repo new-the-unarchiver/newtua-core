@@ -220,38 +220,16 @@ fn parse_warc_date(date_str: &str) -> Option<SystemTime> {
     if s.len() < 20 {
         return None;
     }
-    let year: u64 = s[0..4].parse().ok()?;
-    let month: u64 = s[5..7].parse().ok()?;
-    let day: u64 = s[8..10].parse().ok()?;
+    let year: i32 = s[0..4].parse().ok()?;
+    let month: u32 = s[5..7].parse().ok()?;
+    let day: u32 = s[8..10].parse().ok()?;
     let hour: u64 = s[11..13].parse().ok()?;
     let min: u64 = s[14..16].parse().ok()?;
     let sec: u64 = s[17..19].parse().ok()?;
 
-    // Reject out-of-range / pre-epoch values: a crafted WARC-Date must not index
-    // `days_in_month` out of bounds (month > 12 would panic) — it is only an
-    // optional timestamp, so bail to None.
-    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-
-    // Approximate days since Unix epoch: handle leap years with Gregorian formula.
-    let days_in_month = [0u64, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let is_leap = |y: u64| (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
-
-    // Days from 1970-01-01 to start of year.
-    let mut days: u64 = 0;
-    for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
-    }
-    // Days within year up to start of month.
-    for m in 1..month {
-        let extra = if m == 2 && is_leap(year) { 1 } else { 0 };
-        days += days_in_month[m as usize] + extra;
-    }
-    days += day.saturating_sub(1);
-
-    let secs = days * 86400 + hour * 3600 + min * 60 + sec;
-    Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+    // Range validation + the UTC conversion (including rejecting month > 12 etc.)
+    // live in the shared helper, so a crafted date yields None, never a panic.
+    crate::datetime::civil_to_systime(year, month, day, hour, min, sec)
 }
 
 // ── Reader ────────────────────────────────────────────────────────────────────

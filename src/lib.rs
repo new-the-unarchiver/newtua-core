@@ -18,6 +18,8 @@ pub use path_safety::{safe_join, safe_symlink_target};
 pub mod decompress;
 pub use decompress::{Compressor, decompressor};
 
+mod datetime;
+
 pub mod format;
 
 pub mod volume;
