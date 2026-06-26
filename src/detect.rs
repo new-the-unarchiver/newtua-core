@@ -322,7 +322,8 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
 
     // Compression layer. Magic-based detection first; then an extension-only
     // fallback for magic-less compressors (Brotli — no content signature).
-    if let Some(comp) = detect_compressor(&header).or_else(|| detect_compressor_by_ext(&lower_name)) {
+    if let Some(comp) = detect_compressor(&header).or_else(|| detect_compressor_by_ext(&lower_name))
+    {
         // Step 1: decompress to a temp file via streaming io::copy (no RAM spike).
         let file = std::fs::File::open(path)?;
         let mut decoded: Box<dyn Read> = decompressor(comp, Box::new(file))?;
@@ -536,7 +537,10 @@ mod tests {
 
     #[test]
     fn detect_compressor_by_ext_recognizes_br() {
-        assert_eq!(detect_compressor_by_ext("data.br"), Some(Compressor::Brotli));
+        assert_eq!(
+            detect_compressor_by_ext("data.br"),
+            Some(Compressor::Brotli)
+        );
         assert_eq!(
             detect_compressor_by_ext("archive.tar.br"),
             Some(Compressor::Brotli)

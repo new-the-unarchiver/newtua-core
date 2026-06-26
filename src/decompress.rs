@@ -24,7 +24,9 @@ pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<B
         }
         Compressor::Lzc => Ok(Box::new(lzw_z::Decoder::new(inner))),
         Compressor::Lz4 => Ok(Box::new(lz4_flex::frame::FrameDecoder::new(inner))),
-        Compressor::Brotli => Ok(Box::new(brotli_decompressor::Decompressor::new(inner, 4096))),
+        Compressor::Brotli => Ok(Box::new(brotli_decompressor::Decompressor::new(
+            inner, 4096,
+        ))),
     }
 }
 
@@ -149,8 +151,11 @@ mod tests {
 
     #[test]
     fn brotli_decodes_known_stream() {
-        let mut r =
-            decompressor(Compressor::Brotli, Box::new(std::io::Cursor::new(BROTLI_HELLO))).unwrap();
+        let mut r = decompressor(
+            Compressor::Brotli,
+            Box::new(std::io::Cursor::new(BROTLI_HELLO)),
+        )
+        .unwrap();
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, BROTLI_HELLO_PLAIN);
@@ -163,8 +168,7 @@ mod tests {
         // an incomplete brotli stream cannot reach its ISLAST marker, so the
         // decoder errors on read (UnexpectedEof).
         let half = &BROTLI_HELLO[..BROTLI_HELLO.len() / 2];
-        let mut r =
-            decompressor(Compressor::Brotli, Box::new(std::io::Cursor::new(half))).unwrap();
+        let mut r = decompressor(Compressor::Brotli, Box::new(std::io::Cursor::new(half))).unwrap();
         let mut out = Vec::new();
         assert!(r.read_to_end(&mut out).is_err());
     }
