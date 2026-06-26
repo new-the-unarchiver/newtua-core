@@ -133,22 +133,27 @@ mod tests {
         assert!(r.read_to_end(&mut out).is_err());
     }
 
-    fn brotli_bytes(data: &[u8]) -> Vec<u8> {
-        use brotli::CompressorWriter;
-        let mut w = CompressorWriter::new(Vec::new(), 4096, 11, 22);
-        w.write_all(data).unwrap();
-        w.into_inner()
-    }
+    // A known-good Brotli stream. newtua is decode-only and never links a Brotli
+    // encoder (it is a heavy separate crate), so instead of encoding-then-decoding
+    // — which would only test the `brotli` crate — we decode a committed reference
+    // stream and assert our `decompressor` arm yields the original bytes. The blob
+    // was produced once, out of tree, by `brotli::CompressorWriter` (quality 11).
+    const BROTLI_HELLO: &[u8] = &[
+        0x1b, 0x43, 0x00, 0x80, 0xc5, 0x6e, 0x39, 0xad, 0x37, 0xaf, 0x24, 0x52, 0xea, 0x84, 0xe1,
+        0x1f, 0x26, 0x72, 0xe0, 0xd0, 0x16, 0xe8, 0x3d, 0x30, 0x3c, 0x78, 0xc8, 0x5a, 0x3a, 0x89,
+        0x49, 0xc8, 0xb1, 0xa3, 0xc3, 0xab, 0x44, 0xcb, 0x2f, 0x8a, 0x0d, 0xc8, 0x08, 0xa0, 0x23,
+        0xe5, 0x7c, 0x30, 0xb5, 0x05, 0xd2, 0xf7, 0xaa, 0xc1, 0x18,
+    ];
+    const BROTLI_HELLO_PLAIN: &[u8] =
+        b"hello brotli payload \xe2\x80\x94 the quick brown fox jumps over the lazy dog";
 
     #[test]
-    fn brotli_roundtrip() {
-        let payload = b"hello brotli payload";
-        let compressed = brotli_bytes(payload);
+    fn brotli_decodes_known_stream() {
         let mut r =
-            decompressor(Compressor::Brotli, Box::new(std::io::Cursor::new(compressed))).unwrap();
+            decompressor(Compressor::Brotli, Box::new(std::io::Cursor::new(BROTLI_HELLO))).unwrap();
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
-        assert_eq!(out, payload);
+        assert_eq!(out, BROTLI_HELLO_PLAIN);
     }
 
     #[test]
@@ -157,16 +162,9 @@ mod tests {
         // gzip/zstd/lz4 does not apply. Instead, truncate a VALID stream to half:
         // an incomplete brotli stream cannot reach its ISLAST marker, so the
         // decoder errors on read (UnexpectedEof).
-        let payload: Vec<u8> = b"the quick brown fox jumps over the lazy dog. "
-            .iter()
-            .cycle()
-            .take(400)
-            .copied()
-            .collect();
-        let compressed = brotli_bytes(&payload);
-        let half = &compressed[..compressed.len() / 2];
+        let half = &BROTLI_HELLO[..BROTLI_HELLO.len() / 2];
         let mut r =
-            decompressor(Compressor::Brotli, Box::new(std::io::Cursor::new(half.to_vec()))).unwrap();
+            decompressor(Compressor::Brotli, Box::new(std::io::Cursor::new(half))).unwrap();
         let mut out = Vec::new();
         assert!(r.read_to_end(&mut out).is_err());
     }
