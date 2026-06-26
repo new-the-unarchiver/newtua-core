@@ -9,6 +9,7 @@ pub enum Compressor {
     Lzma,
     Lzc,
     Lz4,
+    Brotli,
 }
 
 pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<Box<dyn Read>> {
@@ -23,6 +24,7 @@ pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<B
         }
         Compressor::Lzc => Ok(Box::new(lzw_z::Decoder::new(inner))),
         Compressor::Lz4 => Ok(Box::new(lz4_flex::frame::FrameDecoder::new(inner))),
+        Compressor::Brotli => Ok(Box::new(brotli_decompressor::Decompressor::new(inner, 4096))),
     }
 }
 
@@ -127,6 +129,44 @@ mod tests {
         let mut bytes = vec![0x04, 0x22, 0x4D, 0x18];
         bytes.extend_from_slice(&[0xFF; 32]);
         let mut r = decompressor(Compressor::Lz4, Box::new(std::io::Cursor::new(bytes))).unwrap();
+        let mut out = Vec::new();
+        assert!(r.read_to_end(&mut out).is_err());
+    }
+
+    fn brotli_bytes(data: &[u8]) -> Vec<u8> {
+        use brotli::CompressorWriter;
+        let mut w = CompressorWriter::new(Vec::new(), 4096, 11, 22);
+        w.write_all(data).unwrap();
+        w.into_inner()
+    }
+
+    #[test]
+    fn brotli_roundtrip() {
+        let payload = b"hello brotli payload";
+        let compressed = brotli_bytes(payload);
+        let mut r =
+            decompressor(Compressor::Brotli, Box::new(std::io::Cursor::new(compressed))).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn corrupt_brotli_errors_on_read() {
+        // Brotli has no magic, so the "valid magic + garbage" trick used for
+        // gzip/zstd/lz4 does not apply. Instead, truncate a VALID stream to half:
+        // an incomplete brotli stream cannot reach its ISLAST marker, so the
+        // decoder errors on read (UnexpectedEof).
+        let payload: Vec<u8> = b"the quick brown fox jumps over the lazy dog. "
+            .iter()
+            .cycle()
+            .take(400)
+            .copied()
+            .collect();
+        let compressed = brotli_bytes(&payload);
+        let half = &compressed[..compressed.len() / 2];
+        let mut r =
+            decompressor(Compressor::Brotli, Box::new(std::io::Cursor::new(half.to_vec()))).unwrap();
         let mut out = Vec::new();
         assert!(r.read_to_end(&mut out).is_err());
     }
