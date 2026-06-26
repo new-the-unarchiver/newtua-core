@@ -15,6 +15,8 @@
 
 #[path = "integration/ar_handler.rs"]
 mod ar_handler;
+#[path = "integration/brotli.rs"]
+mod brotli;
 #[path = "integration/cab_handler.rs"]
 mod cab_handler;
 #[path = "integration/cpio_handler.rs"]
