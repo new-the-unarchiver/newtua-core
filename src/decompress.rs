@@ -135,11 +135,13 @@ mod tests {
         assert!(r.read_to_end(&mut out).is_err());
     }
 
-    // A known-good Brotli stream. newtua is decode-only and never links a Brotli
-    // encoder (it is a heavy separate crate), so instead of encoding-then-decoding
-    // — which would only test the `brotli` crate — we decode a committed reference
-    // stream and assert our `decompressor` arm yields the original bytes. The blob
-    // was produced once, out of tree, by `brotli::CompressorWriter` (quality 11).
+    // A known-good Brotli stream that decodes to `BROTLI_HELLO_PLAIN`. newtua is
+    // decode-only and never links a Brotli encoder (it is a heavy separate crate),
+    // so instead of encoding-then-decoding — which would only test the `brotli`
+    // crate — we decode this committed reference stream and assert our
+    // `decompressor` arm yields the original bytes. The blob was produced once,
+    // out of tree, by `brotli::CompressorWriter::new(buf, 4096, 11, 22)` over
+    // `BROTLI_HELLO_PLAIN`; regenerate it the same way if the plaintext changes.
     const BROTLI_HELLO: &[u8] = &[
         0x1b, 0x43, 0x00, 0x80, 0xc5, 0x6e, 0x39, 0xad, 0x37, 0xaf, 0x24, 0x52, 0xea, 0x84, 0xe1,
         0x1f, 0x26, 0x72, 0xe0, 0xd0, 0x16, 0xe8, 0x3d, 0x30, 0x3c, 0x78, 0xc8, 0x5a, 0x3a, 0x89,
@@ -164,11 +166,14 @@ mod tests {
     #[test]
     fn corrupt_brotli_errors_on_read() {
         // Brotli has no magic, so the "valid magic + garbage" trick used for
-        // gzip/zstd/lz4 does not apply. Instead, truncate a VALID stream to half:
-        // an incomplete brotli stream cannot reach its ISLAST marker, so the
-        // decoder errors on read (UnexpectedEof).
-        let half = &BROTLI_HELLO[..BROTLI_HELLO.len() / 2];
-        let mut r = decompressor(Compressor::Brotli, Box::new(std::io::Cursor::new(half))).unwrap();
+        // gzip/zstd/lz4 does not apply. Instead, feed a tiny prefix of a VALID
+        // stream: too few bytes to be a complete brotli stream regardless of what
+        // BROTLI_HELLO encodes, so the decoder always hits EOF before the ISLAST
+        // marker and errors on read (UnexpectedEof). Robust-by-construction — not
+        // tied to BROTLI_HELLO's length.
+        let truncated = &BROTLI_HELLO[..4];
+        let mut r =
+            decompressor(Compressor::Brotli, Box::new(std::io::Cursor::new(truncated))).unwrap();
         let mut out = Vec::new();
         assert!(r.read_to_end(&mut out).is_err());
     }

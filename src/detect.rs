@@ -88,6 +88,9 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
 /// lowercased by the caller.
 ///
 /// - `.br` / `.tar.br` → Brotli
+///
+/// Add future extension-only (magic-less) compressors here — one `ends_with`
+/// arm each — and keep `detect_compressor` (the byte-magic detector) untouched.
 fn detect_compressor_by_ext(lower_name: &str) -> Option<Compressor> {
     if lower_name.ends_with(".br") {
         return Some(Compressor::Brotli);
@@ -551,9 +554,13 @@ mod tests {
 
     #[test]
     fn brotli_has_no_content_magic() {
-        // Asymmetry guard: a Brotli stream is never detected by content magic.
-        // (A real brotli stream of "x" — first byte 0x0b — must NOT map to a
-        // compressor via detect_compressor.)
+        // Asymmetry guard: Brotli must never be recognised by content magic —
+        // it has no signature, so `detect_compressor` (the byte-magic detector)
+        // must return None for it. The invariant under test is the *absence* of
+        // a magic match; the particular bytes don't matter — these happen to be
+        // the start of a valid Brotli stream (the first byte encodes the window
+        // size, not a fixed tag), but any input that isn't another format's
+        // magic would serve equally.
         assert_eq!(detect_compressor(&[0x0b, 0x00, 0x80]), None);
     }
 
