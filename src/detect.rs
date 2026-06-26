@@ -79,6 +79,22 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     None
 }
 
+/// Detect a compressor from the file name's extension, for formats that have
+/// **no content magic** and therefore cannot be recognised by `detect_compressor`.
+///
+/// This is intentionally separate from `detect_compressor` (which inspects bytes):
+/// magic-less formats are detected only by an explicit extension, never by
+/// content (same deliberate asymmetry as `.lzma`). `lower_name` must already be
+/// lowercased by the caller.
+///
+/// - `.br` / `.tar.br` → Brotli
+fn detect_compressor_by_ext(lower_name: &str) -> Option<Compressor> {
+    if lower_name.ends_with(".br") {
+        return Some(Compressor::Brotli);
+    }
+    None
+}
+
 // ── TempBackedReader ──────────────────────────────────────────────────────────
 
 /// Generic wrapper that delegates all [`ArchiveReader`] calls to an inner reader
@@ -253,7 +269,7 @@ impl ArchiveReader for SingleFileReader {
 fn stem_without_compressor_ext(path: &Path) -> String {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
 
-    for ext in &[".gz", ".bz2", ".xz", ".zst", ".Z", ".lz4"] {
+    for ext in &[".gz", ".bz2", ".xz", ".zst", ".Z", ".lz4", ".br"] {
         if let Some(stem) = name.strip_suffix(ext) {
             return stem.to_string();
         }
@@ -304,8 +320,9 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
         return WarcHandler.open(src, opts);
     }
 
-    // Compression layer.
-    if let Some(comp) = detect_compressor(&header) {
+    // Compression layer. Magic-based detection first; then an extension-only
+    // fallback for magic-less compressors (Brotli — no content signature).
+    if let Some(comp) = detect_compressor(&header).or_else(|| detect_compressor_by_ext(&lower_name)) {
         // Step 1: decompress to a temp file via streaming io::copy (no RAM spike).
         let file = std::fs::File::open(path)?;
         let mut decoded: Box<dyn Read> = decompressor(comp, Box::new(file))?;
@@ -514,6 +531,37 @@ mod tests {
         assert_eq!(
             stem_without_compressor_ext(Path::new("file.zip")),
             "file.zip"
+        );
+    }
+
+    #[test]
+    fn detect_compressor_by_ext_recognizes_br() {
+        assert_eq!(detect_compressor_by_ext("data.br"), Some(Compressor::Brotli));
+        assert_eq!(
+            detect_compressor_by_ext("archive.tar.br"),
+            Some(Compressor::Brotli)
+        );
+        assert_eq!(detect_compressor_by_ext("data.txt"), None);
+        assert_eq!(detect_compressor_by_ext("noext"), None);
+    }
+
+    #[test]
+    fn brotli_has_no_content_magic() {
+        // Asymmetry guard: a Brotli stream is never detected by content magic.
+        // (A real brotli stream of "x" — first byte 0x0b — must NOT map to a
+        // compressor via detect_compressor.)
+        assert_eq!(detect_compressor(&[0x0b, 0x00, 0x80]), None);
+    }
+
+    #[test]
+    fn stem_strips_br() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/tmp/data.tar.br")),
+            "data.tar"
+        );
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("notes.txt.br")),
+            "notes.txt"
         );
     }
 }
