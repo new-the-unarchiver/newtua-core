@@ -9,41 +9,49 @@ use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
     ArHandler, CabHandler, CpioHandler, DebHandler, IsoHandler, MsiHandler, RarHandler, RpmHandler,
-    SevenZHandler, SfxHandler, TarHandler, WarcHandler, XarHandler, ZipHandler,
+    SevenZHandler, SfxHandler, TarHandler, WarcHandler, XarHandler, ZipBundleHandler, ZipHandler,
+    bundle,
 };
 use crate::volume::{ConcatReader, volume_members};
 
 /// Returns the full handler registry in priority order.
 pub fn registry() -> Vec<Box<dyn FormatHandler>> {
-    vec![
-        Box::new(ZipHandler),
-        Box::new(CpioHandler),
-        Box::new(SevenZHandler),
-        Box::new(RarHandler),
-        Box::new(TarHandler),
-        Box::new(CabHandler),
-        // DebHandler MUST precede ArHandler: a .deb shares the `!<arch>\n` magic
-        // with a plain ar archive, so both probe MAGIC. The selector keeps the
-        // first MAGIC on a tie, so order is the tie-break (a plain ar still falls
-        // through to ArHandler, since DebHandler probes NONE without debian-binary).
-        Box::new(DebHandler),
-        Box::new(ArHandler),
-        // RpmHandler: unique lead magic (ED AB EE DB), no tie-break with peers.
-        Box::new(RpmHandler),
-        // XarHandler: unique magic "xar!" (78 61 72 21), used for .xar and .pkg.
-        Box::new(XarHandler),
-        // MsiHandler: CFB magic + .msi extension. Reuses CabHandler for embedded
-        // CAB streams; resolves File/Component/Directory tables to install paths.
-        Box::new(MsiHandler),
-        // IsoHandler: detected by .iso extension; CD001 signature verified in open.
-        Box::new(IsoHandler),
-        // SfxHandler: MZ → Confidence(50), below MAGIC(100), so real archives always
-        // win. Carves the appended archive past the PE overlay and reopens it.
-        Box::new(SfxHandler),
-        // WarcHandler: WARC/1.x magic; .warc.gz is handled by the early
-        // extension branch in open_single and never reaches this registry probe.
-        Box::new(WarcHandler),
-    ]
+    let mut handlers: Vec<Box<dyn FormatHandler>> = Vec::new();
+    // Zip-бандлы ДОЛЖНЫ идти перед ZipHandler: они делят PK-магию, а селектор на
+    // ничьей MAGIC берёт первого. Обычный .zip не совпадает ни с одним бандлом
+    // (NONE) и проваливается в ZipHandler.
+    for &(ext, format) in bundle::ZIP_BUNDLES {
+        handlers.push(Box::new(ZipBundleHandler::new(ext, format)));
+    }
+    // CRX добавляется в Task 3 здесь (после бандлов, перед ZipHandler).
+    handlers.push(Box::new(ZipHandler));
+    handlers.push(Box::new(CpioHandler));
+    handlers.push(Box::new(SevenZHandler));
+    handlers.push(Box::new(RarHandler));
+    handlers.push(Box::new(TarHandler));
+    handlers.push(Box::new(CabHandler));
+    // DebHandler MUST precede ArHandler: a .deb shares the `!<arch>\n` magic
+    // with a plain ar archive, so both probe MAGIC. The selector keeps the
+    // first MAGIC on a tie, so order is the tie-break (a plain ar still falls
+    // through to ArHandler, since DebHandler probes NONE without debian-binary).
+    handlers.push(Box::new(DebHandler));
+    handlers.push(Box::new(ArHandler));
+    // RpmHandler: unique lead magic (ED AB EE DB), no tie-break with peers.
+    handlers.push(Box::new(RpmHandler));
+    // XarHandler: unique magic "xar!" (78 61 72 21), used for .xar and .pkg.
+    handlers.push(Box::new(XarHandler));
+    // MsiHandler: CFB magic + .msi extension. Reuses CabHandler for embedded
+    // CAB streams; resolves File/Component/Directory tables to install paths.
+    handlers.push(Box::new(MsiHandler));
+    // IsoHandler: detected by .iso extension; CD001 signature verified in open.
+    handlers.push(Box::new(IsoHandler));
+    // SfxHandler: MZ → Confidence(50), below MAGIC(100), so real archives always
+    // win. Carves the appended archive past the PE overlay and reopens it.
+    handlers.push(Box::new(SfxHandler));
+    // WarcHandler: WARC/1.x magic; .warc.gz is handled by the early extension
+    // branch in open_single and never reaches this registry probe.
+    handlers.push(Box::new(WarcHandler));
+    handlers
 }
 
 /// Probe magic bytes to detect a compression wrapper.
@@ -450,9 +458,8 @@ mod tests {
 
     #[test]
     fn registry_has_expected_handlers() {
-        // 14 handlers: zip, cpio, 7z, rar, tar, cab, deb, ar, rpm, xar, msi, iso,
-        // sfx, warc.
-        assert_eq!(registry().len(), 14);
+        // 14 базовых + 10 zip-бандлов (jar/apk/ipa/epub/docx/xlsx/pptx/odt/ods/odp).
+        assert_eq!(registry().len(), 24);
     }
 
     #[test]
