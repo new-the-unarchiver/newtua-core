@@ -168,10 +168,12 @@ mod tests {
 
     #[test]
     fn crx2_short_header_is_corrupt() {
-        // version=2, но всего 14 байт (нет полного sig_len).
+        // version=2, 12 байт: есть pubkey_len, но нет sig_len (CRX2 требует ≥16).
+        // Так покрываем именно CRX2-ветку `head.len() < 16`, а не общий guard <12.
         let mut h = b"Cr24".to_vec();
         h.extend_from_slice(&2u32.to_le_bytes());
-        h.extend_from_slice(&[0u8, 0u8]); // только 2 из 4 байт pubkey_len-региона
+        h.extend_from_slice(&12u32.to_le_bytes());
+        assert_eq!(h.len(), 12);
         assert!(matches!(crx_zip_offset(&h), Err(Error::Corrupt(_))));
     }
 }

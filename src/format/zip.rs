@@ -70,7 +70,14 @@ pub(crate) fn open_zip(
     for i in 0..zip.len() {
         let f = zip.by_index_raw(i).map_err(map_zip_err)?;
         is_lzma.push(f.compression() == zip::CompressionMethod::Lzma);
+        // unix_mode() returns the full 16-bit value (type bits + perms).
+        // Use the crate's is_symlink() for detection: unix_permissions() on
+        // write strips type bits and always sets S_IFREG, so checking raw
+        // mode bits ourselves is unreliable. is_symlink() checks S_IFLNK
+        // which is only set when the entry was written via add_symlink().
         let is_symlink = f.is_symlink();
+        // Strip the file-type nibble so `mode` holds only permission bits,
+        // matching the convention used by the tar handler.
         let mode = f.unix_mode().map(|m| m & 0o7777);
         let is_dir = f.is_dir();
         let size = f.size();
@@ -78,7 +85,7 @@ pub(crate) fn open_zip(
         let modified = f.last_modified().and_then(zip_dt_to_systime);
         raw_names.push(f.name_raw().to_vec());
         let kind_raw = if is_symlink {
-            EntryKindRaw::Symlink(Vec::new())
+            EntryKindRaw::Symlink(Vec::new()) // filled in next loop
         } else if is_dir {
             EntryKindRaw::Dir
         } else {
@@ -86,6 +93,9 @@ pub(crate) fn open_zip(
         };
         metas.push((size, is_dir, is_encrypted, modified, mode, kind_raw));
     }
+    // Second pass: read symlink targets via by_index (decompressed).
+    // This is best-effort: if the entry is encrypted or otherwise unreadable,
+    // we fall back to an empty target so that listing still succeeds.
     for (i, meta) in metas.iter_mut().enumerate() {
         if matches!(meta.5, EntryKindRaw::Symlink(_)) {
             let buf = zip
@@ -103,6 +113,7 @@ pub(crate) fn open_zip(
     let encoding_label = opts.encoding_override.as_deref();
     let names = decode_names(&raw_names, encoding_label);
 
+    // Collect symlink target byte-strings for batch decoding with same charset.
     let raw_targets: Vec<Vec<u8>> = metas
         .iter()
         .map(|(_, _, _, _, _, kind_raw)| match kind_raw {
