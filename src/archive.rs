@@ -28,6 +28,20 @@ pub enum FormatId {
     Warc,
     /// A single decompressed file (no container format; e.g. plain `.gz`).
     Raw,
+    // Zip-основанные форматы-бандлы (#16). Все открываются общим zip-движком;
+    // отличается лишь рапортуемый подтип. Детект — по расширению + PK.
+    Jar,
+    Apk,
+    Ipa,
+    Epub,
+    Docx,
+    Xlsx,
+    Pptx,
+    Odt,
+    Ods,
+    Odp,
+    /// Chrome-расширение: zip за заголовком `Cr24` (CRX2/CRX3).
+    Crx,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -42,106 +42,102 @@ impl FormatHandler for ZipHandler {
     }
 
     fn open(&self, src: Source, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
-        let inner: Box<dyn crate::archive::ReadSeek> = match src {
-            Source::Seekable { inner, .. } => inner,
-            Source::Stream { .. } => {
-                return Err(Error::Unsupported {
-                    format: "zip".into(),
-                    feature: "streaming (zip requires seek)".into(),
-                });
-            }
-        };
-        let mut zip = zip::ZipArchive::new(inner).map_err(map_zip_err)?;
-        let mut raw_names: Vec<Vec<u8>> = Vec::new();
-        let mut metas: Vec<EntryMeta> = Vec::new();
-        // Parallel to `entries`: which members use the LZMA method (see read_entry).
-        let mut is_lzma: Vec<bool> = Vec::new();
-        for i in 0..zip.len() {
-            let f = zip.by_index_raw(i).map_err(map_zip_err)?;
-            is_lzma.push(f.compression() == zip::CompressionMethod::Lzma);
-            // unix_mode() returns the full 16-bit value (type bits + perms).
-            // Use the crate's is_symlink() for detection: unix_permissions() on
-            // write strips type bits and always sets S_IFREG, so checking raw
-            // mode bits ourselves is unreliable. is_symlink() checks S_IFLNK
-            // which is only set when the entry was written via add_symlink().
-            let is_symlink = f.is_symlink();
-            // Strip the file-type nibble so `mode` holds only permission bits,
-            // matching the convention used by the tar handler.
-            let mode = f.unix_mode().map(|m| m & 0o7777);
-            let is_dir = f.is_dir();
-            let size = f.size();
-            let is_encrypted = f.encrypted();
-            let modified = f.last_modified().and_then(zip_dt_to_systime);
-            raw_names.push(f.name_raw().to_vec());
-            // For symlinks we need the content (link target), but by_index_raw
-            // gives raw (possibly compressed) bytes. We stage a placeholder and
-            // read the target below via by_index (decompressed).
-            let kind_raw = if is_symlink {
-                EntryKindRaw::Symlink(Vec::new()) // filled in next loop
-            } else if is_dir {
-                EntryKindRaw::Dir
-            } else {
-                EntryKindRaw::File
-            };
-            metas.push((size, is_dir, is_encrypted, modified, mode, kind_raw));
-        }
-        // Second pass: read symlink targets via by_index (decompressed).
-        // This is best-effort: if the entry is encrypted or otherwise unreadable,
-        // we fall back to an empty target so that listing still succeeds.
-        for (i, meta) in metas.iter_mut().enumerate() {
-            if matches!(meta.5, EntryKindRaw::Symlink(_)) {
-                let buf = zip
-                    .by_index(i)
-                    .ok()
-                    .and_then(|mut f| {
-                        let mut buf = Vec::new();
-                        f.read_to_end(&mut buf).ok().map(|_| buf)
-                    })
-                    .unwrap_or_default();
-                meta.5 = EntryKindRaw::Symlink(buf);
-            }
-        }
+        open_zip(src, opts, FormatId::Zip)
+    }
+}
 
-        let encoding_label = opts.encoding_override.as_deref();
-        let names = decode_names(&raw_names, encoding_label);
-
-        // Collect symlink target byte-strings for batch decoding with same charset.
-        let raw_targets: Vec<Vec<u8>> = metas
-            .iter()
-            .map(|(_, _, _, _, _, kind_raw)| match kind_raw {
-                EntryKindRaw::Symlink(t) => t.clone(),
-                _ => Vec::new(),
-            })
-            .collect();
-        let decoded_targets = decode_names(&raw_targets, encoding_label);
-
-        let mut entries = Vec::with_capacity(zip.len());
-        for (i, (size, _, is_encrypted, modified, mode, kind_raw)) in metas.into_iter().enumerate()
-        {
-            let kind = match kind_raw {
-                EntryKindRaw::File => EntryKind::File,
-                EntryKindRaw::Dir => EntryKind::Dir,
-                EntryKindRaw::Symlink(_) => EntryKind::Symlink {
-                    target: std::path::PathBuf::from(&decoded_targets[i]),
-                },
-            };
-            entries.push(Entry {
-                path_raw: raw_names[i].clone(),
-                path: std::path::PathBuf::from(&names[i]),
-                kind,
-                size,
-                mode,
-                is_encrypted,
-                modified,
+/// Открыть zip-источник, рапортуя подтип `format` (Zip для обычного zip, либо
+/// конкретный бандл — Apk/Epub/Crx/…). Вся логика индексации записей,
+/// символлинков, LZMA и паролей общая для всех подтипов.
+pub(crate) fn open_zip(
+    src: Source,
+    opts: &OpenOptions,
+    format: FormatId,
+) -> Result<Box<dyn ArchiveReader>> {
+    let inner: Box<dyn crate::archive::ReadSeek> = match src {
+        Source::Seekable { inner, .. } => inner,
+        Source::Stream { .. } => {
+            return Err(Error::Unsupported {
+                format: "zip".into(),
+                feature: "streaming (zip requires seek)".into(),
             });
         }
-        Ok(Box::new(ZipReader {
-            zip,
-            entries,
-            is_lzma,
-            password: opts.password.clone(),
-        }))
+    };
+    let mut zip = zip::ZipArchive::new(inner).map_err(map_zip_err)?;
+    let mut raw_names: Vec<Vec<u8>> = Vec::new();
+    let mut metas: Vec<EntryMeta> = Vec::new();
+    let mut is_lzma: Vec<bool> = Vec::new();
+    for i in 0..zip.len() {
+        let f = zip.by_index_raw(i).map_err(map_zip_err)?;
+        is_lzma.push(f.compression() == zip::CompressionMethod::Lzma);
+        let is_symlink = f.is_symlink();
+        let mode = f.unix_mode().map(|m| m & 0o7777);
+        let is_dir = f.is_dir();
+        let size = f.size();
+        let is_encrypted = f.encrypted();
+        let modified = f.last_modified().and_then(zip_dt_to_systime);
+        raw_names.push(f.name_raw().to_vec());
+        let kind_raw = if is_symlink {
+            EntryKindRaw::Symlink(Vec::new())
+        } else if is_dir {
+            EntryKindRaw::Dir
+        } else {
+            EntryKindRaw::File
+        };
+        metas.push((size, is_dir, is_encrypted, modified, mode, kind_raw));
     }
+    for (i, meta) in metas.iter_mut().enumerate() {
+        if matches!(meta.5, EntryKindRaw::Symlink(_)) {
+            let buf = zip
+                .by_index(i)
+                .ok()
+                .and_then(|mut f| {
+                    let mut buf = Vec::new();
+                    f.read_to_end(&mut buf).ok().map(|_| buf)
+                })
+                .unwrap_or_default();
+            meta.5 = EntryKindRaw::Symlink(buf);
+        }
+    }
+
+    let encoding_label = opts.encoding_override.as_deref();
+    let names = decode_names(&raw_names, encoding_label);
+
+    let raw_targets: Vec<Vec<u8>> = metas
+        .iter()
+        .map(|(_, _, _, _, _, kind_raw)| match kind_raw {
+            EntryKindRaw::Symlink(t) => t.clone(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let decoded_targets = decode_names(&raw_targets, encoding_label);
+
+    let mut entries = Vec::with_capacity(zip.len());
+    for (i, (size, _, is_encrypted, modified, mode, kind_raw)) in metas.into_iter().enumerate() {
+        let kind = match kind_raw {
+            EntryKindRaw::File => EntryKind::File,
+            EntryKindRaw::Dir => EntryKind::Dir,
+            EntryKindRaw::Symlink(_) => EntryKind::Symlink {
+                target: std::path::PathBuf::from(&decoded_targets[i]),
+            },
+        };
+        entries.push(Entry {
+            path_raw: raw_names[i].clone(),
+            path: std::path::PathBuf::from(&names[i]),
+            kind,
+            size,
+            mode,
+            is_encrypted,
+            modified,
+        });
+    }
+    Ok(Box::new(ZipReader {
+        zip,
+        entries,
+        is_lzma,
+        password: opts.password.clone(),
+        format,
+    }))
 }
 
 /// Convert a `zip::DateTime` (MS-DOS civil fields) to `SystemTime`.
@@ -219,11 +215,13 @@ struct ZipReader {
     /// Parallel to `entries`: true where the member uses the LZMA method.
     is_lzma: Vec<bool>,
     password: Option<String>,
+    /// Рапортуемый подтип (Zip, либо Apk/Epub/Crx/… для бандлов).
+    format: FormatId,
 }
 
 impl ArchiveReader for ZipReader {
     fn format(&self) -> FormatId {
-        FormatId::Zip
+        self.format
     }
 
     fn entries(&mut self) -> Result<&[Entry]> {
@@ -289,6 +287,33 @@ impl ArchiveReader for ZipReader {
 mod tests {
     use super::*;
     use crate::Confidence;
+
+    /// Собрать минимальный валидный zip в памяти (один файл "hello.txt" = "hi").
+    fn tiny_zip_bytes() -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let o: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            w.start_file("hello.txt", o).unwrap();
+            std::io::Write::write_all(&mut w, b"hi").unwrap();
+            w.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn open_zip_reports_requested_format() {
+        let bytes = tiny_zip_bytes();
+        let src = Source::Seekable {
+            inner: Box::new(std::io::Cursor::new(bytes)),
+            path: None,
+        };
+        let mut reader = open_zip(src, &OpenOptions::default(), FormatId::Apk).unwrap();
+        assert_eq!(reader.format(), FormatId::Apk);
+        let entries = reader.entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path.to_string_lossy(), "hello.txt");
+    }
 
     #[test]
     fn probe_detects_pk_magic() {
