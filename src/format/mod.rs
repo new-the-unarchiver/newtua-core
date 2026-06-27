@@ -50,3 +50,6 @@ pub use sfx::SfxHandler;
 
 pub mod warc;
 pub use warc::WarcHandler;
+
+pub mod squashfs;
+pub use squashfs::SquashfsHandler;

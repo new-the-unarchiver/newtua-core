@@ -9,8 +9,8 @@ use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
     ArHandler, CabHandler, CondaHandler, CpioHandler, CrxHandler, DebHandler, IsoHandler,
-    MsiHandler, RarHandler, RpmHandler, SevenZHandler, SfxHandler, TarHandler, WarcHandler,
-    XarHandler, ZipBundleHandler, ZipHandler, bundle,
+    MsiHandler, RarHandler, RpmHandler, SevenZHandler, SfxHandler, SquashfsHandler, TarHandler,
+    WarcHandler, XarHandler, ZipBundleHandler, ZipHandler, bundle,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -50,6 +50,9 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
     handlers.push(Box::new(MsiHandler));
     // IsoHandler: detected by .iso extension; CD001 signature verified in open.
     handlers.push(Box::new(IsoHandler));
+    // SquashfsHandler: unique magic `hsqs` (no tie-break with peers); also
+    // detected by .squashfs/.sfs extension.
+    handlers.push(Box::new(SquashfsHandler));
     // SfxHandler: MZ → Confidence(50), below MAGIC(100), so real archives always
     // win. Carves the appended archive past the PE overlay and reopens it.
     handlers.push(Box::new(SfxHandler));
@@ -463,8 +466,8 @@ mod tests {
 
     #[test]
     fn registry_has_expected_handlers() {
-        // 14 базовых + zip-бандлы + CRX + Conda (самодокументируемо при росте).
-        assert_eq!(registry().len(), 14 + bundle::ZIP_BUNDLES.len() + 2);
+        // 15 базовых + zip-бандлы + CRX + Conda (самодокументируемо при росте).
+        assert_eq!(registry().len(), 15 + bundle::ZIP_BUNDLES.len() + 2);
     }
 
     #[test]

@@ -36,6 +36,10 @@ msi.workspace = true
 cdfs = "0.2.3"
 goblin.workspace = true
 warc.workspace = true
+# SquashFS (.squashfs/.sfs): pure-Rust reader. Default features add
+# gzip/xz/zstd/lz4 + parallel; `lzo` adds LZO. Reopens the file by path because
+# backhand's BufReadSeek requires Send.
+backhand = { workspace = true }
 lzw-z = { path = "../lzw-z" }
 # ZIP method-14 (LZMA) decode — see format/zip.rs::decode_zip_lzma.
 lzma-rs.workspace = true

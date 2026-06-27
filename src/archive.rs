@@ -45,6 +45,8 @@ pub enum FormatId {
     /// Пакет conda (`.conda`): внешний zip с `*.tar.zst`-членами; ридер
     /// разворачивает их и показывает слитое содержимое.
     Conda,
+    /// SquashFS read-only filesystem image (`.squashfs` / `.sfs`); via backhand.
+    Squashfs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
