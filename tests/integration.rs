@@ -21,6 +21,8 @@ mod brotli;
 mod bundles;
 #[path = "integration/cab_handler.rs"]
 mod cab_handler;
+#[path = "integration/conda.rs"]
+mod conda;
 #[path = "integration/cpio_handler.rs"]
 mod cpio_handler;
 #[path = "integration/deb_handler.rs"]
