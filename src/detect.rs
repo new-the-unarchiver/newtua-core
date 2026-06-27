@@ -16,7 +16,8 @@ use crate::volume::{ConcatReader, volume_members};
 
 /// Returns the full handler registry in priority order.
 pub fn registry() -> Vec<Box<dyn FormatHandler>> {
-    let mut handlers: Vec<Box<dyn FormatHandler>> = Vec::new();
+    let mut handlers: Vec<Box<dyn FormatHandler>> =
+        Vec::with_capacity(bundle::ZIP_BUNDLES.len() + 15);
     // Zip-бандлы ДОЛЖНЫ идти перед ZipHandler: они делят PK-магию, а селектор на
     // ничьей MAGIC берёт первого. Обычный .zip не совпадает ни с одним бандлом
     // (NONE) и проваливается в ZipHandler.
@@ -459,8 +460,8 @@ mod tests {
 
     #[test]
     fn registry_has_expected_handlers() {
-        // 14 базовых + 10 zip-бандлов + CRX.
-        assert_eq!(registry().len(), 25);
+        // 14 базовых + zip-бандлы + CRX (самодокументируемо при росте таблицы).
+        assert_eq!(registry().len(), 14 + bundle::ZIP_BUNDLES.len() + 1);
     }
 
     #[test]

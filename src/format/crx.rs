@@ -68,23 +68,23 @@ impl FormatHandler for CrxHandler {
             }
         };
 
-        // Фиксированный префикс: 12 байт (CRX3) или 16 (CRX2).
-        let mut head = vec![0u8; 12];
+        // Фиксированный префикс: 12 байт (CRX3) или 16 (CRX2). Читаем CRX3-часть
+        // первой и добираем 4 байта только для CRX2 — так на CRX3 с маленьким
+        // header_len мы не зачитываем байты вложенного zip.
+        let mut head = [0u8; 16];
         inner
-            .read_exact(&mut head)
+            .read_exact(&mut head[..12])
             .map_err(|e| Error::Corrupt(format!("crx header: {e}")))?;
         let version = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
         let consumed: u64 = if version == 2 {
-            let mut more = [0u8; 4];
             inner
-                .read_exact(&mut more)
+                .read_exact(&mut head[12..16])
                 .map_err(|e| Error::Corrupt(format!("crx2 header: {e}")))?;
-            head.extend_from_slice(&more);
             16
         } else {
             12
         };
-        let zip_offset = crx_zip_offset(&head)?;
+        let zip_offset = crx_zip_offset(&head[..consumed as usize])?;
         let skip = zip_offset
             .checked_sub(consumed)
             .ok_or_else(|| Error::Corrupt("crx: header overlaps zip".into()))?;
@@ -95,22 +95,13 @@ impl FormatHandler for CrxHandler {
             return Err(Error::Corrupt("crx: truncated before zip".into()));
         }
 
-        // Вырезать вложенный zip во временный файл (потоково, без RAM-пика).
+        // Вырезать вложенный zip во временный файл (потоково, без RAM-пика), затем
+        // открыть его по пути общим zip-движком — тот же приём, что у deb/sfx.
         let mut tmp = tempfile::NamedTempFile::new()?;
         std::io::copy(&mut inner, &mut tmp)?;
-        let file = tmp.reopen()?;
-        let reader = crate::format::zip::open_zip(
-            Source::Seekable {
-                inner: Box::new(file),
-                path: None,
-            },
-            opts,
-            FormatId::Crx,
-        )?;
-        Ok(Box::new(TempBackedReader::new(
-            reader,
-            tmp.into_temp_path(),
-        )))
+        let temp_path = tmp.into_temp_path();
+        let reader = crate::format::zip::open_zip(Source::path(&temp_path)?, opts, FormatId::Crx)?;
+        Ok(Box::new(TempBackedReader::new(reader, temp_path)))
     }
 }
 

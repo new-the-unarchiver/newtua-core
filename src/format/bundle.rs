@@ -37,9 +37,12 @@ impl FormatHandler for ZipBundleHandler {
     }
 
     fn probe(&self, header: &[u8], name: Option<&str>) -> Confidence {
-        let ext_ok = name
-            .map(|n| n.to_ascii_lowercase().ends_with(self.ext))
-            .unwrap_or(false);
+        // Сравниваем суффикс без аллокации и без учёта регистра; срез по байтам
+        // безопасен на любых именах (срез &str мог бы паниковать на мультибайте).
+        let ext_ok = name.is_some_and(|n| {
+            let (nb, eb) = (n.as_bytes(), self.ext.as_bytes());
+            nb.len() >= eb.len() && nb[nb.len() - eb.len()..].eq_ignore_ascii_case(eb)
+        });
         if ext_ok && header.starts_with(b"PK\x03\x04") {
             Confidence::MAGIC
         } else {
@@ -97,7 +100,6 @@ mod tests {
     #[test]
     fn table_covers_ten_bundle_formats() {
         assert_eq!(ZIP_BUNDLES.len(), 10);
-        let ids: Vec<FormatId> = ZIP_BUNDLES.iter().map(|&(_, f)| f).collect();
         for want in [
             FormatId::Jar,
             FormatId::Apk,
@@ -110,7 +112,10 @@ mod tests {
             FormatId::Ods,
             FormatId::Odp,
         ] {
-            assert!(ids.contains(&want), "table missing {want:?}");
+            assert!(
+                ZIP_BUNDLES.iter().any(|&(_, f)| f == want),
+                "table missing {want:?}"
+            );
         }
     }
 }
