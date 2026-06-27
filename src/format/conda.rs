@@ -8,12 +8,11 @@ use crate::error::{Error, Result};
 use crate::format::TarHandler;
 use crate::format::zip::open_zip;
 
-/// True, если имя `name` (в любом регистре) оканчивается на `.tar.zst` —
-/// признак payload-члена conda. Сравнение по байтам — безопасно на мультибайте
-/// (срез `&str` мог бы паниковать на не-границе символа).
-fn is_tar_zst(name: &str) -> bool {
-    let (nb, eb) = (name.as_bytes(), b".tar.zst".as_slice());
-    nb.len() >= eb.len() && nb[nb.len() - eb.len()..].eq_ignore_ascii_case(eb)
+/// Регистронезависимое сравнение байтового суффикса. Срез по байтам безопасен
+/// на любых именах (срез `&str` мог бы паниковать на не-границе символа).
+/// Используется и для расширения `.conda` (probe), и для `.tar.zst`-членов.
+fn ends_with_ascii_ci(bytes: &[u8], suffix: &[u8]) -> bool {
+    bytes.len() >= suffix.len() && bytes[bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 /// Распознаёт пакеты conda (`.conda`) и разворачивает их внутренние
@@ -26,12 +25,9 @@ impl FormatHandler for CondaHandler {
     }
 
     fn probe(&self, header: &[u8], name: Option<&str>) -> Confidence {
-        // Имя оканчивается на `.conda` (без аллокации, регистронезависимо; срез
-        // по байтам безопасен на мультибайте) И zip-магия PK.
-        let ext_ok = name.is_some_and(|n| {
-            let (nb, eb) = (n.as_bytes(), b".conda".as_slice());
-            nb.len() >= eb.len() && nb[nb.len() - eb.len()..].eq_ignore_ascii_case(eb)
-        });
+        // Имя оканчивается на `.conda` (без аллокации, регистронезависимо)
+        // И zip-магия PK.
+        let ext_ok = name.is_some_and(|n| ends_with_ascii_ci(n.as_bytes(), b".conda"));
         if ext_ok && header.starts_with(b"PK\x03\x04") {
             Confidence::MAGIC
         } else {
@@ -61,7 +57,9 @@ fn open_conda(src: Source, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>>
         .entries()?
         .iter()
         .enumerate()
-        .filter(|(_, e)| is_tar_zst(&e.path.to_string_lossy()))
+        // Фильтр по сырым байтам имени (path_raw): без аллокации Cow и без
+        // потери не-UTF-8 байт, в отличие от to_string_lossy.
+        .filter(|(_, e)| ends_with_ascii_ci(&e.path_raw, b".tar.zst"))
         .map(|(i, _)| i)
         .collect();
     if members.is_empty() {
@@ -138,14 +136,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_tar_zst_matches_suffix() {
-        assert!(is_tar_zst("pkg-foo-1.0.tar.zst"));
-        assert!(is_tar_zst("info-foo-1.0.tar.zst"));
-        assert!(is_tar_zst("X.TAR.ZST"));
-        assert!(!is_tar_zst("metadata.json"));
-        assert!(!is_tar_zst("foo.tar"));
-        assert!(!is_tar_zst("foo.zst"));
-        assert!(!is_tar_zst("zst"));
+    fn ends_with_ascii_ci_matches_suffix() {
+        let suf = b".tar.zst";
+        assert!(ends_with_ascii_ci(b"pkg-foo-1.0.tar.zst", suf));
+        assert!(ends_with_ascii_ci(b"info-foo-1.0.tar.zst", suf));
+        assert!(ends_with_ascii_ci(b"X.TAR.ZST", suf));
+        assert!(!ends_with_ascii_ci(b"metadata.json", suf));
+        assert!(!ends_with_ascii_ci(b"foo.tar", suf));
+        assert!(!ends_with_ascii_ci(b"foo.zst", suf));
+        assert!(!ends_with_ascii_ci(b"zst", suf));
     }
 
     #[test]
