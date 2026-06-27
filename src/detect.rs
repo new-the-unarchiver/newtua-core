@@ -8,9 +8,9 @@ use crate::archive::{
 use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
-    ArHandler, CabHandler, CpioHandler, DebHandler, IsoHandler, MsiHandler, RarHandler, RpmHandler,
-    SevenZHandler, SfxHandler, TarHandler, WarcHandler, XarHandler, ZipBundleHandler, ZipHandler,
-    bundle,
+    ArHandler, CabHandler, CpioHandler, CrxHandler, DebHandler, IsoHandler, MsiHandler, RarHandler,
+    RpmHandler, SevenZHandler, SfxHandler, TarHandler, WarcHandler, XarHandler, ZipBundleHandler,
+    ZipHandler, bundle,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -23,7 +23,8 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
     for &(ext, format) in bundle::ZIP_BUNDLES {
         handlers.push(Box::new(ZipBundleHandler::new(ext, format)));
     }
-    // CRX добавляется в Task 3 здесь (после бандлов, перед ZipHandler).
+    // CRX: уникальная магия `Cr24` (не PK), карвит вложенный zip из-за заголовка.
+    handlers.push(Box::new(CrxHandler));
     handlers.push(Box::new(ZipHandler));
     handlers.push(Box::new(CpioHandler));
     handlers.push(Box::new(SevenZHandler));
@@ -458,8 +459,8 @@ mod tests {
 
     #[test]
     fn registry_has_expected_handlers() {
-        // 14 базовых + 10 zip-бандлов (jar/apk/ipa/epub/docx/xlsx/pptx/odt/ods/odp).
-        assert_eq!(registry().len(), 24);
+        // 14 базовых + 10 zip-бандлов + CRX.
+        assert_eq!(registry().len(), 25);
     }
 
     #[test]

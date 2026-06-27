@@ -22,6 +22,9 @@ pub use zip::ZipHandler;
 pub mod bundle;
 pub use bundle::ZipBundleHandler;
 
+pub mod crx;
+pub use crx::CrxHandler;
+
 pub mod sevenz;
 pub use sevenz::SevenZHandler;
 

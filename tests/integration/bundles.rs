@@ -44,3 +44,17 @@ fn docx_reports_docx_and_extracts() {
         b"hello docx\n"
     );
 }
+
+#[test]
+fn crx3_reports_crx_and_extracts() {
+    let mut reader = open(&fixture("ext.crx"), &OpenOptions::default()).expect("open crx3");
+    assert_eq!(reader.format(), FormatId::Crx);
+    assert_eq!(body_of(reader.as_mut(), "background.js"), b"hello crx\n");
+}
+
+#[test]
+fn crx2_reports_crx_and_extracts() {
+    let mut reader = open(&fixture("ext2.crx"), &OpenOptions::default()).expect("open crx2");
+    assert_eq!(reader.format(), FormatId::Crx);
+    assert_eq!(body_of(reader.as_mut(), "background.js"), b"hello crx\n");
+}
