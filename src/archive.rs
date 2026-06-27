@@ -42,6 +42,9 @@ pub enum FormatId {
     Odp,
     /// Chrome-расширение: zip за заголовком `Cr24` (CRX2/CRX3).
     Crx,
+    /// Пакет conda (`.conda`): внешний zip с `*.tar.zst`-членами; ридер
+    /// разворачивает их и показывает слитое содержимое.
+    Conda,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

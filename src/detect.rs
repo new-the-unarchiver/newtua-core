@@ -8,16 +8,16 @@ use crate::archive::{
 use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
-    ArHandler, CabHandler, CpioHandler, CrxHandler, DebHandler, IsoHandler, MsiHandler, RarHandler,
-    RpmHandler, SevenZHandler, SfxHandler, TarHandler, WarcHandler, XarHandler, ZipBundleHandler,
-    ZipHandler, bundle,
+    ArHandler, CabHandler, CondaHandler, CpioHandler, CrxHandler, DebHandler, IsoHandler,
+    MsiHandler, RarHandler, RpmHandler, SevenZHandler, SfxHandler, TarHandler, WarcHandler,
+    XarHandler, ZipBundleHandler, ZipHandler, bundle,
 };
 use crate::volume::{ConcatReader, volume_members};
 
 /// Returns the full handler registry in priority order.
 pub fn registry() -> Vec<Box<dyn FormatHandler>> {
     let mut handlers: Vec<Box<dyn FormatHandler>> =
-        Vec::with_capacity(bundle::ZIP_BUNDLES.len() + 15);
+        Vec::with_capacity(bundle::ZIP_BUNDLES.len() + 16);
     // Zip-бандлы ДОЛЖНЫ идти перед ZipHandler: они делят PK-магию, а селектор на
     // ничьей MAGIC берёт первого. Обычный .zip не совпадает ни с одним бандлом
     // (NONE) и проваливается в ZipHandler.
@@ -26,6 +26,9 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
     }
     // CRX: уникальная магия `Cr24` (не PK), карвит вложенный zip из-за заголовка.
     handlers.push(Box::new(CrxHandler));
+    // Conda: zip + расширение `.conda`; делит PK-магию с zip (как бандлы), но
+    // разворачивает вложенные `*.tar.zst`. Должен идти перед ZipHandler.
+    handlers.push(Box::new(CondaHandler));
     handlers.push(Box::new(ZipHandler));
     handlers.push(Box::new(CpioHandler));
     handlers.push(Box::new(SevenZHandler));
@@ -460,8 +463,8 @@ mod tests {
 
     #[test]
     fn registry_has_expected_handlers() {
-        // 14 базовых + zip-бандлы + CRX (самодокументируемо при росте таблицы).
-        assert_eq!(registry().len(), 14 + bundle::ZIP_BUNDLES.len() + 1);
+        // 14 базовых + zip-бандлы + CRX + Conda (самодокументируемо при росте).
+        assert_eq!(registry().len(), 14 + bundle::ZIP_BUNDLES.len() + 2);
     }
 
     #[test]

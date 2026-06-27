@@ -25,6 +25,9 @@ pub use bundle::ZipBundleHandler;
 pub mod crx;
 pub use crx::CrxHandler;
 
+pub mod conda;
+pub use conda::CondaHandler;
+
 pub mod sevenz;
 pub use sevenz::SevenZHandler;
 
