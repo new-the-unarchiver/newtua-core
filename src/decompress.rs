@@ -172,8 +172,11 @@ mod tests {
         // marker and errors on read (UnexpectedEof). Robust-by-construction — not
         // tied to BROTLI_HELLO's length.
         let truncated = &BROTLI_HELLO[..4];
-        let mut r =
-            decompressor(Compressor::Brotli, Box::new(std::io::Cursor::new(truncated))).unwrap();
+        let mut r = decompressor(
+            Compressor::Brotli,
+            Box::new(std::io::Cursor::new(truncated)),
+        )
+        .unwrap();
         let mut out = Vec::new();
         assert!(r.read_to_end(&mut out).is_err());
     }
