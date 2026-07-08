@@ -47,6 +47,9 @@ pub enum FormatId {
     Conda,
     /// SquashFS read-only filesystem image (`.squashfs` / `.sfs`); via backhand.
     Squashfs,
+    /// AppImage single-file app: an ELF runtime with an appended SquashFS
+    /// (Type 2) or ISO 9660 (Type 1) filesystem, read from the computed offset.
+    AppImage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -53,3 +53,6 @@ pub use warc::WarcHandler;
 
 pub mod squashfs;
 pub use squashfs::SquashfsHandler;
+
+pub mod appimage;
+pub use appimage::AppImageHandler;
