@@ -61,7 +61,7 @@ impl FormatHandler for SquashfsHandler {
 /// Map a backhand error onto our model. Any parse/read failure (truncated image,
 /// unknown version, big-endian v3, unsupported inner compressor) is structural →
 /// `Corrupt`.
-fn map_backhand_err(e: backhand::BackhandError) -> Error {
+fn map_backhand_err(e: BackhandError) -> Error {
     Error::Corrupt(format!("squashfs: {e}"))
 }
 
