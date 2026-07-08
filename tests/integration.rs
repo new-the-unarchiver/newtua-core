@@ -13,6 +13,8 @@
 //! Fixtures are referenced via `env!("CARGO_MANIFEST_DIR")` or `include_bytes!`
 //! with `../fixtures/` (relative to the `integration/` subdir).
 
+#[path = "integration/appimage.rs"]
+mod appimage;
 #[path = "integration/ar_handler.rs"]
 mod ar_handler;
 #[path = "integration/brotli.rs"]
