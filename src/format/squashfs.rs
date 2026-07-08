@@ -53,8 +53,7 @@ impl FormatHandler for SquashfsHandler {
                 feature: "non-file source (squashfs requires a file path)".into(),
             })?
             .to_path_buf();
-        let reader = open_squashfs(&path)?;
-        Ok(Box::new(reader))
+        open_squashfs(&path, 0)
     }
 }
 
@@ -124,13 +123,15 @@ fn mtime_to_systime(mtime: u32) -> Option<SystemTime> {
     }
 }
 
-/// Open `path` as a SquashFS image and build the flat entry list.
-fn open_squashfs(path: &Path) -> Result<SquashfsReader> {
+/// Open the SquashFS image whose superblock begins at `offset` bytes into
+/// `path`, and build the flat entry list. `offset` is `0` for a bare `.squashfs`
+/// file and non-zero for an embedded image (e.g. an AppImage Type 2 payload).
+pub(crate) fn open_squashfs(path: &Path, offset: u64) -> Result<Box<dyn ArchiveReader>> {
     let file = std::fs::File::open(path)?;
     let buf = std::io::BufReader::new(file);
     // LE v4 with our custom decompressor (xz via xz2, everything else default).
     let kind = Kind::new_v4(&XZ_VIA_XZ2);
-    let fs = FilesystemReader::from_reader_with_offset_and_kind(buf, 0, kind)
+    let fs = FilesystemReader::from_reader_with_offset_and_kind(buf, offset, kind)
         .map_err(map_backhand_err)?;
 
     let mut entries: Vec<Entry> = Vec::new();
@@ -174,11 +175,11 @@ fn open_squashfs(path: &Path) -> Result<SquashfsReader> {
         bodies.push(body);
     }
 
-    Ok(SquashfsReader {
+    Ok(Box::new(SquashfsReader {
         fs,
         entries,
         bodies,
-    })
+    }))
 }
 
 /// Holds the `FilesystemReader` (owns the reopened file) plus the flat entry
