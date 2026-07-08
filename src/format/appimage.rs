@@ -1,9 +1,9 @@
 use crate::archive::{
     ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
 };
-use crate::detect::open_single;
+use crate::detect::TempBackedReader;
 use crate::error::{Error, Result};
-use crate::format::squashfs;
+use crate::format::{IsoHandler, squashfs};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -53,18 +53,20 @@ impl FormatHandler for AppImageHandler {
         if read_at(&path, offset, SQUASHFS_MAGIC.len())?.starts_with(SQUASHFS_MAGIC) {
             // Type 2: read the embedded SquashFS in place (no copy).
             let inner = squashfs::open_squashfs(&path, offset)?;
-            return Ok(Box::new(AppImageReader { inner, _temp: None }));
+            return Ok(Box::new(AppImageReader { inner }));
         }
         if read_at(&path, offset + ISO_SIG_OFFSET, ISO_SIG.len())?.starts_with(ISO_SIG) {
-            // Type 1: carve [offset..EOF] to a temp `.iso` and reuse the
-            // pipeline. The `.iso` suffix matters — IsoHandler is detected by
-            // extension, so an extensionless temp would not be recognized.
-            let temp_path = carve_to_temp_iso(&path, offset)?;
-            let inner = open_single(&temp_path, opts)?;
-            return Ok(Box::new(AppImageReader {
+            // Type 1: the filesystem is a known ISO 9660 (CD001 confirmed just
+            // above), so carve [offset..EOF] to a temp file and hand it to
+            // IsoHandler directly — no need to re-run format detection.
+            // TempBackedReader keeps the temp alive and reports AppImage.
+            let temp_path = carve_to_temp(&path, offset)?;
+            let inner = IsoHandler.open(Source::path(&temp_path)?, opts)?;
+            return Ok(Box::new(TempBackedReader::with_format(
                 inner,
-                _temp: Some(temp_path),
-            }));
+                temp_path,
+                FormatId::AppImage,
+            )));
         }
         Err(Error::Corrupt(
             "appimage: no squashfs/iso filesystem at the computed offset".into(),
@@ -78,17 +80,10 @@ impl FormatHandler for AppImageHandler {
 fn read_at(path: &Path, offset: u64, n: usize) -> Result<Vec<u8>> {
     let mut f = std::fs::File::open(path)?;
     f.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; n];
-    let mut filled = 0;
-    while filled < n {
-        match f.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(k) => filled += k,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(Error::Io(e)),
-        }
-    }
-    buf.truncate(filled);
+    // `read_to_end` retries on `Interrupted` and stops cleanly at EOF, so a short
+    // read yields a shorter `Vec` rather than an error — exactly what we want.
+    let mut buf = Vec::new();
+    f.take(n as u64).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
@@ -105,32 +100,37 @@ fn appimage_fs_offset(path: &Path) -> Result<u64> {
     }
     let is_64 = head[4] == 2; // EI_CLASS: 1 = 32-bit, 2 = 64-bit
     let le = head[5] != 2; // EI_DATA: 1 (or 0) = little-endian, 2 = big-endian
-    let u16_at = |o: usize| {
-        let b = [head[o], head[o + 1]];
+    // One LE/BE branch per integer width, reused symmetrically for ELF32/64.
+    // Every offset below is within the 64-byte header guaranteed above, so the
+    // `try_into` on the fixed-width slice never fails.
+    let u16_at = |o: usize| -> u16 {
+        let b: [u8; 2] = head[o..o + 2].try_into().unwrap();
         if le {
             u16::from_le_bytes(b)
         } else {
             u16::from_be_bytes(b)
         }
     };
-    let (shoff, shentsize, shnum) = if is_64 {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&head[0x28..0x30]);
-        let shoff = if le {
-            u64::from_le_bytes(b)
-        } else {
-            u64::from_be_bytes(b)
-        };
-        (shoff, u16_at(0x3a), u16_at(0x3c))
-    } else {
-        let mut b = [0u8; 4];
-        b.copy_from_slice(&head[0x20..0x24]);
-        let shoff = if le {
+    let u32_at = |o: usize| -> u32 {
+        let b: [u8; 4] = head[o..o + 4].try_into().unwrap();
+        if le {
             u32::from_le_bytes(b)
         } else {
             u32::from_be_bytes(b)
-        };
-        (u64::from(shoff), u16_at(0x2e), u16_at(0x30))
+        }
+    };
+    let u64_at = |o: usize| -> u64 {
+        let b: [u8; 8] = head[o..o + 8].try_into().unwrap();
+        if le {
+            u64::from_le_bytes(b)
+        } else {
+            u64::from_be_bytes(b)
+        }
+    };
+    let (shoff, shentsize, shnum) = if is_64 {
+        (u64_at(0x28), u16_at(0x3a), u16_at(0x3c))
+    } else {
+        (u64::from(u32_at(0x20)), u16_at(0x2e), u16_at(0x30))
     };
     let offset = shoff
         .checked_add(u64::from(shentsize) * u64::from(shnum))
@@ -144,23 +144,22 @@ fn appimage_fs_offset(path: &Path) -> Result<u64> {
     Ok(offset)
 }
 
-/// Carve `[offset..EOF]` from `path` into a temp file with a `.iso` suffix so
-/// the existing extension-based ISO detection recognizes it. The returned
-/// `TempPath` deletes the file on drop.
-fn carve_to_temp_iso(path: &Path, offset: u64) -> Result<tempfile::TempPath> {
+/// Carve `[offset..EOF]` from `path` into a temp file (streamed via
+/// `io::copy`, no full-file buffering). The returned `TempPath` deletes the
+/// file on drop.
+fn carve_to_temp(path: &Path, offset: u64) -> Result<tempfile::TempPath> {
     let mut src = std::fs::File::open(path)?;
     src.seek(SeekFrom::Start(offset))?;
-    let mut tmp = tempfile::Builder::new().suffix(".iso").tempfile()?;
+    let mut tmp = tempfile::NamedTempFile::new()?;
     std::io::copy(&mut src, tmp.as_file_mut())?;
     Ok(tmp.into_temp_path())
 }
 
-/// Wraps the embedded filesystem's reader so `format()` reports `AppImage`, and
-/// (Type 1 only) keeps the carved temp file alive for the reader's lifetime.
+/// Wraps the embedded filesystem's reader so `format()` reports `AppImage`.
+/// Used for Type 2 (SquashFS read in place — no temp file); Type 1 uses
+/// [`TempBackedReader`], which already keeps its carved temp alive.
 struct AppImageReader {
     inner: Box<dyn ArchiveReader>,
-    /// `Some` for Type 1 (carved temp); `None` for Type 2 (read in place).
-    _temp: Option<tempfile::TempPath>,
 }
 
 impl ArchiveReader for AppImageReader {
