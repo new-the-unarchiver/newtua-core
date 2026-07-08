@@ -55,6 +55,8 @@ mod sevenz_handler;
 mod sfx_handler;
 #[path = "integration/source.rs"]
 mod source;
+#[path = "integration/squashfs.rs"]
+mod squashfs;
 #[path = "integration/tar_handler.rs"]
 mod tar_handler;
 #[path = "integration/volume_open.rs"]
