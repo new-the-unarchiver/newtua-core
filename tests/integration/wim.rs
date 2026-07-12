@@ -83,17 +83,11 @@ fn wim_lzx_extracts_tree() {
 }
 
 #[test]
-fn wim_lzms_esd_is_unsupported_not_corrupt() {
-    let err = open(&fixture("wim_lzms.esd"), &OpenOptions::default())
-        .err()
-        .expect(".esd (LZMS) must fail to open in task 20a");
-    match err {
-        Error::Unsupported { format, feature } => {
-            assert_eq!(format, "wim");
-            assert!(feature.to_ascii_lowercase().contains("lzms"), "{feature}");
-        }
-        other => panic!("expected Unsupported, got {other:?}"),
-    }
+fn wim_lzms_extracts_tree() {
+    let mut reader =
+        open(&fixture("wim_lzms.esd"), &OpenOptions::default()).expect("open wim lzms");
+    assert_eq!(reader.format(), FormatId::Wim);
+    assert_standard_tree(reader.as_mut());
 }
 
 #[test]

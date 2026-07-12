@@ -30,7 +30,10 @@ pub(crate) enum Compressor {
     /// differences documented on that module. See
     /// `task_n_reports/report-20c-mscompress-lzx.md`.
     Lzx,
-    /// Detected but not decodable at all (no decoder yet) — task 20d.
+    /// Decoded via `newtua_mscompress::lzms` (task 20d) — a direct
+    /// translation of wimlib's LZMS decoder (no permissively licensed Rust
+    /// donor exists for this codec). See
+    /// `task_n_reports/report-20d-mscompress-lzms.md`.
     Lzms,
 }
 
@@ -290,10 +293,7 @@ fn decode_one_chunk(
     match compressor {
         Compressor::Xpress => decode_xpress_chunk(compressed, uncompressed_len),
         Compressor::Lzx => decode_lzx_chunk(compressed, uncompressed_len),
-        Compressor::Lzms => Err(Error::Unsupported {
-            format: "wim".into(),
-            feature: "LZMS compression (.esd)".into(),
-        }),
+        Compressor::Lzms => decode_lzms_chunk(compressed, uncompressed_len),
     }
 }
 
@@ -310,6 +310,13 @@ fn decode_xpress_chunk(compressed: &[u8], uncompressed_len: usize) -> Result<Vec
 fn decode_lzx_chunk(compressed: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
     newtua_mscompress::lzx::decompress_chunk(compressed, uncompressed_len)
         .map_err(|e| Error::Corrupt(format!("wim: lzx chunk decode: {e}")))
+}
+
+/// Decode one WIM-LZMS (`.esd`) chunk via `newtua_mscompress` (task 20d).
+/// Same externally-supplied-length convention as [`decode_xpress_chunk`].
+fn decode_lzms_chunk(compressed: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
+    newtua_mscompress::lzms::decompress_chunk(compressed, uncompressed_len)
+        .map_err(|e| Error::Corrupt(format!("wim: lzms chunk decode: {e}")))
 }
 
 // ── Metadata resource: directory tree ───────────────────────────────────
@@ -594,13 +601,6 @@ impl FormatHandler for WimHandler {
                 ),
             });
         }
-        if header.compressor == Some(Compressor::Lzms) {
-            return Err(Error::Unsupported {
-                format: "wim".into(),
-                feature: "LZMS compression (.esd) — see task 20d".into(),
-            });
-        }
-
         let lookup_bytes = read_resource(
             &mut *inner,
             header.chunk_size,
@@ -1004,15 +1004,23 @@ mod tests {
     }
 
     #[test]
-    fn decode_one_chunk_lzms_is_unsupported() {
-        let err = decode_one_chunk(b"compressed-ish", 100, Compressor::Lzms).unwrap_err();
-        match err {
-            Error::Unsupported { format, feature } => {
-                assert_eq!(format, "wim");
-                assert!(feature.to_ascii_lowercase().contains("lzms"));
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+    fn decode_lzms_chunk_maps_decoder_errors_to_corrupt() {
+        let err = decode_lzms_chunk(&[], 2).unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_one_chunk_lzms_delegates_to_newtua_mscompress() {
+        // Not stored (len mismatch) and too short to be a valid LZMS chunk:
+        // must route through the lzms module (task 20d) and surface its
+        // error as Corrupt, not stay Unsupported. Real successful LZMS
+        // decode is covered end-to-end by `wim_lzms_extracts_tree`
+        // (`tests/integration/wim.rs`) against the real `wim_lzms.esd`
+        // fixture — hand-building a valid LZMS byte stream here isn't
+        // practical (its adaptive Huffman codes depend on the exact
+        // frequency history, unlike LZX's simple uncompressed-block framing).
+        let err = decode_one_chunk(b"xx", 100, Compressor::Lzms).unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
     }
 
     #[test]
