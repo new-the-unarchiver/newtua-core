@@ -50,6 +50,9 @@ pub enum FormatId {
     /// AppImage single-file app: an ELF runtime with an appended SquashFS
     /// (Type 2) or ISO 9660 (Type 1) filesystem, read from the computed offset.
     AppImage,
+    /// WIM (`.wim`/`.esd`/`.swm`) Windows install image: a SHA-1-addressed
+    /// resource store plus a metadata resource holding the directory tree.
+    Wim,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

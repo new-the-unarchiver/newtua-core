@@ -56,3 +56,6 @@ pub use squashfs::SquashfsHandler;
 
 pub mod appimage;
 pub use appimage::AppImageHandler;
+
+pub mod wim;
+pub use wim::WimHandler;

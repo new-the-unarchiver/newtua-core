@@ -65,6 +65,8 @@ mod tar_handler;
 mod volume_open;
 #[path = "integration/warc_handler.rs"]
 mod warc_handler;
+#[path = "integration/wim.rs"]
+mod wim;
 #[path = "integration/xar_handler.rs"]
 mod xar_handler;
 #[path = "integration/zip_handler.rs"]

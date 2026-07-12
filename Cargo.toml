@@ -44,6 +44,8 @@ backhand = { workspace = true }
 lzw-z = { path = "../lzw-z" }
 # ZIP method-14 (LZMA) decode — see format/zip.rs::decode_zip_lzma.
 lzma-rs.workspace = true
+# WIM (.wim/.esd) resource chunk decoding: XPRESS-Huffman. See format/wim.rs.
+newtua-mscompress = { path = "../newtua-mscompress" }
 
 [features]
 default = []
