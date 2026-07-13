@@ -260,9 +260,8 @@ fn build_synthetic_dmg(mish: &[u8]) -> Vec<u8> {
 #[test]
 fn dmg_without_hfsplus_inside_is_clean_error() {
     // One ZERO_FILL chunk covering 8 sectors -- the assembled raw image stays
-    // all-zero, so no HFS+ volume header is ever found. Exercises the "not
-    // found" tail of the locate-HFS+ scan without needing a real APFS image
-    // (out of scope, #21c).
+    // all-zero, so neither an HFS+ volume header nor an APFS NXSB magic is
+    // ever found. Exercises the "not found" tail of both locate-volume sweeps.
     let mish = synthetic_mish(0, 8, &[(0x0000_0000, 0, 8, 0, 0)]);
     let file_bytes = build_synthetic_dmg(&mish);
 

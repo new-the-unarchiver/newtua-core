@@ -3,7 +3,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hfsplus::{EntryKind as HfsEntryKind, HfsPlusError, HfsVolume};
+use memmap2::Mmap;
 
 use crate::archive::{
     ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
@@ -18,10 +18,19 @@ pub(crate) const HFSX_SIGNATURE: u16 = 0x4858;
 pub(crate) const VOLUME_HEADER_OFFSET: u64 = 1024;
 /// Seconds between the HFS+ epoch (1904-01-01 00:00 GMT) and the Unix epoch.
 const HFS_EPOCH_TO_UNIX_EPOCH_SECS: u64 = 2_082_844_800;
+/// `HFSPlusBSDInfo.fileMode` high nibble mask and the symlink bit pattern
+/// within it (`S_IFMT`/`S_IFLNK`, matching the reserved TN1150 field
+/// `hfsplus-forensic::HfsStat::mode` now surfaces).
+const S_IFMT: u16 = 0xF000;
+const S_IFLNK: u16 = 0xA000;
 
-/// Reads HFS+/HFSX filesystem images via the `hfsplus` crate: a bare volume
+/// Reads HFS+/HFSX filesystem images via the vendored `hfsplus-forensic`
+/// crate (`crates/hfsplus-forensic/`, see its `VENDORED.md`): a bare volume
 /// (`.hfs`/`.hfsplus`/`.hfsx`, as produced by `newfs_hfs`) or, via
 /// [`open_hfsplus`], the filesystem embedded inside a DMG image (#21b).
+/// Transparently-compressed (`decmpfs`) files are decoded on read — the
+/// reason #21a's `hfsplus` (Dil4rd) backend was replaced (#21a2), which
+/// silently returned an empty body for them.
 pub struct HfsPlusHandler;
 
 impl FormatHandler for HfsPlusHandler {
@@ -51,9 +60,9 @@ impl FormatHandler for HfsPlusHandler {
     }
 
     fn open(&self, src: Source, _opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
-        // The `hfsplus` reader isn't reopened from the boxed Source (it needs
-        // an owned, `'static` Read+Seek); reopen by path instead, like
-        // squashfs/7z/rar. A pathless source (pure stream) is unsupported.
+        // `hfsplus-forensic` reads over a byte buffer (mmap), which needs a
+        // real path; reopen by path instead, like squashfs/7z/rar. A pathless
+        // source (pure stream) is unsupported.
         let path = src
             .file_path()
             .ok_or_else(|| Error::Unsupported {
@@ -63,15 +72,6 @@ impl FormatHandler for HfsPlusHandler {
             .to_path_buf();
         open_hfsplus(&path, 0)
     }
-}
-
-/// Map any `hfsplus` crate error onto our model. Every failure the crate can
-/// raise past a successful signature check (bad B-tree, corrupted catalog
-/// record, truncated read) is structural — never a distinction our callers
-/// need — so it all becomes `Corrupt`, mirroring `map_backhand_err` in
-/// squashfs.rs.
-fn map_hfs_err(e: HfsPlusError) -> Error {
-    Error::Corrupt(format!("hfsplus: {e}"))
 }
 
 /// Convert an HFS+ date (seconds since 1904-01-01 00:00 GMT) to `SystemTime`.
@@ -85,13 +85,20 @@ fn hfs_date_to_systime(date: u32) -> Option<SystemTime> {
     }
 }
 
+/// True when a catalog file record's `(is_dir, mode)` mark it as a symlink
+/// (`HFSPlusBSDInfo.fileMode & S_IFMT == S_IFLNK`). Folders are never
+/// symlinks — `hfsplus-forensic` always reports `mode == 0` for them.
+fn is_symlink_mode(is_dir: bool, mode: u16) -> bool {
+    !is_dir && (mode & S_IFMT) == S_IFLNK
+}
+
 /// Wraps a `File` so that logical position 0 is `base` bytes into the
 /// underlying file, and reads never cross past `base + len` (`len` is the
-/// remaining tail of the file from `base`). `HfsVolume::open` always seeks to
-/// an *absolute* `Start(1024)` from the reader's own position 0; when the
-/// volume is embedded at a partition offset (DMG, #21b) this adapter makes
-/// that absolute seek land on the volume's real Volume Header.
-struct OffsetReader {
+/// remaining tail of the file from `base`). `pub(crate)` so `format/apfs.rs`
+/// (#21c) can reuse the same offset semantics for its own absolute
+/// `seek(Start(0))` reads. HFS+ itself no longer uses this (mmap + slice
+/// covers offset directly, see [`open_hfsplus`]) — kept for apfs.rs (#21c).
+pub(crate) struct OffsetReader {
     file: File,
     base: u64,
     len: u64,
@@ -100,7 +107,7 @@ struct OffsetReader {
 }
 
 impl OffsetReader {
-    fn new(mut file: File, base: u64) -> Result<OffsetReader> {
+    pub(crate) fn new(mut file: File, base: u64) -> Result<OffsetReader> {
         let total_len = file.metadata()?.len();
         let len = total_len.saturating_sub(base);
         // Land the underlying file's physical position on `base` up front:
@@ -155,90 +162,91 @@ impl Seek for OffsetReader {
 /// larger image (e.g. a partition inside a DMG, #21b).
 pub(crate) fn open_hfsplus(path: &Path, offset: u64) -> Result<Box<dyn ArchiveReader>> {
     let file = File::open(path)?;
-    if offset == 0 {
-        open_hfsplus_reader(file)
-    } else {
-        open_hfsplus_reader(OffsetReader::new(file, offset)?)
-    }
-}
-
-fn open_hfsplus_reader<R: Read + Seek + 'static>(mut reader: R) -> Result<Box<dyn ArchiveReader>> {
-    // Validate the H+/HX signature ourselves, on the same reader the crate
-    // will use, before handing it off. A non-HFS+ input (legacy HFS `BD`,
-    // APFS `NXSB`, garbage, or a file too short to hold the header) yields a
-    // clean `UnknownFormat` instead of leaking the crate's own error type.
-    reader.seek(SeekFrom::Start(VOLUME_HEADER_OFFSET))?;
-    let mut sig = [0u8; 2];
-    reader
-        .read_exact(&mut sig)
-        .map_err(|_| Error::UnknownFormat)?;
-    let signature = u16::from_be_bytes(sig);
-    if signature != HFS_PLUS_SIGNATURE && signature != HFSX_SIGNATURE {
+    // SAFETY: the mapping is only read through this handle for the reader's
+    // lifetime; nothing in this process writes to `path` concurrently. The
+    // usual memmap2 caveat (another process truncating/mutating the file
+    // underneath the mapping is UB) is outside this tool's threat model —
+    // same acceptance as ripgrep and other local-file mmap readers.
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|_| Error::UnknownFormat)?;
+    let offset = usize::try_from(offset).map_err(|_| Error::UnknownFormat)?;
+    if offset > mmap.len() {
         return Err(Error::UnknownFormat);
     }
-    reader.seek(SeekFrom::Start(0))?;
+    let volume = &mmap[offset..];
+    // `parse` validates both the H+/HX signature at 1024 and that the buffer
+    // is long enough to hold the Volume Header; anything else (too short, no
+    // signature, legacy HFS `BD`, APFS `NXSB`, garbage) is `None`.
+    hfsplus_forensic::parse(volume).ok_or(Error::UnknownFormat)?;
+    let (entries, cnids) = build_entries(volume)?;
 
-    let mut vol = HfsVolume::open(reader).map_err(map_hfs_err)?;
-    let walk = vol.walk().map_err(map_hfs_err)?;
+    Ok(Box::new(HfsPlusReader {
+        mmap,
+        offset,
+        entries,
+        cnids,
+    }))
+}
 
-    let mut entries = Vec::with_capacity(walk.len());
-    let mut paths = Vec::with_capacity(walk.len());
-    for w in walk {
-        let rel = w.path.strip_prefix('/').unwrap_or(&w.path);
-        if rel.is_empty() {
-            continue; // the root entry itself
-        }
+/// Walk the catalog and build the flat `Entry` list plus a parallel CNID
+/// vector (the key `read_file`/`stat` need) for on-demand extraction by
+/// index. Called only after the caller has confirmed the H+/HX signature, so
+/// a `None` from the crate here means a structurally broken catalog, not an
+/// unrecognised format — `Corrupt`, not `UnknownFormat`.
+fn build_entries(volume: &[u8]) -> Result<(Vec<Entry>, Vec<u32>)> {
+    let walked = hfsplus_forensic::walk(volume)
+        .ok_or_else(|| Error::Corrupt("hfsplus: catalog B-tree unreadable".into()))?;
 
-        let kind = match w.entry.kind {
-            HfsEntryKind::Directory => EntryKind::Dir,
-            HfsEntryKind::File => EntryKind::File,
-            HfsEntryKind::Symlink => {
-                // The symlink target is stored as the data fork's content.
-                let target = vol
-                    .read_file(&w.path)
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
-                    .map(PathBuf::from)
-                    .unwrap_or_default();
-                EntryKind::Symlink { target }
-            }
-        };
-        let size = if kind == EntryKind::File {
-            w.entry.size
+    let mut entries = Vec::with_capacity(walked.len());
+    let mut cnids = Vec::with_capacity(walked.len());
+    for w in walked {
+        let st = hfsplus_forensic::stat(volume, w.cnid).ok_or_else(|| {
+            Error::Corrupt(format!("hfsplus: no catalog record for cnid {}", w.cnid))
+        })?;
+
+        let kind = if is_symlink_mode(w.is_dir, st.mode) {
+            // The symlink target is stored as the data fork's content.
+            let target = hfsplus_forensic::read_file(volume, w.cnid)
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            EntryKind::Symlink { target }
+        } else if w.is_dir {
+            EntryKind::Dir
         } else {
-            0
+            EntryKind::File
         };
+        let size = if kind == EntryKind::File { st.size } else { 0 };
 
         entries.push(Entry {
-            path_raw: rel.as_bytes().to_vec(),
-            path: PathBuf::from(rel),
+            path_raw: w.path.as_bytes().to_vec(),
+            path: PathBuf::from(&w.path),
             kind,
             size,
             mode: None,
             is_encrypted: false,
-            modified: hfs_date_to_systime(w.entry.modify_date),
+            modified: hfs_date_to_systime(st.modified),
         });
-        paths.push(w.path);
+        cnids.push(w.cnid);
     }
 
-    Ok(Box::new(HfsPlusReader {
-        vol,
-        entries,
-        paths,
-    }))
+    Ok((entries, cnids))
 }
 
-/// Holds the opened `HfsVolume` (owns the reader) plus the flat entry list and
-/// a parallel `paths` vector (the crate's original, `/`-prefixed path — the
-/// key `read_file_to` needs) for on-demand extraction by index.
-struct HfsPlusReader<R: Read + Seek> {
-    vol: HfsVolume<R>,
+/// Holds the memory-mapped volume plus the flat entry list and a parallel
+/// `cnids` vector (catalog node ID per entry, for `read_file`/`stat` by
+/// index). `mmap` lives for as long as the reader — for DMG (#21b),
+/// `TempBackedReader` drops this reader (and so the mapping) before deleting
+/// the backing temp file.
+struct HfsPlusReader {
+    mmap: Mmap,
+    /// Byte offset of the volume's start within `mmap` (0 for a bare file).
+    offset: usize,
     entries: Vec<Entry>,
-    /// Parallel to `entries`: the crate's own path string for each entry.
-    paths: Vec<String>,
+    /// Parallel to `entries`: the catalog node ID for on-demand extraction.
+    cnids: Vec<u32>,
 }
 
-impl<R: Read + Seek> ArchiveReader for HfsPlusReader<R> {
+impl ArchiveReader for HfsPlusReader {
     fn format(&self) -> FormatId {
         FormatId::HfsPlus
     }
@@ -254,9 +262,14 @@ impl<R: Read + Seek> ArchiveReader for HfsPlusReader<R> {
         if self.entries[idx].kind != EntryKind::File {
             return Ok(()); // directory or symlink — no body to extract
         }
-        self.vol
-            .read_file_to(&self.paths[idx], out)
-            .map_err(map_hfs_err)?;
+        let volume = &self.mmap[self.offset..];
+        let cnid = self.cnids[idx];
+        // Already decodes decmpfs (zlib/LZVN/LZFSE, inline or resource-fork)
+        // transparently; `None` means an unrecognised/undecodable file —
+        // never a misleading empty body.
+        let bytes = hfsplus_forensic::read_file(volume, cnid)
+            .ok_or_else(|| Error::Corrupt(format!("hfsplus: failed to read/decode cnid {cnid}")))?;
+        out.write_all(&bytes)?;
         Ok(())
     }
 }
@@ -264,7 +277,6 @@ impl<R: Read + Seek> ArchiveReader for HfsPlusReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     // ── id / probe ───────────────────────────────────────────────────────────
 
@@ -351,6 +363,23 @@ mod tests {
         assert_eq!(t, UNIX_EPOCH + Duration::from_secs(one_day));
     }
 
+    // ── symlink mode classification ─────────────────────────────────────────
+
+    #[test]
+    fn symlink_mode_is_detected() {
+        assert!(is_symlink_mode(false, 0xA1ED)); // S_IFLNK | 0755-ish, real value seen on macOS
+    }
+
+    #[test]
+    fn regular_file_mode_is_not_symlink() {
+        assert!(!is_symlink_mode(false, 0x81A4)); // S_IFREG | 0644
+    }
+
+    #[test]
+    fn folder_is_never_symlink_even_with_stray_mode_bits() {
+        assert!(!is_symlink_mode(true, 0xA1ED));
+    }
+
     // ── offset adapter ───────────────────────────────────────────────────────
 
     fn write_temp(bytes: &[u8]) -> tempfile::NamedTempFile {
@@ -428,40 +457,8 @@ mod tests {
         assert_eq!(buf, data);
     }
 
-    // ── open_hfsplus / open_hfsplus_reader (signature validation only;
-    //    fixture-backed listing/extraction lives in the integration suite) ──
-
-    #[test]
-    fn open_hfsplus_reader_rejects_truncated_input() {
-        let short = Cursor::new(vec![0u8; 600]); // shorter than the 1024 header offset
-        let err = open_hfsplus_reader(short).err().expect("must error");
-        assert!(matches!(err, Error::UnknownFormat), "got {err:?}");
-    }
-
-    #[test]
-    fn open_hfsplus_reader_rejects_bad_signature() {
-        let mut bytes = vec![0u8; 1024 + 2];
-        bytes[1024..1026].copy_from_slice(&[0x00, 0x00]); // neither H+ nor HX
-        let err = open_hfsplus_reader(Cursor::new(bytes))
-            .err()
-            .expect("must error");
-        assert!(matches!(err, Error::UnknownFormat), "got {err:?}");
-    }
-
-    #[test]
-    fn open_hfsplus_reader_rejects_legacy_hfs_bd_signature() {
-        let mut bytes = vec![0u8; 1024 + 2];
-        bytes[1024..1026].copy_from_slice(&[0x42, 0x44]); // 'BD' legacy HFS
-        let err = open_hfsplus_reader(Cursor::new(bytes))
-            .err()
-            .expect("must error");
-        assert!(matches!(err, Error::UnknownFormat), "got {err:?}");
-    }
-
-    // ── open_hfsplus with a non-zero offset (the mechanism #21b/DMG relies on) ─
-    //
-    // `open_hfsplus` is `pub(crate)`, so this must live here rather than in the
-    // integration suite (an external crate that only sees the public API).
+    // ── open_hfsplus (signature/bounds validation; fixture-backed listing/
+    //    extraction lives in the integration suite) ─────────────────────────
 
     fn fixture_bytes(name: &str) -> Vec<u8> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -469,6 +466,43 @@ mod tests {
             .join(name);
         std::fs::read(path).expect("read fixture")
     }
+
+    /// Assert `open_hfsplus` rejects `bytes` at `offset` with `UnknownFormat`
+    /// (never a panic) — the shared shape of every signature/bounds rejection.
+    fn assert_unknown_format(bytes: &[u8], offset: u64) {
+        let tmp = write_temp(bytes);
+        let err = open_hfsplus(tmp.path(), offset).err().expect("must error");
+        assert!(matches!(err, Error::UnknownFormat), "got {err:?}");
+    }
+
+    #[test]
+    fn open_hfsplus_rejects_truncated_input() {
+        assert_unknown_format(&[0u8; 600], 0); // shorter than the 1024 header offset
+    }
+
+    #[test]
+    fn open_hfsplus_rejects_bad_signature() {
+        let mut bytes = vec![0u8; 1024 + 52];
+        bytes[1024..1026].copy_from_slice(&[0x00, 0x00]); // neither H+ nor HX
+        assert_unknown_format(&bytes, 0);
+    }
+
+    #[test]
+    fn open_hfsplus_rejects_legacy_hfs_bd_signature() {
+        let mut bytes = vec![0u8; 1024 + 52];
+        bytes[1024..1026].copy_from_slice(&[0x42, 0x44]); // 'BD' legacy HFS
+        assert_unknown_format(&bytes, 0);
+    }
+
+    #[test]
+    fn open_hfsplus_offset_beyond_file_is_unknown_format_not_panic() {
+        assert_unknown_format(b"short file", 1_000_000);
+    }
+
+    // ── open_hfsplus with a non-zero offset (the mechanism #21b/DMG relies on) ─
+    //
+    // `open_hfsplus` is `pub(crate)`, so this must live here rather than in the
+    // integration suite (an external crate that only sees the public API).
 
     #[test]
     fn open_hfsplus_with_offset_matches_zero_offset() {

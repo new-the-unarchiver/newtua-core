@@ -8,10 +8,10 @@ use crate::archive::{
 use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
-    AppImageHandler, ArHandler, CabHandler, CondaHandler, CpioHandler, CrxHandler, DebHandler,
-    DmgHandler, HfsPlusHandler, IsoHandler, MsiHandler, RarHandler, RpmHandler, SevenZHandler,
-    SfxHandler, SquashfsHandler, TarHandler, WarcHandler, WimHandler, XarHandler, ZipBundleHandler,
-    ZipHandler, bundle,
+    ApfsHandler, AppImageHandler, ArHandler, CabHandler, CondaHandler, CpioHandler, CrxHandler,
+    DebHandler, DmgHandler, HfsPlusHandler, IsoHandler, MsiHandler, RarHandler, RpmHandler,
+    SevenZHandler, SfxHandler, SquashfsHandler, TarHandler, WarcHandler, WimHandler, XarHandler,
+    ZipBundleHandler, ZipHandler, bundle,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -71,6 +71,10 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
     // signature at offset 1024 is past the registry's 512-byte peek, same
     // situation as ISO); no tie-break with peers.
     handlers.push(Box::new(HfsPlusHandler));
+    // ApfsHandler: unlike HFS+, `NXSB` at offset 32 IS reachable within the
+    // registry's 512-byte peek, so this probe actually fires (also detected
+    // by .apfs extension); no tie-break with peers.
+    handlers.push(Box::new(ApfsHandler));
     // DmgHandler: detected by .dmg extension (the koly trailer lives in the
     // last 512 bytes, unreachable from the registry's header peek, same
     // situation as HFS+/ISO). Registered for uniform enumeration, but this
@@ -500,8 +504,8 @@ mod tests {
 
     #[test]
     fn registry_has_expected_handlers() {
-        // 19 базовых + zip-бандлы + CRX + Conda (самодокументируемо при росте).
-        assert_eq!(registry().len(), 19 + bundle::ZIP_BUNDLES.len() + 2);
+        // 20 базовых + zip-бандлы + CRX + Conda (самодокументируемо при росте).
+        assert_eq!(registry().len(), 20 + bundle::ZIP_BUNDLES.len() + 2);
     }
 
     #[test]

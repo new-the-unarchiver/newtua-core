@@ -60,8 +60,12 @@ pub enum FormatId {
     HfsPlus,
     /// DMG (`.dmg`) Apple Disk Image, UDIF container: koly trailer + XML plist
     /// blkx/mish chunk tables, decoded into a raw disk image and handed to the
-    /// filesystem layer inside (HFS+ for now; APFS is #21c).
+    /// filesystem layer inside (HFS+ or APFS).
     Dmg,
+    /// APFS (Apple File System) read-only filesystem: a bare container (`NXSB`
+    /// magic) or the filesystem layer inside a DMG image. Supports transparent
+    /// `decmpfs` decompression, unlike the HFS+ handler.
+    Apfs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -150,6 +150,99 @@ fn bad_signature_is_unknown_format() {
     assert!(is_unknown_format, "expected UnknownFormat");
 }
 
+/// The compressible source `ditto --hfsCompression` encoded into
+/// `hfs_decmpfs.hfs`'s `bigfile.txt` (see task_n_reports/report-21a2-hfsplus-decmpfs.md
+/// §3 for how the fixture was generated). Regenerated deterministically here
+/// instead of committing a second large blob for comparison.
+fn decmpfs_source_bytes() -> Vec<u8> {
+    b"The quick brown fox jumps over the lazy dog. ".repeat(4000)
+}
+
+#[test]
+fn decmpfs_file_decompresses_fully() {
+    let mut reader =
+        open(&fixture("hfs_decmpfs.hfs"), &OpenOptions::default()).expect("open hfs_decmpfs");
+    let entries = reader.entries().expect("entries");
+    let bigfile = entries
+        .iter()
+        .find(|e| e.path.to_string_lossy() == "bigfile.txt")
+        .expect("bigfile.txt present");
+    assert_eq!(bigfile.kind, EntryKind::File);
+
+    let expected = decmpfs_source_bytes();
+    let body = body_of(reader.as_mut(), "bigfile.txt");
+    assert_eq!(
+        body.len(),
+        expected.len(),
+        "decmpfs must decode to the full original length, not an empty/partial body"
+    );
+    assert_eq!(
+        body, expected,
+        "decmpfs output must match the original file byte-for-byte"
+    );
+}
+
+#[test]
+fn symlink_is_typed_and_targets_original() {
+    let mut reader =
+        open(&fixture("hfs_decmpfs.hfs"), &OpenOptions::default()).expect("open hfs_decmpfs");
+    let target = {
+        let entries = reader.entries().expect("entries");
+        let link = entries
+            .iter()
+            .find(|e| e.path.to_string_lossy() == "link_to_bigfile")
+            .expect("link_to_bigfile present");
+        match &link.kind {
+            EntryKind::Symlink { target } => target.to_string_lossy().into_owned(),
+            other => panic!("expected Symlink, got {other:?}"),
+        }
+    };
+    assert_eq!(target, "bigfile.txt");
+    // A symlink has no extractable body (its "content" is the target path).
+    assert!(
+        body_of(reader.as_mut(), "link_to_bigfile").is_empty(),
+        "symlink body must be empty, not the target's data fork"
+    );
+}
+
+#[test]
+fn undecodable_decmpfs_is_corrupt_not_empty() {
+    // Corrupt the `com.apple.decmpfs` xattr's `compression_type` field (the
+    // 4 bytes right after the 'fpmc' magic) to an undocumented value, so
+    // `hfsplus_forensic::read_file` fails loud (`None`) instead of returning
+    // any body. `hfsplus.rs::read_entry` must map that to `Corrupt`, never a
+    // silent empty/wrong extraction (the exact #21a bug #21a2 exists to fix).
+    let mut bytes = std::fs::read(fixture("hfs_decmpfs.hfs")).expect("read fixture");
+    let magic = b"fpmc";
+    let pos = bytes
+        .windows(magic.len())
+        .position(|w| w == magic)
+        .expect("decmpfs magic 'fpmc' present in fixture");
+    // compression_type is the 4 bytes (LE) right after the 4-byte magic.
+    bytes[pos + 4..pos + 8].copy_from_slice(&255u32.to_le_bytes());
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let path = tmp_dir.path().join("corrupted_decmpfs.hfs");
+    std::fs::write(&path, &bytes).expect("write corrupted");
+
+    let mut reader = open(&path, &OpenOptions::default()).expect("open corrupted image");
+    let idx = reader
+        .entries()
+        .expect("entries")
+        .iter()
+        .position(|e| e.path.to_string_lossy() == "bigfile.txt")
+        .expect("bigfile.txt present");
+    let mut sink = Vec::new();
+    let err = reader
+        .read_entry(idx, &mut sink)
+        .expect_err("undecodable decmpfs must error, not return a body");
+    assert!(
+        matches!(err, Error::Corrupt(_)),
+        "expected Corrupt, got {err:?}"
+    );
+    assert!(sink.is_empty(), "no partial body may leak out on error");
+}
+
 /// Cross-check against `7zz` when present on the system (dev-only oracle, per
 /// `_protocol.md`). Skips (prints and returns) when the binary isn't found.
 #[test]

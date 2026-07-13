@@ -47,10 +47,17 @@ lzma-rs.workspace = true
 # WIM (.wim/.esd) resource chunk decoding: XPRESS-Huffman. See format/wim.rs.
 newtua-mscompress = { path = "../newtua-mscompress" }
 # HFS+/HFSX (.hfs/.hfsplus/.hfsx, and the filesystem inside DMG images):
-# pure-Rust reader. See format/hfsplus.rs.
-hfsplus.workspace = true
+# vendored reader (decmpfs-capable), see crates/hfsplus-forensic/VENDORED.md
+# and format/hfsplus.rs.
+hfsplus-forensic = { path = "../hfsplus-forensic" }
+# Memory-maps the volume for hfsplus-forensic's byte-buffer API. See
+# format/hfsplus.rs::open_hfsplus.
+memmap2.workspace = true
 # DMG/UDIF container (.dmg): LZFSE (ULFO) chunk decoding. See format/dmg.rs.
 lzfse_rust.workspace = true
+# APFS filesystem inside DMG images / bare containers (#21c): vendored reader,
+# see crates/apfs-core/VENDORED.md and format/apfs.rs.
+apfs-core = { path = "../apfs-core" }
 # Already resolved transitively (via rpm); used directly to decode the plist
 # `Data` base64 field. See format/dmg.rs.
 base64.workspace = true
@@ -64,3 +71,4 @@ tempfile.workspace = true
 zip.workspace = true
 cab.workspace = true
 flate2.workspace = true
+sha2.workspace = true

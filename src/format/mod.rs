@@ -65,3 +65,6 @@ pub use hfsplus::HfsPlusHandler;
 
 pub mod dmg;
 pub use dmg::DmgHandler;
+
+pub mod apfs;
+pub use apfs::ApfsHandler;

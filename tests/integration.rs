@@ -13,6 +13,8 @@
 //! Fixtures are referenced via `env!("CARGO_MANIFEST_DIR")` or `include_bytes!`
 //! with `../fixtures/` (relative to the `integration/` subdir).
 
+#[path = "integration/apfs.rs"]
+mod apfs;
 #[path = "integration/appimage.rs"]
 mod appimage;
 #[path = "integration/ar_handler.rs"]

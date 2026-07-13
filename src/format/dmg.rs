@@ -3,8 +3,9 @@
 //! A `.dmg` stores a disk image sector-range-compressed: a koly trailer (last
 //! 512 bytes) points at an XML plist holding `blkx` records, each a base64
 //! `mish` chunk table. Each chunk decodes to a byte range of the "raw" disk
-//! image; assembling all chunks into a temp file yields a bare disk that
-//! (today) holds an HFS+ volume, opened via [`open_hfsplus`](super::hfsplus::open_hfsplus).
+//! image; assembling all chunks into a temp file yields a bare disk holding an
+//! HFS+/HFSX volume ([`open_hfsplus`](super::hfsplus::open_hfsplus)) or an APFS
+//! volume ([`open_apfs`](super::apfs::open_apfs)), located by [`locate_volume`].
 //!
 //! See `task_n_reports/task-21b-udif-container.md` for the full format
 //! writeup and the offset formula this module implements.
@@ -17,6 +18,7 @@ use base64::Engine as _;
 use crate::archive::{ArchiveReader, Confidence, FormatHandler, FormatId, OpenOptions, Source};
 use crate::detect::TempBackedReader;
 use crate::error::{Error, Result};
+use crate::format::apfs::{APFS_MAGIC, APFS_MAGIC_OFFSET, open_apfs};
 use crate::format::hfsplus::{
     HFS_PLUS_SIGNATURE, HFSX_SIGNATURE, VOLUME_HEADER_OFFSET, open_hfsplus,
 };
@@ -187,35 +189,69 @@ fn build_raw_image(path: &Path, koly: &Koly) -> Result<tempfile::TempPath> {
     Ok(tmp.into_temp_path())
 }
 
-/// Locate the HFS+/HFSX volume inside the assembled raw image (§8): try offset
-/// 0 first (bare volume), else sweep sector boundaries for the Volume Header
-/// signature (`H+`/`HX`) at `s + VOLUME_HEADER_OFFSET`. Each signature hit is
-/// fully validated by `open_hfsplus`, so a coincidental 2-byte match is
-/// rejected and the sweep continues.
-///
-/// The sweep is a single buffered forward read: `BufReader::seek_relative`
-/// keeps the small inter-sector skips inside the buffer, so a large
-/// HFS+-free image (an APFS DMG, #21c) costs one read per buffer, not one
-/// seek+read syscall per 512-byte sector.
-fn locate_hfsplus(raw_path: &Path) -> Result<u64> {
-    if open_hfsplus(raw_path, 0).is_ok() {
-        return Ok(0);
-    }
-
+/// Sweep sector boundaries for a filesystem signature at `s + magic_offset`,
+/// returning the first volume that `open` fully mounts. Each `matches` hit is
+/// validated by actually opening the volume, so a coincidental byte match is
+/// rejected and the sweep continues. A single buffered forward read:
+/// `BufReader::seek_relative` keeps the small inter-sector skip inside the
+/// buffer, so a large image costs one read per buffer, not one seek+read
+/// syscall per 512-byte sector. `N` is the signature width in bytes.
+fn sweep_for_volume<const N: usize>(
+    raw_path: &Path,
+    magic_offset: u64,
+    matches: impl Fn(&[u8; N]) -> bool,
+    open: impl Fn(&Path, u64) -> Result<Box<dyn ArchiveReader>>,
+) -> Result<Option<Box<dyn ArchiveReader>>> {
     let mut reader = std::io::BufReader::new(std::fs::File::open(raw_path)?);
-    reader.seek_relative(VOLUME_HEADER_OFFSET as i64)?;
+    reader.seek_relative(magic_offset as i64)?;
     let mut s = 0u64;
-    let mut sig = [0u8; 2];
+    let mut sig = [0u8; N];
     while reader.read_exact(&mut sig).is_ok() {
-        let signature = u16::from_be_bytes(sig);
-        if (signature == HFS_PLUS_SIGNATURE || signature == HFSX_SIGNATURE)
-            && open_hfsplus(raw_path, s).is_ok()
-        {
-            return Ok(s);
+        if matches(&sig) {
+            if let Ok(inner) = open(raw_path, s) {
+                return Ok(Some(inner));
+            }
         }
-        // Advance to the next sector's header: we already consumed 2 bytes.
-        reader.seek_relative((SECTOR_SIZE - 2) as i64)?;
+        // Advance to the next sector's header: we already consumed N bytes.
+        reader.seek_relative((SECTOR_SIZE - N as u64) as i64)?;
         s += SECTOR_SIZE;
+    }
+    Ok(None)
+}
+
+/// Locate and open the HFS+/HFSX or APFS volume inside the assembled raw image
+/// (§7): try offset 0 first (bare volume, either filesystem), else sweep sector
+/// boundaries for each filesystem's signature in turn, returning the opened
+/// reader directly (so the winning volume is mounted exactly once). HFS+'s
+/// Volume Header (offset 1024) and APFS's `NXSB` (offset 32) sit too far apart
+/// to check both within one forward-only buffered pass without a backward seek
+/// per sector (which would reintroduce the per-sector syscall this sweep exists
+/// to avoid), so each filesystem gets its own full forward sweep.
+fn locate_volume(raw_path: &Path) -> Result<Box<dyn ArchiveReader>> {
+    if let Ok(inner) = open_hfsplus(raw_path, 0) {
+        return Ok(inner);
+    }
+    if let Ok(inner) = open_apfs(raw_path, 0) {
+        return Ok(inner);
+    }
+    if let Some(inner) = sweep_for_volume(
+        raw_path,
+        APFS_MAGIC_OFFSET,
+        |sig| sig == APFS_MAGIC,
+        open_apfs,
+    )? {
+        return Ok(inner);
+    }
+    if let Some(inner) = sweep_for_volume(
+        raw_path,
+        VOLUME_HEADER_OFFSET,
+        |sig: &[u8; 2]| {
+            let signature = u16::from_be_bytes(*sig);
+            signature == HFS_PLUS_SIGNATURE || signature == HFSX_SIGNATURE
+        },
+        open_hfsplus,
+    )? {
+        return Ok(inner);
     }
     Err(Error::UnknownFormat)
 }
@@ -528,8 +564,7 @@ impl FormatHandler for DmgHandler {
 
         let koly = read_koly(&path)?;
         let temp_path = build_raw_image(&path, &koly)?;
-        let offset = locate_hfsplus(&temp_path)?;
-        let inner = open_hfsplus(&temp_path, offset)?;
+        let inner = locate_volume(&temp_path)?;
         Ok(Box::new(TempBackedReader::with_format(
             inner,
             temp_path,
