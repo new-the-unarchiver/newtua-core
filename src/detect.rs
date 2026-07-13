@@ -9,9 +9,9 @@ use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
     AppImageHandler, ArHandler, CabHandler, CondaHandler, CpioHandler, CrxHandler, DebHandler,
-    HfsPlusHandler, IsoHandler, MsiHandler, RarHandler, RpmHandler, SevenZHandler, SfxHandler,
-    SquashfsHandler, TarHandler, WarcHandler, WimHandler, XarHandler, ZipBundleHandler, ZipHandler,
-    bundle,
+    DmgHandler, HfsPlusHandler, IsoHandler, MsiHandler, RarHandler, RpmHandler, SevenZHandler,
+    SfxHandler, SquashfsHandler, TarHandler, WarcHandler, WimHandler, XarHandler, ZipBundleHandler,
+    ZipHandler, bundle,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -71,6 +71,12 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
     // signature at offset 1024 is past the registry's 512-byte peek, same
     // situation as ISO); no tie-break with peers.
     handlers.push(Box::new(HfsPlusHandler));
+    // DmgHandler: detected by .dmg extension (the koly trailer lives in the
+    // last 512 bytes, unreachable from the registry's header peek, same
+    // situation as HFS+/ISO). Registered for uniform enumeration, but this
+    // probe never actually fires: `.dmg` is intercepted by the early extension
+    // branch in open_single (before the registry loop), so dispatch is there.
+    handlers.push(Box::new(DmgHandler));
     handlers
 }
 
@@ -351,6 +357,22 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
         return WarcHandler.open(src, opts);
     }
 
+    // Early DMG extension branch — same rationale as WARC above.
+    //
+    // A DMG's data fork (sector-compressed chunks) starts at byte 0 of the
+    // file whenever `koly.DataForkOffset` and the first blkx chunk's
+    // `CompressedOffset` are both 0 (the common case). That chunk's own
+    // compressed bytes can coincidentally start with another compressor's
+    // magic — observed with real `hdiutil`-generated UDBZ/ULMO images, whose
+    // first chunk happens to open with the bzip2/xz stream header — which
+    // would otherwise make the generic compressor layer below swallow the
+    // whole file as one compressed stream and fail once it runs past that
+    // first chunk's boundary. Routing `.dmg` straight to DmgHandler bypasses
+    // that layer entirely; `koly`'s own magic is validated inside `open`.
+    if lower_name.ends_with(".dmg") {
+        return DmgHandler.open(src, opts);
+    }
+
     // Compression layer. Magic-based detection first; then an extension-only
     // fallback for magic-less compressors (Brotli — no content signature).
     if let Some(comp) = detect_compressor(&header).or_else(|| detect_compressor_by_ext(&lower_name))
@@ -478,8 +500,8 @@ mod tests {
 
     #[test]
     fn registry_has_expected_handlers() {
-        // 18 базовых + zip-бандлы + CRX + Conda (самодокументируемо при росте).
-        assert_eq!(registry().len(), 18 + bundle::ZIP_BUNDLES.len() + 2);
+        // 19 базовых + zip-бандлы + CRX + Conda (самодокументируемо при росте).
+        assert_eq!(registry().len(), 19 + bundle::ZIP_BUNDLES.len() + 2);
     }
 
     #[test]

@@ -11,11 +11,11 @@ use crate::archive::{
 use crate::error::{Error, Result};
 
 /// HFS+ signature `H+` (big-endian `0x482B`, version 4).
-const HFS_PLUS_SIGNATURE: u16 = 0x482B;
+pub(crate) const HFS_PLUS_SIGNATURE: u16 = 0x482B;
 /// HFSX signature `HX` (big-endian `0x4858`, version 5) — case-sensitive HFS+.
-const HFSX_SIGNATURE: u16 = 0x4858;
+pub(crate) const HFSX_SIGNATURE: u16 = 0x4858;
 /// Byte offset of the Volume Header within an HFS+/HFSX volume.
-const VOLUME_HEADER_OFFSET: u64 = 1024;
+pub(crate) const VOLUME_HEADER_OFFSET: u64 = 1024;
 /// Seconds between the HFS+ epoch (1904-01-01 00:00 GMT) and the Unix epoch.
 const HFS_EPOCH_TO_UNIX_EPOCH_SECS: u64 = 2_082_844_800;
 

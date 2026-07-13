@@ -31,6 +31,8 @@ mod cpio_handler;
 mod deb_handler;
 #[path = "integration/detect.rs"]
 mod detect;
+#[path = "integration/dmg.rs"]
+mod dmg;
 #[path = "integration/extract.rs"]
 mod extract;
 #[path = "integration/hfsplus.rs"]

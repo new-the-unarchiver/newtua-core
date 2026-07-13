@@ -58,6 +58,10 @@ pub enum FormatId {
     /// HFSX (case-sensitive) reports the same `FormatId` — the two differ only
     /// in signature/case-sensitivity, not in shape.
     HfsPlus,
+    /// DMG (`.dmg`) Apple Disk Image, UDIF container: koly trailer + XML plist
+    /// blkx/mish chunk tables, decoded into a raw disk image and handed to the
+    /// filesystem layer inside (HFS+ for now; APFS is #21c).
+    Dmg,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

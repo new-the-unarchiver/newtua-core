@@ -130,7 +130,7 @@ fn find_from(b: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
 /// recurse per level and overflow the stack on a deeply-nested document). On
 /// any malformed/unterminated construct it returns `false` and lets the real
 /// parser produce the error.
-fn exceeds_nesting_depth(xml: &str, limit: usize) -> bool {
+pub(crate) fn exceeds_nesting_depth(xml: &str, limit: usize) -> bool {
     let b = xml.as_bytes();
     let n = b.len();
     let mut i = 0;

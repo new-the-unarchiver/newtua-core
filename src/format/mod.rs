@@ -62,3 +62,6 @@ pub use wim::WimHandler;
 
 pub mod hfsplus;
 pub use hfsplus::HfsPlusHandler;
+
+pub mod dmg;
+pub use dmg::DmgHandler;
