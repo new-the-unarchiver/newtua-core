@@ -61,6 +61,15 @@ apfs-core = { path = "../apfs-core" }
 # Already resolved transitively (via rpm); used directly to decode the plist
 # `Data` base64 field. See format/dmg.rs.
 base64.workspace = true
+# Legacy-format decoders ported from XADMaster (the newtua-formats family).
+# Thin FormatHandler/ArchiveReader adapters live in src/format/legacy/. Each
+# crate exposes a uniform recognize/open/entries/read_entry API over &[u8].
+newtua-dos.workspace = true
+newtua-mac.workspace = true
+newtua-stuffit.workspace = true
+newtua-amiga.workspace = true
+newtua-alz.workspace = true
+newtua-nsis.workspace = true
 
 [features]
 default = []

@@ -8,10 +8,13 @@ use crate::archive::{
 use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
-    ApfsHandler, AppImageHandler, ArHandler, CabHandler, CondaHandler, CpioHandler, CrxHandler,
-    DebHandler, DmgHandler, HfsPlusHandler, IsoHandler, MsiHandler, RarHandler, RpmHandler,
-    SevenZHandler, SfxHandler, SquashfsHandler, TarHandler, WarcHandler, WimHandler, XarHandler,
-    ZipBundleHandler, ZipHandler, bundle,
+    AlzHandler, ApfsHandler, AppImageHandler, AppleSingleHandler, ArHandler, ArcHandler,
+    ArjHandler, BinHexHandler, CabHandler, CompactProHandler, CondaHandler, CpioHandler,
+    CrunchHandler, CrxHandler, DebHandler, DmgHandler, DmsHandler, HfsPlusHandler, IsoHandler,
+    LbrHandler, LzxHandler, MacBinaryHandler, MsiHandler, NsisHandler, PackItHandler,
+    PowerPackerHandler, RarHandler, RpmHandler, SevenZHandler, SfxHandler, SquashfsHandler,
+    SqueezeHandler, StuffIt5Handler, StuffItHandler, StuffItXHandler, TarHandler, WarcHandler,
+    WimHandler, XarHandler, ZipBundleHandler, ZipHandler, ZooHandler, bundle,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -81,6 +84,41 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
     // probe never actually fires: `.dmg` is intercepted by the early extension
     // branch in open_single (before the registry loop), so dispatch is there.
     handlers.push(Box::new(DmgHandler));
+    // Legacy formats (newtua-formats family). Content-first detection via the
+    // upstream `recognize`; their magics/extensions don't tie with the modern
+    // handlers above, so they're simply appended. ARC has no content sniff and
+    // detects by extension only; Squeeze detects by both its `76 FF` magic and
+    // its extension. As with the modern handlers, an extension fallback is
+    // added where a format has a distinctive conventional extension.
+    // --- newtua-dos ---
+    handlers.push(Box::new(ArjHandler));
+    handlers.push(Box::new(ZooHandler));
+    handlers.push(Box::new(LbrHandler));
+    handlers.push(Box::new(CrunchHandler));
+    handlers.push(Box::new(ArcHandler));
+    handlers.push(Box::new(SqueezeHandler));
+    // --- newtua-mac ---
+    handlers.push(Box::new(BinHexHandler));
+    handlers.push(Box::new(MacBinaryHandler));
+    handlers.push(Box::new(AppleSingleHandler));
+    handlers.push(Box::new(CompactProHandler));
+    handlers.push(Box::new(PackItHandler));
+    // --- newtua-stuffit --- (distinct signatures; a `.sit` routes to classic
+    // or SIT5 by content, so registration order is not a tie-break here).
+    handlers.push(Box::new(StuffIt5Handler));
+    handlers.push(Box::new(StuffItHandler));
+    handlers.push(Box::new(StuffItXHandler));
+    // --- newtua-alz / newtua-nsis --- (NsisHandler's probe is always NONE, so
+    // it is registry-invisible — unlike DmgHandler, whose probe fires for
+    // `.dmg` and whose registration is a live fallback. NSIS is reached only
+    // via the `MZ` early branch in open_single; registered here for uniform
+    // enumeration.)
+    handlers.push(Box::new(AlzHandler));
+    handlers.push(Box::new(NsisHandler));
+    // --- newtua-amiga ---
+    handlers.push(Box::new(PowerPackerHandler));
+    handlers.push(Box::new(LzxHandler));
+    handlers.push(Box::new(DmsHandler));
     handlers
 }
 
@@ -411,6 +449,20 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
         }
     }
 
+    // NSIS installers are PE executables (`MZ`) with the archive appended past
+    // the stub — the firstheader sits far beyond the 512-byte header peek, so
+    // no registry probe can see it. Read the whole file once and let the
+    // handler sniff it: a genuine NSIS installer opens here (before the generic
+    // SFX carve); anything else returns `UnknownFormat` and falls through to
+    // the registry, where `SfxHandler` still handles other self-extractors.
+    if header.starts_with(b"MZ") {
+        match NsisHandler::open_bytes(std::fs::read(path)?, opts) {
+            Ok(reader) => return Ok(reader),
+            Err(Error::UnknownFormat) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
     // Container formats: pick handler with highest probe confidence.
     let name = path.file_name().and_then(|s| s.to_str());
     let handlers = registry();
@@ -504,8 +556,12 @@ mod tests {
 
     #[test]
     fn registry_has_expected_handlers() {
-        // 20 базовых + zip-бандлы + CRX + Conda (самодокументируемо при росте).
-        assert_eq!(registry().len(), 20 + bundle::ZIP_BUNDLES.len() + 2);
+        // 20 базовых + 16 legacy (6 dos + 5 mac + 3 stuffit + alz + nsis + 3 amiga)
+        // + zip-бандлы + CRX + Conda.
+        assert_eq!(
+            registry().len(),
+            20 + 6 + 5 + 3 + 2 + 3 + bundle::ZIP_BUNDLES.len() + 2
+        );
     }
 
     #[test]

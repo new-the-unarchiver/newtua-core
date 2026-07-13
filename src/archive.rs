@@ -66,6 +66,47 @@ pub enum FormatId {
     /// magic) or the filesystem layer inside a DMG image. Supports transparent
     /// `decmpfs` decompression, unlike the HFS+ handler.
     Apfs,
+    // Legacy formats from the `newtua-formats` family (ports from XADMaster).
+    // Thin adapters in `format/legacy/`; detection is extension-first with a
+    // `recognize` confirmation (see docs/superpowers/plans/2026-07-14-*).
+    /// ARJ (`.arj`), Robert Jung's DOS archiver — `newtua-dos`.
+    Arj,
+    /// Zoo (`.zoo`), Rahul Dhesi's cross-platform archiver — `newtua-dos`.
+    Zoo,
+    /// LBR (`.lbr`), CP/M library container — `newtua-dos`.
+    Lbr,
+    /// Crunch (DOS/CP-M LZW cruncher container) — `newtua-dos`.
+    Crunch,
+    /// ARC (`.arc`/`.ark`/`.pak`/`.spark`), SEA's PC archiver — `newtua-dos`.
+    Arc,
+    /// Squeeze (`.sq`/`.qqq`), Huffman-coded CP/M & DOS file — `newtua-dos`.
+    Squeeze,
+    /// BinHex 4.0 (`.hqx`), 7-bit Mac transport encoding — `newtua-mac`.
+    BinHex,
+    /// MacBinary I/II/III (`.bin`), resource-fork container — `newtua-mac`.
+    MacBinary,
+    /// AppleSingle / AppleDouble fork-preserving encoding — `newtua-mac`.
+    AppleSingle,
+    /// Compact Pro (`.cpt`), early-90s Mac archiver — `newtua-mac`.
+    CompactPro,
+    /// PackIt (`.pit`), early Mac archiver — `newtua-mac`.
+    PackIt,
+    /// StuffIt classic (`.sit`), the dominant Mac archiver — `newtua-stuffit`.
+    StuffIt,
+    /// StuffIt 5 (`.sit`), later container incl. RC4/MD5 — `newtua-stuffit`.
+    StuffIt5,
+    /// StuffItX (`.sitx`), range-coded successor — `newtua-stuffit`.
+    StuffItX,
+    /// ALZip (`.alz`), ESTsoft's Korean archiver — `newtua-alz`.
+    Alz,
+    /// NSIS (`.exe`), contents of a Nullsoft installer — `newtua-nsis`.
+    Nsis,
+    /// Amiga LZX (`.lzx`), the Amiga archiver — `newtua-amiga`.
+    Lzx,
+    /// PowerPacker (`.pp`), Amiga single-file cruncher — `newtua-amiga`.
+    PowerPacker,
+    /// DMS (`.dms`), Disk Masher System floppy image — `newtua-amiga`.
+    Dms,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

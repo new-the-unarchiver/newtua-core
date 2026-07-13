@@ -41,6 +41,8 @@ mod extract;
 mod hfsplus;
 #[path = "integration/iso_handler.rs"]
 mod iso_handler;
+#[path = "integration/legacy.rs"]
+mod legacy;
 #[path = "integration/lz4.rs"]
 mod lz4;
 #[path = "integration/lzc.rs"]

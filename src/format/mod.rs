@@ -68,3 +68,14 @@ pub use dmg::DmgHandler;
 
 pub mod apfs;
 pub use apfs::ApfsHandler;
+
+// Legacy formats from the `newtua-formats` family (ports from XADMaster). Thin
+// adapters over the upstream crates' uniform recognize/open/entries/read_entry
+// API; see legacy/mod.rs.
+pub mod legacy;
+pub use legacy::{
+    AlzHandler, AppleSingleHandler, ArcHandler, ArjHandler, BinHexHandler, CompactProHandler,
+    CrunchHandler, DmsHandler, LbrHandler, LzxHandler, MacBinaryHandler, NsisHandler,
+    PackItHandler, PowerPackerHandler, SqueezeHandler, StuffIt5Handler, StuffItHandler,
+    StuffItXHandler, ZooHandler,
+};
