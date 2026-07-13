@@ -59,3 +59,6 @@ pub use appimage::AppImageHandler;
 
 pub mod wim;
 pub use wim::WimHandler;
+
+pub mod hfsplus;
+pub use hfsplus::HfsPlusHandler;

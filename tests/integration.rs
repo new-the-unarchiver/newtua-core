@@ -33,6 +33,8 @@ mod deb_handler;
 mod detect;
 #[path = "integration/extract.rs"]
 mod extract;
+#[path = "integration/hfsplus.rs"]
+mod hfsplus;
 #[path = "integration/iso_handler.rs"]
 mod iso_handler;
 #[path = "integration/lz4.rs"]

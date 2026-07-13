@@ -46,6 +46,9 @@ lzw-z = { path = "../lzw-z" }
 lzma-rs.workspace = true
 # WIM (.wim/.esd) resource chunk decoding: XPRESS-Huffman. See format/wim.rs.
 newtua-mscompress = { path = "../newtua-mscompress" }
+# HFS+/HFSX (.hfs/.hfsplus/.hfsx, and the filesystem inside DMG images):
+# pure-Rust reader. See format/hfsplus.rs.
+hfsplus.workspace = true
 
 [features]
 default = []

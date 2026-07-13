@@ -9,8 +9,9 @@ use crate::decompress::{Compressor, decompressor};
 use crate::error::{Error, Result};
 use crate::format::{
     AppImageHandler, ArHandler, CabHandler, CondaHandler, CpioHandler, CrxHandler, DebHandler,
-    IsoHandler, MsiHandler, RarHandler, RpmHandler, SevenZHandler, SfxHandler, SquashfsHandler,
-    TarHandler, WarcHandler, WimHandler, XarHandler, ZipBundleHandler, ZipHandler, bundle,
+    HfsPlusHandler, IsoHandler, MsiHandler, RarHandler, RpmHandler, SevenZHandler, SfxHandler,
+    SquashfsHandler, TarHandler, WarcHandler, WimHandler, XarHandler, ZipBundleHandler, ZipHandler,
+    bundle,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -66,6 +67,10 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
     // WarcHandler: WARC/1.x magic; .warc.gz is handled by the early extension
     // branch in open_single and never reaches this registry probe.
     handlers.push(Box::new(WarcHandler));
+    // HfsPlusHandler: detected by .hfs/.hfsplus/.hfsx extension (the H+/HX
+    // signature at offset 1024 is past the registry's 512-byte peek, same
+    // situation as ISO); no tie-break with peers.
+    handlers.push(Box::new(HfsPlusHandler));
     handlers
 }
 
@@ -473,8 +478,8 @@ mod tests {
 
     #[test]
     fn registry_has_expected_handlers() {
-        // 17 базовых + zip-бандлы + CRX + Conda (самодокументируемо при росте).
-        assert_eq!(registry().len(), 17 + bundle::ZIP_BUNDLES.len() + 2);
+        // 18 базовых + zip-бандлы + CRX + Conda (самодокументируемо при росте).
+        assert_eq!(registry().len(), 18 + bundle::ZIP_BUNDLES.len() + 2);
     }
 
     #[test]

@@ -53,6 +53,11 @@ pub enum FormatId {
     /// WIM (`.wim`/`.esd`/`.swm`) Windows install image: a SHA-1-addressed
     /// resource store plus a metadata resource holding the directory tree.
     Wim,
+    /// HFS+/HFSX (Mac OS Extended) read-only filesystem: a bare volume (as
+    /// produced by `newfs_hfs`) or the filesystem layer inside a DMG image.
+    /// HFSX (case-sensitive) reports the same `FormatId` — the two differ only
+    /// in signature/case-sensitivity, not in shape.
+    HfsPlus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
