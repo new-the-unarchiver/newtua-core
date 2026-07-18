@@ -1,8 +1,8 @@
 use chardetng::EncodingDetector;
 use encoding_rs::{Encoding, UTF_8};
 
-/// Декодирует набор сырых имён, определяя единую кодировку по всему набору.
-/// `override_label` (если задан и валиден) принудительно выбирает кодировку.
+/// Decodes a set of raw names, detecting a single encoding across the whole
+/// set. `override_label` (if given and valid) forces that encoding.
 pub fn decode_names(raw: &[Vec<u8>], override_label: Option<&str>) -> Vec<String> {
     let encoding = resolve_encoding(raw, override_label);
     raw.iter()

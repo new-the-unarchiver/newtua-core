@@ -2,8 +2,8 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-/// Безопасно соединяет `dest_root` с путём записи из архива.
-/// Отклоняет абсолютные пути, корневые/префиксные компоненты и `..`.
+/// Safely joins `dest_root` with an archive entry's path.
+/// Rejects absolute paths, root/prefix components, and `..`.
 pub fn safe_join(dest_root: &Path, entry_path: &Path) -> Result<PathBuf> {
     // Нормализуем разделители Windows-стиля в именах из архива.
     let normalized = entry_path.to_string_lossy().replace('\\', "/");

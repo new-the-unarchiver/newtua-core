@@ -8,15 +8,15 @@ use crate::error::{Error, Result};
 use crate::format::TarHandler;
 use crate::format::zip::open_zip;
 
-/// Регистронезависимое сравнение байтового суффикса. Срез по байтам безопасен
-/// на любых именах (срез `&str` мог бы паниковать на не-границе символа).
-/// Используется и для расширения `.conda` (probe), и для `.tar.zst`-членов.
+/// Case-insensitive byte-suffix comparison. Slicing by bytes is safe on any
+/// name (slicing a `&str` could panic on a non-char-boundary index). Used
+/// both for the `.conda` extension (probe) and for `.tar.zst` members.
 fn ends_with_ascii_ci(bytes: &[u8], suffix: &[u8]) -> bool {
     bytes.len() >= suffix.len() && bytes[bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
-/// Распознаёт пакеты conda (`.conda`) и разворачивает их внутренние
-/// `*.tar.zst`-члены в единый список записей.
+/// Recognizes conda packages (`.conda`) and unpacks their inner
+/// `*.tar.zst` members into a single flat list of entries.
 pub struct CondaHandler;
 
 impl FormatHandler for CondaHandler {
@@ -40,8 +40,8 @@ impl FormatHandler for CondaHandler {
     }
 }
 
-/// Открыть `.conda`: внешний zip → развернуть каждый `*.tar.zst`-член в tar и
-/// слить их записи в один список.
+/// Open a `.conda`: outer zip → unpack each `*.tar.zst` member into a tar
+/// and merge their entries into a single list.
 fn open_conda(src: Source, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
     // conda — это файловый zip; стрим не поддержан (как zip/crx).
     if !matches!(src, Source::Seekable { .. }) {
@@ -106,11 +106,11 @@ fn open_conda(src: Source, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>>
     }))
 }
 
-/// Композитный ридер: держит по одному tar-ридеру на `*.tar.zst`-член и
-/// диспетчеризует `read_entry` по карте `глобальный idx → (ридер, idx)`.
+/// Composite reader: holds one tar reader per `*.tar.zst` member and
+/// dispatches `read_entry` via a `global idx → (reader, idx)` map.
 struct CondaReader {
     inners: Vec<Box<dyn ArchiveReader>>,
-    /// Держат temp-tar живыми (Drop удаляет файлы).
+    /// Keeps the temp tar files alive (Drop removes them).
     _temps: Vec<tempfile::TempPath>,
     entries: Vec<Entry>,
     map: Vec<(usize, usize)>,

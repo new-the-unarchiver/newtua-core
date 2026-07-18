@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-/// Находит и упорядочивает тома многотомного архива по первому тому.
+/// Finds and orders a multi-volume archive's volumes from its first volume.
 pub fn volume_members(first: &Path) -> Result<Vec<PathBuf>> {
     let name = first.file_name().and_then(|s| s.to_str()).unwrap_or("");
     // Схема .001/.002...
@@ -29,7 +29,7 @@ pub fn volume_members(first: &Path) -> Result<Vec<PathBuf>> {
     Ok(vec![first.to_path_buf()])
 }
 
-/// Последовательное чтение нескольких файлов как единого потока.
+/// Sequential reading of multiple files as a single stream.
 pub struct ConcatReader {
     files: Vec<PathBuf>,
     idx: usize,

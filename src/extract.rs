@@ -73,8 +73,8 @@ fn apply_symlink_mtime(path: &Path, modified: Option<SystemTime>) {
 
 pub struct ExtractOptions {
     pub dest: PathBuf,
-    /// Имя обёртки-папки (обычно — имя архива без расширения). Используется,
-    /// только если у записей нет единого общего корневого каталога.
+    /// Wrapper-folder name (usually the archive name without its extension).
+    /// Used only when the entries have no single shared root directory.
     pub wrapper_name: Option<String>,
     pub strict: bool,
     /// Restore mtime (and in future: mode) from archive metadata. Default: true.

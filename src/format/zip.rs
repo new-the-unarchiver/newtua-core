@@ -46,9 +46,9 @@ impl FormatHandler for ZipHandler {
     }
 }
 
-/// Открыть zip-источник, рапортуя подтип `format` (Zip для обычного zip, либо
-/// конкретный бандл — Apk/Epub/Crx/…). Вся логика индексации записей,
-/// символлинков, LZMA и паролей общая для всех подтипов.
+/// Open a zip source, reporting the `format` subtype (Zip for a plain zip,
+/// or a specific bundle — Apk/Epub/Crx/…). All the entry-indexing,
+/// symlink, LZMA and password logic is shared across every subtype.
 pub(crate) fn open_zip(
     src: Source,
     opts: &OpenOptions,
@@ -226,7 +226,7 @@ struct ZipReader {
     /// Parallel to `entries`: true where the member uses the LZMA method.
     is_lzma: Vec<bool>,
     password: Option<String>,
-    /// Рапортуемый подтип (Zip, либо Apk/Epub/Crx/… для бандлов).
+    /// Reported subtype (Zip, or Apk/Epub/Crx/… for bundles).
     format: FormatId,
 }
 
@@ -299,7 +299,7 @@ mod tests {
     use super::*;
     use crate::Confidence;
 
-    /// Собрать минимальный валидный zip в памяти (один файл "hello.txt" = "hi").
+    /// Build a minimal valid zip in memory (one file "hello.txt" = "hi").
     fn tiny_zip_bytes() -> Vec<u8> {
         let mut buf = Vec::new();
         {

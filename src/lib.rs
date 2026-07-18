@@ -1,4 +1,4 @@
-//! newtua-core — движок распаковки архивов.
+//! newtua-core — archive extraction engine.
 
 pub mod error;
 pub use error::{Error, Result};

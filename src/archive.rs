@@ -40,10 +40,10 @@ pub enum FormatId {
     Odt,
     Ods,
     Odp,
-    /// Chrome-расширение: zip за заголовком `Cr24` (CRX2/CRX3).
+    /// Chrome extension: zip following the `Cr24` header (CRX2/CRX3).
     Crx,
-    /// Пакет conda (`.conda`): внешний zip с `*.tar.zst`-членами; ридер
-    /// разворачивает их и показывает слитое содержимое.
+    /// Conda package (`.conda`): an outer zip containing `*.tar.zst` members;
+    /// the reader unpacks them and presents their merged contents.
     Conda,
     /// SquashFS read-only filesystem image (`.squashfs` / `.sfs`); via backhand.
     Squashfs,
@@ -148,7 +148,7 @@ pub struct OpenOptions {
     pub encoding_override: Option<String>,
 }
 
-/// Источник архива: либо seekable-файл, либо чистый поток.
+/// Archive source: either a seekable file or a plain stream.
 pub enum Source {
     Seekable {
         inner: Box<dyn ReadSeek>,
@@ -178,9 +178,9 @@ impl Source {
         }
     }
 
-    /// Прочитать первые `n` байт, не нарушая последующее чтение (для seekable —
-    /// откат в начало; для stream — буфер не возвращается, поэтому header
-    /// читается только из seekable-источников).
+    /// Read the first `n` bytes without disturbing subsequent reads (for
+    /// seekable sources — rewinds back to the start; for streams — the buffer
+    /// isn't returned, so the header can only be read from seekable sources).
     pub fn peek_header(&mut self, n: usize) -> Result<Vec<u8>> {
         match self {
             Source::Seekable { inner, .. } => {
@@ -219,18 +219,18 @@ pub trait ArchiveReader {
     fn entries(&mut self) -> Result<&[Entry]>;
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()>;
 
-    /// Проверить, что архив можно расшифровать заданным паролем, НЕ извлекая
-    /// файлы. Оркестратор (`extract_all`) вызывает это до начала записи на
-    /// диск, чтобы ошибка пароля поднималась наверх единообразно для всех
-    /// форматов и не оставляла частичных файлов.
+    /// Verify that the archive can be decrypted with the given password,
+    /// WITHOUT extracting any files. The orchestrator (`extract_all`) calls
+    /// this before it starts writing to disk, so a password error surfaces
+    /// uniformly across all formats and never leaves partial files behind.
     ///
-    /// Контракт:
-    /// - нет зашифрованных записей           → `Ok(())`
-    /// - есть зашифрованная, пароль не задан → `Err(Error::Encrypted)`
-    /// - пароль задан, но неверный           → `Err(Error::WrongPassword)`
-    /// - пароль верный (или шифрования нет)   → `Ok(())`
+    /// Contract:
+    /// - no encrypted entries                       → `Ok(())`
+    /// - an encrypted entry, no password given       → `Err(Error::Encrypted)`
+    /// - a password given, but wrong                 → `Err(Error::WrongPassword)`
+    /// - the password is correct (or no encryption)  → `Ok(())`
     ///
-    /// Значение по умолчанию — `Ok(())`, для форматов без шифрования
+    /// Defaults to `Ok(())`, for formats without encryption
     /// (tar, ar, cab, gzip, raw).
     fn verify_password(&mut self) -> Result<()> {
         Ok(())

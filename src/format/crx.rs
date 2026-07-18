@@ -6,17 +6,17 @@ use crate::archive::{
 use crate::detect::TempBackedReader;
 use crate::error::{Error, Result};
 
-/// Распознаёт Chrome-расширения (`Cr24`) и извлекает вложенный zip.
+/// Recognizes Chrome extensions (`Cr24`) and extracts the embedded zip.
 pub struct CrxHandler;
 
-/// Вычислить смещение начала вложенного zip по фиксированному префиксу
-/// заголовка CRX. Нужны только длины из префикса (≤16 байт):
+/// Compute the embedded zip's start offset from the fixed CRX header
+/// prefix. Only the lengths from that prefix are needed (≤16 bytes):
 ///
-/// - CRX3: `Cr24 | u32 version=3 | u32 header_len` → zip с `12 + header_len`.
+/// - CRX3: `Cr24 | u32 version=3 | u32 header_len` → zip at `12 + header_len`.
 /// - CRX2: `Cr24 | u32 version=2 | u32 pubkey_len | u32 sig_len`
-///   → zip с `16 + pubkey_len + sig_len`.
+///   → zip at `16 + pubkey_len + sig_len`.
 ///
-/// Арифметика в u64 — переполнение u32-длин невозможно.
+/// Arithmetic is done in u64 — overflowing u32-sized lengths is impossible.
 fn crx_zip_offset(head: &[u8]) -> Result<u64> {
     if head.len() < 12 || &head[0..4] != b"Cr24" {
         return Err(Error::Corrupt("crx: short header or bad magic".into()));

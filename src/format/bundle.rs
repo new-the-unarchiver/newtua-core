@@ -1,9 +1,9 @@
 use crate::archive::{ArchiveReader, Confidence, FormatHandler, FormatId, OpenOptions, Source};
 use crate::error::Result;
 
-/// Внутренняя таблица детект-расширений: одно каноническое расширение на
-/// подтип. Синонимы (war/ear/aab/docm/...) сюда НЕ добавляем — это
-/// презентационный слой UI, не вход детекта.
+/// Internal table of detection extensions: one canonical extension per
+/// subtype. Synonyms (war/ear/aab/docm/...) are deliberately NOT added
+/// here — that's a UI presentation concern, not a detection input.
 pub(crate) const ZIP_BUNDLES: &[(&str, FormatId)] = &[
     (".jar", FormatId::Jar),
     (".apk", FormatId::Apk),
@@ -17,9 +17,9 @@ pub(crate) const ZIP_BUNDLES: &[(&str, FormatId)] = &[
     (".odp", FormatId::Odp),
 ];
 
-/// Тонкий хендлер: zip-подтип, опознаваемый по `PK`-магии плюс канони­ческое
-/// расширение имени. Открытие делегируется общему zip-движку с нужным
-/// `FormatId`.
+/// Thin handler: a zip subtype recognized by `PK` magic plus its canonical
+/// name extension. Opening is delegated to the shared zip engine with the
+/// appropriate `FormatId`.
 pub struct ZipBundleHandler {
     ext: &'static str,
     format: FormatId,
