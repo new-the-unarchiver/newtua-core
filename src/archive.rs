@@ -68,7 +68,7 @@ pub enum FormatId {
     Apfs,
     // Legacy formats from the `newtua-formats` family (ports from XADMaster).
     // Thin adapters in `format/legacy/`; detection is extension-first with a
-    // `recognize` confirmation (see docs/superpowers/plans/2026-07-14-*).
+    // `recognize` confirmation.
     /// ARJ (`.arj`), Robert Jung's DOS archiver — `newtua-dos`.
     Arj,
     /// Zoo (`.zoo`), Rahul Dhesi's cross-platform archiver — `newtua-dos`.

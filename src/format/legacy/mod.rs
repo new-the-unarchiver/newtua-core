@@ -9,8 +9,7 @@
 //!
 //! Detection is content-first: `probe` calls the upstream `recognize` on the
 //! registry's 512-byte header peek (where a format has no `recognize`, or its
-//! signature sits past the peek, it falls back to the file extension). See
-//! `docs/superpowers/plans/2026-07-14-legacy-formats-integration.md`.
+//! signature sits past the peek, it falls back to the file extension).
 
 use crate::archive::{ArchiveReader, Confidence, Entry, EntryKind, FormatId, OpenOptions, Source};
 use crate::encoding::decode_names;

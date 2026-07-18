@@ -6,9 +6,6 @@
 //! image; assembling all chunks into a temp file yields a bare disk holding an
 //! HFS+/HFSX volume ([`open_hfsplus`](super::hfsplus::open_hfsplus)) or an APFS
 //! volume ([`open_apfs`](super::apfs::open_apfs)), located by [`locate_volume`].
-//!
-//! See `task_n_reports/task-21b-udif-container.md` for the full format
-//! writeup and the offset formula this module implements.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;

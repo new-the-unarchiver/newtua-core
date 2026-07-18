@@ -151,8 +151,7 @@ fn bad_signature_is_unknown_format() {
 }
 
 /// The compressible source `ditto --hfsCompression` encoded into
-/// `hfs_decmpfs.hfs`'s `bigfile.txt` (see task_n_reports/report-21a2-hfsplus-decmpfs.md
-/// §3 for how the fixture was generated). Regenerated deterministically here
+/// `hfs_decmpfs.hfs`'s `bigfile.txt`. Regenerated deterministically here
 /// instead of committing a second large blob for comparison.
 fn decmpfs_source_bytes() -> Vec<u8> {
     b"The quick brown fox jumps over the lazy dog. ".repeat(4000)

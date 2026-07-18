@@ -23,8 +23,8 @@ fn body_of(reader: &mut dyn ArchiveReader, name: &str) -> Vec<u8> {
     body
 }
 
-/// Assert the standard `src/{a.txt,empty.txt,sub/,sub/b.txt}` tree (see
-/// task_n_reports/task-20a-wim.md §7) is listed and extracts correctly.
+/// Assert the standard `src/{a.txt,empty.txt,sub/,sub/b.txt}` tree
+/// is listed and extracts correctly.
 fn assert_standard_tree(reader: &mut dyn ArchiveReader) {
     let entries = reader.entries().expect("entries");
     let names: Vec<String> = entries

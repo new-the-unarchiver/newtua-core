@@ -25,7 +25,8 @@ const S_IFMT: u16 = 0xF000;
 const S_IFLNK: u16 = 0xA000;
 
 /// Reads HFS+/HFSX filesystem images via the vendored `hfsplus-forensic`
-/// crate (`crates/hfsplus-forensic/`, see its `VENDORED.md`): a bare volume
+/// crate (published as `newtua-hfsplus`; see its README for why it's a
+/// fork): a bare volume
 /// (`.hfs`/`.hfsplus`/`.hfsx`, as produced by `newfs_hfs`) or, via
 /// [`open_hfsplus`], the filesystem embedded inside a DMG image (#21b).
 /// Transparently-compressed (`decmpfs`) files are decoded on read — the

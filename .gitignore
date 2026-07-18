@@ -1,0 +1,14 @@
+/target
+Cargo.lock
+Cargo.lock.bak
+.DS_Store
+.code-index/
+
+# Local dependency overrides pointing at sibling checkouts. Published manifests
+# carry versions only — see the project README.
+/.cargo/config.toml
+
+# The development-process repository is private; these live there.
+/CLAUDE.md
+/.claude/
+/.superpowers/

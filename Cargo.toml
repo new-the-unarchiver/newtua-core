@@ -1,83 +1,89 @@
 [package]
 name = "newtua-core"
 version = "0.1.0"
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+edition = "2024"
+rust-version = "1.85"
+license = "LGPL-3.0-or-later"
+description = "Archive extraction engine: lists and extracts over 50 formats entirely in-process, with no subprocess fallbacks. Extract only — never creates archives."
+readme = "README.md"
+repository = "https://github.com/new-the-unarchiver/newtua-core"
+keywords = ["archive", "extract", "unarchiver", "zip", "rar"]
+categories = ["compression", "filesystem"]
+exclude = ["tests/fixtures/**"]
 
 [dependencies]
-ar.workspace = true
-filetime.workspace = true
-thiserror.workspace = true
-encoding_rs.workspace = true
-chardetng.workspace = true
-flate2.workspace = true
-bzip2.workspace = true
-cab.workspace = true
-xz2.workspace = true
-zip.workspace = true
-zstd.workspace = true
-lz4_flex.workspace = true
-brotli-decompressor.workspace = true
-tar.workspace = true
-time.workspace = true
-sevenz-rust2.workspace = true
-unrar.workspace = true
-tempfile.workspace = true
-cpio.workspace = true
-rpm.workspace = true
+ar = "0.9"
+filetime = "0.2"
+thiserror = "2"
+encoding_rs = "0.8"
+chardetng = "0.1"
+flate2 = "1"
+bzip2 = "0.5"
+cab = "0.6"
+xz2 = "0.1"
+zip = { version = "2", features = ["lzma", "bzip2", "zstd", "deflate64", "xz"] }
+zstd = "0.13"
+lz4_flex = "0.11"
+brotli-decompressor = "5"
+tar = "0.4"
+time = "0.3"
+sevenz-rust2 = { version = "0.21", features = ["aes256"] }
+unrar = { package = "newtua-unrar", version = "0.5.8-newtua.1" }
+tempfile = "3"
+cpio = "0.4"
+rpm = { version = "0.25", default-features = false }
 # XAR (.xar/.pkg): in-house decode-only reader (header + zlib TOC + heap). Uses
-# the workspace flate2/bzip2/xz2 plus a tiny XML DOM; no apple-xar, no `ring`.
+# the shared flate2/bzip2/xz2 plus a tiny XML DOM; no apple-xar, no `ring`.
 roxmltree = "0.21"
 # MSI (.msi): CFB database with embedded CAB stream(s). The handler resolves the
 # File/Component/Directory tables to real install paths (model C) and reuses
 # CabHandler for the embedded CAB bytes. Always built.
-msi.workspace = true
+msi = "0.10"
 cdfs = "0.2.3"
-goblin.workspace = true
-warc.workspace = true
+goblin = { version = "0.10", default-features = false, features = ["pe32", "pe64", "std", "endian_fd"] }
+warc = "0.4"
 # SquashFS (.squashfs/.sfs): pure-Rust reader. Explicit gzip/zstd/lz4/lzo +
 # parallel; backhand's `xz` feature stays OFF (its liblzma collides with our
 # xz2 on `links = "lzma"`) — xz is decoded via xz2, see format/squashfs.rs.
 # Reopens the file by path because backhand's BufReadSeek requires Send.
-backhand = { workspace = true }
-lzw-z = { path = "../lzw-z" }
+backhand = { version = "0.25", features = ["lzo", "gzip", "zstd", "lz4", "parallel"], default-features = false }
+lzw-z = { package = "newtua-lzw-z", version = "0.1" }
 # ZIP method-14 (LZMA) decode — see format/zip.rs::decode_zip_lzma.
-lzma-rs.workspace = true
+lzma-rs = "0.3"
 # WIM (.wim/.esd) resource chunk decoding: XPRESS-Huffman. See format/wim.rs.
-newtua-mscompress = { path = "../newtua-mscompress" }
+newtua-mscompress = "0.1"
 # HFS+/HFSX (.hfs/.hfsplus/.hfsx, and the filesystem inside DMG images):
-# vendored reader (decmpfs-capable), see crates/hfsplus-forensic/VENDORED.md
+# vendored reader (decmpfs-capable), see the newtua-hfsplus fork's README
 # and format/hfsplus.rs.
-hfsplus-forensic = { path = "../hfsplus-forensic" }
+hfsplus-forensic = { package = "newtua-hfsplus", version = "0.2.0-newtua.1" }
 # Memory-maps the volume for hfsplus-forensic's byte-buffer API. See
 # format/hfsplus.rs::open_hfsplus.
-memmap2.workspace = true
+memmap2 = "0.9"
 # DMG/UDIF container (.dmg): LZFSE (ULFO) chunk decoding. See format/dmg.rs.
-lzfse_rust.workspace = true
+lzfse_rust = "0.2.1"
 # APFS filesystem inside DMG images / bare containers (#21c): vendored reader,
-# see crates/apfs-core/VENDORED.md and format/apfs.rs.
-apfs-core = { path = "../apfs-core" }
+# see the newtua-apfs fork's README and format/apfs.rs.
+apfs-core = { package = "newtua-apfs", version = "0.2.0-newtua.1" }
 # Already resolved transitively (via rpm); used directly to decode the plist
 # `Data` base64 field. See format/dmg.rs.
-base64.workspace = true
+base64 = "0.22"
 # Legacy-format decoders ported from XADMaster (the newtua-formats family).
 # Thin FormatHandler/ArchiveReader adapters live in src/format/legacy/. Each
 # crate exposes a uniform recognize/open/entries/read_entry API over &[u8].
-newtua-dos.workspace = true
-newtua-mac.workspace = true
-newtua-stuffit.workspace = true
-newtua-amiga.workspace = true
-newtua-alz.workspace = true
-newtua-nsis.workspace = true
+newtua-dos = "0.1"
+newtua-mac = "0.1"
+newtua-stuffit = "0.1"
+newtua-amiga = "0.1"
+newtua-alz = "0.1"
+newtua-nsis = "0.1"
 
 [features]
 default = []
 
 [dev-dependencies]
-tar.workspace = true
-tempfile.workspace = true
-zip.workspace = true
-cab.workspace = true
-flate2.workspace = true
-sha2.workspace = true
+tar = "0.4"
+tempfile = "3"
+zip = { version = "2", features = ["lzma", "bzip2", "zstd", "deflate64", "xz"] }
+cab = "0.6"
+flate2 = "1"
+sha2 = "0.10"

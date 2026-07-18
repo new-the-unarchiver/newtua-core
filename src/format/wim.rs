@@ -25,15 +25,13 @@ const FLAG_COMPRESS_LZMS: u32 = 0x0008_0000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Compressor {
     Xpress,
-    /// Decoded via `newtua_mscompress::lzx` (task 20c) — a port of the
-    /// `lzxd` crate's CAB-LZX core with the WIM-specific framing
-    /// differences documented on that module. See
-    /// `task_n_reports/report-20c-mscompress-lzx.md`.
+    /// Decoded via `newtua_mscompress::lzx` — a port of the `lzxd` crate's
+    /// CAB-LZX core with the WIM-specific framing differences documented on
+    /// that module.
     Lzx,
-    /// Decoded via `newtua_mscompress::lzms` (task 20d) — a direct
-    /// translation of wimlib's LZMS decoder (no permissively licensed Rust
-    /// donor exists for this codec). See
-    /// `task_n_reports/report-20d-mscompress-lzms.md`.
+    /// Decoded via `newtua_mscompress::lzms` — a direct translation of
+    /// wimlib's LZMS decoder (no permissively licensed Rust donor exists for
+    /// this codec).
     Lzms,
 }
 

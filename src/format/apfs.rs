@@ -1,13 +1,12 @@
 //! APFS (Apple File System) — a bare container (`.apfs`, `NXSB` magic) or the
 //! filesystem layer inside a DMG image (§7 of `dmg.rs`'s volume locator).
 //!
-//! Backed by the vendored `apfs-core` crate (see `crates/apfs-core/VENDORED.md`)
-//! used at its low level (`dir`/`extent`/`xattr` free functions, no `vfs`
+//! Backed by the vendored `apfs-core` crate (published as `newtua-apfs`; see
+//! its README for why it's a fork) used at its low level (`dir`/`extent`/
+//! `xattr` free functions, no `vfs`
 //! feature) — the same navigation sequence as its own `vfs::ApfsFs::open`.
-//! Unlike the HFS+ handler (#21a), `extent::read_data` transparently decodes
+//! Unlike the HFS+ handler, `extent::read_data` transparently decodes
 //! `decmpfs`-compressed files (zlib/LZVN/LZFSE), so no file reads back empty.
-//!
-//! See `task_n_reports/task-21c-apfs.md` for the full format writeup.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
