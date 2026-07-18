@@ -1,0 +1,21 @@
+newtua-core — the archive extraction engine of New The Unarchiver.
+Copyright (C) 2026 Aleksei Trankov and contributors.
+
+Licensed under the GNU Lesser General Public License, version 3 or (at your
+option) any later version. The full license text is in LICENSE (the GNU Lesser
+General Public License v3); it incorporates by reference the GNU General Public
+License v3, provided in GPL-3.0.txt. If you did not receive these, see
+<https://www.gnu.org/licenses/>.
+
+Provenance: this work is a modern rewrite of The Unarchiver. Its legacy-format
+support is provided by the newtua-formats crate family, whose decoders are
+ported from XADMaster (© Dag Ågren and contributors, GNU LGPL). Because the
+engine links those LGPL components, newtua-core is itself distributed under the
+LGPL.
+
+The engine also depends on three forced forks of third-party crates —
+newtua-unrar, newtua-apfs and newtua-hfsplus — which retain the licenses of
+their respective upstream projects. Each fork's README explains why it exists
+and states the license it carries.
+
+SPDX-License-Identifier: LGPL-3.0-or-later

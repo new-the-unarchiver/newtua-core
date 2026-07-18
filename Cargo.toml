@@ -9,7 +9,11 @@ readme = "README.md"
 repository = "https://github.com/new-the-unarchiver/newtua-core"
 keywords = ["archive", "extract", "unarchiver", "zip", "rar"]
 categories = ["compression", "filesystem"]
-exclude = ["tests/fixtures/**"]
+# Tests and their fixtures stay in the repository and run in CI, but they do
+# not ship: the fixtures alone are 11 MB against a 10 MiB package limit, and
+# the test files embed them with include_bytes!, so shipping the tests without
+# their fixtures would hand consumers a suite that cannot compile.
+exclude = ["tests/**"]
 
 [dependencies]
 ar = "0.9"

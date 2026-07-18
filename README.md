@@ -114,6 +114,15 @@ The engine depends on three **forced forks** — `newtua-unrar`,
 as soon as the upstream crates meet our requirements. Each fork's README
 explains why it exists.
 
+## License
+
+**LGPL-3.0-or-later.** The engine links the `newtua-formats` crate family,
+whose decoders are ported from XADMaster (The Unarchiver) under the LGPL, so
+the engine inherits that license. In practice this means you may link
+`newtua-core` from a program under any license, including a proprietary one,
+provided you keep the engine itself replaceable and pass on its source. See
+[`LICENSE`](LICENSE), [`GPL-3.0.txt`](GPL-3.0.txt) and [`NOTICE`](NOTICE).
+
 ## Part of New The Unarchiver
 
 `newtua-core` is one of the crates behind
