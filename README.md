@@ -114,6 +114,24 @@ The engine depends on three **forced forks** — `newtua-unrar`,
 as soon as the upstream crates meet our requirements. Each fork's README
 explains why it exists.
 
+## Tests
+
+The package published to crates.io carries the library only — no `tests/`
+directory. The suite is driven by real archives: 11 MB of binary fixtures that
+the test files embed at compile time with `include_bytes!`. Shipping them would
+blow past the 10 MiB package limit, and shipping the tests without them would
+hand you a suite that cannot compile at all.
+
+Nothing is hidden. All 572 tests and every fixture live in the
+[repository on GitHub](https://github.com/new-the-unarchiver/newtua-core) and
+run in CI on Linux, macOS and Windows. To run them yourself:
+
+```bash
+git clone https://github.com/new-the-unarchiver/newtua-core
+cd newtua-core
+cargo test
+```
+
 ## License
 
 **LGPL-3.0-or-later.** The engine links the `newtua-formats` crate family,
