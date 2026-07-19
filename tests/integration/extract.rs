@@ -1,5 +1,8 @@
 use newtua_core::{ExtractOptions, OpenOptions, extract_all, open};
 use std::io::Write;
+// Used only by the escaping-symlink test below, which is Unix-only. The other
+// mentions of Path in this file are fully qualified.
+#[cfg(unix)]
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
