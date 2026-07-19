@@ -61,7 +61,7 @@ fn squashfs_symlink_target() {
         .expect("link entry");
     match &link.kind {
         EntryKind::Symlink { target } => {
-            assert_eq!(target.to_string_lossy(), "sub/nested.txt")
+            assert_eq!(target.as_path(), Path::new("sub/nested.txt"))
         }
         other => panic!("expected symlink, got {other:?}"),
     }

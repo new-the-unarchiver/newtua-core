@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use newtua_core::error::Error;
 use newtua_core::format::TarHandler;
 use newtua_core::{EntryKind, FormatHandler, OpenOptions, Source};
@@ -52,7 +54,7 @@ fn lists_tar_entries() {
     let mut ar = h.open(src, &OpenOptions::default()).unwrap();
     let entries = ar.entries().unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].path.to_str().unwrap(), "dir/a.txt");
+    assert_eq!(entries[0].path, Path::new("dir/a.txt"));
     assert_eq!(entries[0].size, 9);
 }
 

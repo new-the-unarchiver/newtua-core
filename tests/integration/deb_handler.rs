@@ -60,7 +60,7 @@ fn assert_payload(path: &Path) {
     let mut ar = open(path, &OpenOptions::default()).unwrap();
     let entries = ar.entries().unwrap();
     assert_eq!(entries.len(), 1, "expected exactly 1 payload entry");
-    assert_eq!(entries[0].path.to_str().unwrap(), "usr/bin/hello");
+    assert_eq!(entries[0].path, Path::new("usr/bin/hello"));
 
     let mut out = Vec::new();
     ar.read_entry(0, &mut out).unwrap();

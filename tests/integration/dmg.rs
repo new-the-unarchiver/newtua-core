@@ -43,7 +43,7 @@ fn assert_standard_fixture_content(path: &std::path::Path) {
 
     let nested = entries
         .iter()
-        .find(|e| e.path.to_string_lossy() == "sub/nested.txt")
+        .find(|e| e.path == Path::new("sub/nested.txt"))
         .expect("sub/nested.txt present");
     assert_eq!(nested.kind, EntryKind::File);
     assert_eq!(nested.size, 12);

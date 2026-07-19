@@ -1,6 +1,7 @@
 use newtua_core::format::CabHandler;
 use newtua_core::{Error, ExtractOptions, FormatHandler, OpenOptions, Source, extract_all};
 use std::io::Write;
+use std::path::Path;
 
 /// Build a single-folder MSZIP cabinet in a temp file. Files are written in the
 /// order declared (the `cab` writer streams `next_file()` in that order).
@@ -34,7 +35,7 @@ fn lists_and_reads_cab() {
     assert_eq!(entries.len(), 2);
     // backslash separators are normalized to forward slashes
     assert_eq!(entries[0].path.to_str().unwrap(), "hello.txt");
-    assert_eq!(entries[1].path.to_str().unwrap(), "dir/nested.txt");
+    assert_eq!(entries[1].path, Path::new("dir/nested.txt"));
     assert_eq!(entries[0].size, 9);
     assert_eq!(entries[1].size, 7);
 

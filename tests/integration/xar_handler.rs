@@ -108,7 +108,7 @@ fn nested_reads_file_inside_directory() {
         let entries = ar.entries().unwrap();
         entries
             .iter()
-            .position(|e| e.path.to_str() == Some("sub/a.txt"))
+            .position(|e| e.path == Path::new("sub/a.txt"))
             .expect("sub/a.txt not found")
     };
     let mut out = Vec::new();

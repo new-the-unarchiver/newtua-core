@@ -54,7 +54,7 @@ fn dmg_with_apfs_volume_lists_and_extracts_known_files() {
 
     let nested = entries
         .iter()
-        .find(|e| e.path.to_string_lossy() == "sub/nested.txt")
+        .find(|e| e.path == Path::new("sub/nested.txt"))
         .expect("sub/nested.txt present");
     assert_eq!(nested.kind, EntryKind::File);
     assert_eq!(nested.size, 12);
@@ -101,7 +101,7 @@ fn apfs_bare_opens_standalone_and_lists_known_files() {
 
     let beth = entries
         .iter()
-        .find(|e| e.path.to_string_lossy() == "Dir1/Beth.txt")
+        .find(|e| e.path == Path::new("Dir1/Beth.txt"))
         .expect("Dir1/Beth.txt present");
     assert_eq!(beth.kind, EntryKind::File);
     assert_eq!(beth.size, 33);
@@ -149,7 +149,7 @@ fn apfs_bare_symlink_target_matches_readlink_oracle() {
         .expect("symlink_to_beth present");
     match &link.kind {
         EntryKind::Symlink { target } => {
-            assert_eq!(target.to_string_lossy(), "Dir1/Beth.txt");
+            assert_eq!(target.as_path(), Path::new("Dir1/Beth.txt"));
         }
         other => panic!("expected Symlink, got {other:?}"),
     }

@@ -2,6 +2,7 @@
 //!
 
 use std::io::{Cursor, Write};
+use std::path::Path;
 
 use newtua_core::{OpenOptions, detect};
 
@@ -289,13 +290,13 @@ fn msi_multi_cab_entries_are_prefixed() {
 
     // Entries are in insertion order: media1/a.txt then media2/b.txt.
     assert_eq!(
-        entries[0].path.to_str().unwrap(),
-        "media1/a.txt",
+        entries[0].path,
+        Path::new("media1/a.txt"),
         "first entry must be prefixed with 'media1'"
     );
     assert_eq!(
-        entries[1].path.to_str().unwrap(),
-        "media2/b.txt",
+        entries[1].path,
+        Path::new("media2/b.txt"),
         "second entry must be prefixed with 'media2'"
     );
 }
@@ -508,8 +509,8 @@ fn msi_resolves_nested_install_path() {
     let entries = reader.entries().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(
-        entries[0].path.to_str().unwrap(),
-        "ProgramFilesFolder/MyApp/sub/hello.txt"
+        entries[0].path,
+        Path::new("ProgramFilesFolder/MyApp/sub/hello.txt")
     );
 
     let mut out = Vec::new();
@@ -548,7 +549,7 @@ fn msi_resolution_drops_dot_directory() {
     let mut reader = detect::open(msi_file.path(), &OpenOptions::default()).unwrap();
     let entries = reader.entries().unwrap();
     // INSTALLDIR has DefaultDir "." → contributes no segment.
-    assert_eq!(entries[0].path.to_str().unwrap(), "bin/app.exe");
+    assert_eq!(entries[0].path, Path::new("bin/app.exe"));
 }
 
 #[test]
@@ -641,13 +642,13 @@ fn msi_unknown_file_key_falls_back_to_member_name() {
 
     let mut reader = detect::open(tmp.path(), &OpenOptions::default()).unwrap();
     let entries = reader.entries().unwrap();
-    let paths: Vec<&str> = entries.iter().map(|e| e.path.to_str().unwrap()).collect();
+    let paths: Vec<&Path> = entries.iter().map(|e| e.path.as_path()).collect();
     assert!(
-        paths.contains(&"bin/known.txt"),
+        paths.contains(&Path::new("bin/known.txt")),
         "known file resolves; got {paths:?}"
     );
     assert!(
-        paths.contains(&"orphan"),
+        paths.contains(&Path::new("orphan")),
         "orphan keeps CAB member name; got {paths:?}"
     );
 }

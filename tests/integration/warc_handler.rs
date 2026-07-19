@@ -3,6 +3,7 @@
 /// Fixtures are built programmatically (WARC is plain text + gzip) — no
 /// committed binary files are required.
 use std::io::Write as _;
+use std::path::Path;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -146,13 +147,13 @@ fn warc_list_and_extract_plain() {
 
     // Verify derived paths from WARC-Target-URI.
     assert_eq!(
-        entries[0].path.to_string_lossy(),
-        "example.com/page.html",
+        entries[0].path,
+        Path::new("example.com/page.html"),
         "response entry path"
     );
     assert_eq!(
-        entries[1].path.to_string_lossy(),
-        "example.com/data.bin",
+        entries[1].path,
+        Path::new("example.com/data.bin"),
         "resource entry path"
     );
 
@@ -194,8 +195,8 @@ fn warc_gz_opens_as_warc_not_gzip() {
         entries.len()
     );
 
-    assert_eq!(entries[0].path.to_string_lossy(), "example.com/page.html");
-    assert_eq!(entries[1].path.to_string_lossy(), "example.com/data.bin");
+    assert_eq!(entries[0].path, Path::new("example.com/page.html"));
+    assert_eq!(entries[1].path, Path::new("example.com/data.bin"));
 
     // Verify bodies are correct even after gzip decompression.
     let mut body0 = Vec::new();
@@ -272,9 +273,9 @@ fn warc_duplicate_uri_deduplication() {
     let entries = reader.entries().expect("entries");
 
     assert_eq!(entries.len(), 2, "expected 2 entries");
-    assert_eq!(entries[0].path.to_string_lossy(), "example.com/file.txt");
+    assert_eq!(entries[0].path, Path::new("example.com/file.txt"));
     // Second occurrence gets a -1 suffix.
-    assert_eq!(entries[1].path.to_string_lossy(), "example.com/file.txt-1");
+    assert_eq!(entries[1].path, Path::new("example.com/file.txt-1"));
 
     let mut b0 = Vec::new();
     reader.read_entry(0, &mut b0).expect("read_entry 0");

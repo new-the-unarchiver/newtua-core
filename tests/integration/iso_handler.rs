@@ -56,7 +56,7 @@ fn open_lists_root_file_and_subdirectory() {
     // Find sub/inner.txt
     let inner = entries
         .iter()
-        .find(|e| e.path.to_str().unwrap_or("") == "sub/inner.txt")
+        .find(|e| e.path == Path::new("sub/inner.txt"))
         .expect("sub/inner.txt not found in entries");
     assert_eq!(inner.kind, EntryKind::File);
     assert_eq!(inner.size, 7, "sub/inner.txt should be 7 bytes");
@@ -88,7 +88,7 @@ fn read_nested_file_content() {
     let entries = reader.entries().expect("entries");
     let idx = entries
         .iter()
-        .position(|e| e.path.to_str().unwrap_or("") == "sub/inner.txt")
+        .position(|e| e.path == Path::new("sub/inner.txt"))
         .expect("sub/inner.txt not found");
 
     let mut buf = Vec::new();

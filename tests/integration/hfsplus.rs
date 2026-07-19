@@ -39,7 +39,7 @@ fn hfs_ci_lists_known_files() {
 
     let nested = entries
         .iter()
-        .find(|e| e.path.to_string_lossy() == "sub/nested.txt")
+        .find(|e| e.path == Path::new("sub/nested.txt"))
         .expect("sub/nested.txt present");
     assert_eq!(nested.kind, EntryKind::File);
     assert_eq!(nested.size, 12);
@@ -85,7 +85,7 @@ fn hfs_cs_hfsx_opens_and_lists_known_files() {
     assert!(
         entries
             .iter()
-            .any(|e| e.path.to_string_lossy() == "sub/nested.txt" && e.size == 12)
+            .any(|e| e.path == Path::new("sub/nested.txt") && e.size == 12)
     );
     assert_eq!(body_of(reader.as_mut(), "hello.txt"), b"hello hfs+\n");
 }

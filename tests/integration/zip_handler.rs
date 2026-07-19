@@ -1,6 +1,7 @@
 use newtua_core::format::ZipHandler;
 use newtua_core::{Error, FormatHandler, OpenOptions, Source};
 use std::io::Write;
+use std::path::Path;
 
 fn make_zip(password: Option<&str>) -> tempfile::NamedTempFile {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -24,7 +25,7 @@ fn lists_and_extracts_plain_zip() {
     let mut ar = ZipHandler.open(src, &OpenOptions::default()).unwrap();
     let entries = ar.entries().unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].path.to_str().unwrap(), "dir/a.txt");
+    assert_eq!(entries[0].path, Path::new("dir/a.txt"));
     let mut out = Vec::new();
     ar.read_entry(0, &mut out).unwrap();
     assert_eq!(out, b"hello zip");
