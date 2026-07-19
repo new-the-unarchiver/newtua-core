@@ -16,7 +16,7 @@ fn body_of(reader: &mut dyn ArchiveReader, name: &str) -> Vec<u8> {
         let entries = reader.entries().expect("entries");
         entries
             .iter()
-            .position(|e| e.path.to_string_lossy() == name)
+            .position(|e| e.path == Path::new(name))
             .unwrap_or_else(|| panic!("entry {name} not found"))
     };
     let mut body = Vec::new();
@@ -32,7 +32,7 @@ fn hfs_ci_lists_known_files() {
 
     let hello = entries
         .iter()
-        .find(|e| e.path.to_string_lossy() == "hello.txt")
+        .find(|e| e.path == Path::new("hello.txt"))
         .expect("hello.txt present");
     assert_eq!(hello.kind, EntryKind::File);
     assert_eq!(hello.size, 11);
@@ -46,7 +46,7 @@ fn hfs_ci_lists_known_files() {
 
     let sub = entries
         .iter()
-        .find(|e| e.path.to_string_lossy() == "sub")
+        .find(|e| e.path == Path::new("sub"))
         .expect("sub dir present");
     assert_eq!(sub.kind, EntryKind::Dir);
 }
@@ -65,7 +65,7 @@ fn hfs_ci_dir_read_is_empty() {
         .entries()
         .expect("entries")
         .iter()
-        .position(|e| e.path.to_string_lossy() == "sub")
+        .position(|e| e.path == Path::new("sub"))
         .expect("sub dir");
     let mut body = Vec::new();
     reader.read_entry(idx, &mut body).expect("read dir");
@@ -80,7 +80,7 @@ fn hfs_cs_hfsx_opens_and_lists_known_files() {
     assert!(
         entries
             .iter()
-            .any(|e| e.path.to_string_lossy() == "hello.txt" && e.size == 11)
+            .any(|e| e.path == Path::new("hello.txt") && e.size == 11)
     );
     assert!(
         entries
@@ -164,7 +164,7 @@ fn decmpfs_file_decompresses_fully() {
     let entries = reader.entries().expect("entries");
     let bigfile = entries
         .iter()
-        .find(|e| e.path.to_string_lossy() == "bigfile.txt")
+        .find(|e| e.path == Path::new("bigfile.txt"))
         .expect("bigfile.txt present");
     assert_eq!(bigfile.kind, EntryKind::File);
 
@@ -189,7 +189,7 @@ fn symlink_is_typed_and_targets_original() {
         let entries = reader.entries().expect("entries");
         let link = entries
             .iter()
-            .find(|e| e.path.to_string_lossy() == "link_to_bigfile")
+            .find(|e| e.path == Path::new("link_to_bigfile"))
             .expect("link_to_bigfile present");
         match &link.kind {
             EntryKind::Symlink { target } => target.to_string_lossy().into_owned(),
@@ -229,7 +229,7 @@ fn undecodable_decmpfs_is_corrupt_not_empty() {
         .entries()
         .expect("entries")
         .iter()
-        .position(|e| e.path.to_string_lossy() == "bigfile.txt")
+        .position(|e| e.path == Path::new("bigfile.txt"))
         .expect("bigfile.txt present");
     let mut sink = Vec::new();
     let err = reader

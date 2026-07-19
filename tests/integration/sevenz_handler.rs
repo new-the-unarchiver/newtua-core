@@ -3,6 +3,7 @@ use newtua_core::{FormatHandler, OpenOptions, Source};
 // Used only by the symlink tests below, which are Unix-only.
 #[cfg(unix)]
 use newtua_core::{EntryKind, ExtractOptions, extract_all};
+use std::path::Path;
 
 // Fixture: pre-built 7z archive with one entry "a.txt" = "hello 7z".
 const FIXTURE: &[u8] = include_bytes!("../fixtures/hello.7z");
@@ -151,7 +152,7 @@ fn sevenz_populates_mode_when_available() {
     let entries = ar.entries().unwrap().to_vec();
     let f = entries
         .iter()
-        .find(|e| e.path.to_str() == Some("f.txt"))
+        .find(|e| e.path == Path::new("f.txt"))
         .unwrap();
     assert_eq!(f.mode, Some(0o755));
 }
@@ -168,7 +169,7 @@ fn sevenz_symlink_target_populated() {
     let entries = ar.entries().unwrap();
     let slink = entries
         .iter()
-        .find(|e| e.path.file_name().map(|n| n == "slink").unwrap_or(false))
+        .find(|e| e.path.file_name() == Some(Path::new("slink").as_os_str()))
         .expect("entry 'slink' not found in symlink.7z");
     assert_eq!(
         slink.kind,
@@ -226,11 +227,11 @@ fn multi_entry_on_demand_extraction() {
     // Determine which index corresponds to f1.txt / f2.txt (order may vary).
     let idx_f1 = entries
         .iter()
-        .position(|e| e.path.file_name().map(|n| n == "f1.txt").unwrap_or(false))
+        .position(|e| e.path.file_name() == Some(Path::new("f1.txt").as_os_str()))
         .expect("f1.txt not found");
     let idx_f2 = entries
         .iter()
-        .position(|e| e.path.file_name().map(|n| n == "f2.txt").unwrap_or(false))
+        .position(|e| e.path.file_name() == Some(Path::new("f2.txt").as_os_str()))
         .expect("f2.txt not found");
 
     // Extract f2 first to confirm on-demand (not sequential) access.

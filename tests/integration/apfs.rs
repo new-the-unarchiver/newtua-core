@@ -28,7 +28,7 @@ fn body_of(reader: &mut dyn ArchiveReader, name: &str) -> Vec<u8> {
         let entries = reader.entries().expect("entries");
         entries
             .iter()
-            .position(|e| e.path.to_string_lossy() == name)
+            .position(|e| e.path == Path::new(name))
             .unwrap_or_else(|| panic!("entry {name} not found"))
     };
     let mut body = Vec::new();
@@ -47,7 +47,7 @@ fn dmg_with_apfs_volume_lists_and_extracts_known_files() {
     let entries = reader.entries().expect("entries").to_vec();
     let hello = entries
         .iter()
-        .find(|e| e.path.to_string_lossy() == "hello.txt")
+        .find(|e| e.path == Path::new("hello.txt"))
         .expect("hello.txt present");
     assert_eq!(hello.kind, EntryKind::File);
     assert_eq!(hello.size, 11);
@@ -61,7 +61,7 @@ fn dmg_with_apfs_volume_lists_and_extracts_known_files() {
 
     let sub = entries
         .iter()
-        .find(|e| e.path.to_string_lossy() == "sub")
+        .find(|e| e.path == Path::new("sub"))
         .expect("sub dir present");
     assert_eq!(sub.kind, EntryKind::Dir);
 
@@ -76,7 +76,7 @@ fn dmg_with_apfs_dir_read_is_empty() {
         .entries()
         .expect("entries")
         .iter()
-        .position(|e| e.path.to_string_lossy() == "sub")
+        .position(|e| e.path == Path::new("sub"))
         .expect("sub dir");
     let mut body = Vec::new();
     reader.read_entry(idx, &mut body).expect("read dir");
@@ -94,7 +94,7 @@ fn apfs_bare_opens_standalone_and_lists_known_files() {
     let entries = reader.entries().expect("entries").to_vec();
     let plain = entries
         .iter()
-        .find(|e| e.path.to_string_lossy() == "plain.txt")
+        .find(|e| e.path == Path::new("plain.txt"))
         .expect("plain.txt present");
     assert_eq!(plain.kind, EntryKind::File);
     assert_eq!(plain.size, 35);
@@ -145,7 +145,7 @@ fn apfs_bare_symlink_target_matches_readlink_oracle() {
     let entries = reader.entries().expect("entries");
     let link = entries
         .iter()
-        .find(|e| e.path.to_string_lossy() == "symlink_to_beth")
+        .find(|e| e.path == Path::new("symlink_to_beth"))
         .expect("symlink_to_beth present");
     match &link.kind {
         EntryKind::Symlink { target } => {

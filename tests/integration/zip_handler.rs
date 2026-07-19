@@ -151,13 +151,13 @@ fn zip_populates_mode_and_symlink() {
 
     let f = entries
         .iter()
-        .find(|e| e.path.to_str() == Some("f.txt"))
+        .find(|e| e.path == Path::new("f.txt"))
         .unwrap();
     assert_eq!(f.mode, Some(0o644));
 
     let link = entries
         .iter()
-        .find(|e| e.path.to_str() == Some("link"))
+        .find(|e| e.path == Path::new("link"))
         .unwrap();
     assert_eq!(
         link.kind,

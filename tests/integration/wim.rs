@@ -1,7 +1,7 @@
 use newtua_core::archive::{ArchiveReader, EntryKind, FormatId, OpenOptions};
 use newtua_core::detect::open;
 use newtua_core::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn fixture(name: &str) -> std::path::PathBuf {
@@ -15,7 +15,7 @@ fn body_of(reader: &mut dyn ArchiveReader, name: &str) -> Vec<u8> {
         let entries = reader.entries().expect("entries");
         entries
             .iter()
-            .position(|e| e.path.to_string_lossy() == name)
+            .position(|e| e.path == Path::new(name))
             .unwrap_or_else(|| panic!("entry {name} not found"))
     };
     let mut body = Vec::new();
@@ -27,22 +27,28 @@ fn body_of(reader: &mut dyn ArchiveReader, name: &str) -> Vec<u8> {
 /// is listed and extracts correctly.
 fn assert_standard_tree(reader: &mut dyn ArchiveReader) {
     let entries = reader.entries().expect("entries");
-    let names: Vec<String> = entries
-        .iter()
-        .map(|e| e.path.to_string_lossy().into_owned())
-        .collect();
-    assert!(names.iter().any(|n| n == "a.txt"), "names: {names:?}");
-    assert!(names.iter().any(|n| n == "empty.txt"), "names: {names:?}");
-    assert!(names.iter().any(|n| n == "sub"), "names: {names:?}");
-    assert!(names.iter().any(|n| n == "sub/b.txt"), "names: {names:?}");
+    let names: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
     assert!(
-        !names.iter().any(|n| n.starts_with('/')),
+        names.iter().any(|n| n == Path::new("a.txt")),
+        "names: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == Path::new("empty.txt")),
+        "names: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == Path::new("sub")),
+        "names: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == Path::new("sub/b.txt")),
+        "names: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.is_absolute()),
         "no leading slash: {names:?}"
     );
-    let sub = entries
-        .iter()
-        .find(|e| e.path.to_string_lossy() == "sub")
-        .unwrap();
+    let sub = entries.iter().find(|e| e.path == Path::new("sub")).unwrap();
     assert_eq!(sub.kind, EntryKind::Dir);
 
     assert_eq!(body_of(reader, "a.txt"), b"hello wim\n");
@@ -52,7 +58,7 @@ fn assert_standard_tree(reader: &mut dyn ArchiveReader) {
         .entries()
         .unwrap()
         .iter()
-        .position(|e| e.path.to_string_lossy() == "empty.txt")
+        .position(|e| e.path == Path::new("empty.txt"))
         .unwrap();
     assert_eq!(reader.entries().unwrap()[empty_idx].size, 0);
     let mut body = Vec::new();

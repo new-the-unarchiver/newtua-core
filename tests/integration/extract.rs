@@ -1,5 +1,6 @@
 use newtua_core::{ExtractOptions, OpenOptions, extract_all, open};
 use std::io::Write;
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 fn e(path: &str, is_dir: bool) -> newtua_core::Entry {
@@ -351,7 +352,7 @@ fn rejects_escaping_symlink() {
         report
             .failed
             .iter()
-            .any(|(p, _)| p.to_str() == Some("evil"))
+            .any(|(p, _)| p.as_path() == Path::new("evil"))
     );
     let _ = EntryKind::File; // silence unused import if needed
     assert!(!dest.path().join("arc/evil").exists());

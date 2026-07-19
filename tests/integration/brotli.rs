@@ -42,11 +42,11 @@ fn tar_dot_br_lists_members() {
 
         let idx = entries
             .iter()
-            .position(|e| e.path.to_string_lossy() == "a.txt")
+            .position(|e| e.path == Path::new("a.txt"))
             .unwrap();
         let idx_b = entries
             .iter()
-            .position(|e| e.path.to_string_lossy() == "b.txt")
+            .position(|e| e.path == Path::new("b.txt"))
             .unwrap();
         (idx, idx_b)
     };

@@ -1,6 +1,6 @@
 use newtua_core::archive::{ArchiveReader, EntryKind, FormatId, OpenOptions};
 use newtua_core::detect::open;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -13,7 +13,7 @@ fn body_of(reader: &mut dyn ArchiveReader, name: &str) -> Vec<u8> {
         let entries = reader.entries().expect("entries");
         entries
             .iter()
-            .position(|e| e.path.to_string_lossy() == name)
+            .position(|e| e.path == Path::new(name))
             .unwrap_or_else(|| panic!("entry {name} not found"))
     };
     let mut body = Vec::new();
@@ -27,26 +27,26 @@ fn squashfs_reports_format_and_lists_tree() {
         open(&fixture("tree-gzip.squashfs"), &OpenOptions::default()).expect("open squashfs");
     assert_eq!(reader.format(), FormatId::Squashfs);
     let entries = reader.entries().expect("entries");
-    let names: Vec<String> = entries
-        .iter()
-        .map(|e| e.path.to_string_lossy().into_owned())
-        .collect();
-    assert!(names.iter().any(|n| n == "hello.txt"), "names: {names:?}");
-    assert!(names.iter().any(|n| n == "sub"), "names: {names:?}");
+    let names: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
     assert!(
-        names.iter().any(|n| n == "sub/nested.txt"),
+        names.iter().any(|n| n == Path::new("hello.txt")),
         "names: {names:?}"
     );
-    assert!(names.iter().any(|n| n == "link"), "names: {names:?}");
+    assert!(
+        names.iter().any(|n| n == Path::new("sub")),
+        "names: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == Path::new("sub/nested.txt")),
+        "names: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == Path::new("link")),
+        "names: {names:?}"
+    );
     // No leading '/', no special nodes.
-    assert!(
-        !names.iter().any(|n| n.starts_with('/')),
-        "names: {names:?}"
-    );
-    let sub = entries
-        .iter()
-        .find(|e| e.path.to_string_lossy() == "sub")
-        .unwrap();
+    assert!(!names.iter().any(|n| n.is_absolute()), "names: {names:?}");
+    let sub = entries.iter().find(|e| e.path == Path::new("sub")).unwrap();
     assert_eq!(sub.kind, EntryKind::Dir);
 }
 
@@ -57,7 +57,7 @@ fn squashfs_symlink_target() {
     let entries = reader.entries().expect("entries");
     let link = entries
         .iter()
-        .find(|e| e.path.to_string_lossy() == "link")
+        .find(|e| e.path == Path::new("link"))
         .expect("link entry");
     match &link.kind {
         EntryKind::Symlink { target } => {
@@ -85,7 +85,7 @@ fn squashfs_dir_read_is_empty() {
         .entries()
         .expect("entries")
         .iter()
-        .position(|e| e.path.to_string_lossy() == "sub")
+        .position(|e| e.path == Path::new("sub"))
         .expect("sub dir");
     let mut body = Vec::new();
     reader.read_entry(idx, &mut body).expect("read dir");

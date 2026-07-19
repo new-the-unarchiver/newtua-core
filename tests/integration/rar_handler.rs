@@ -1,5 +1,6 @@
 use newtua_core::format::RarHandler;
 use newtua_core::{FormatHandler, OpenOptions, Source};
+use std::path::Path;
 
 const FIXTURE: &[u8] = include_bytes!("../fixtures/hello.rar");
 
@@ -34,7 +35,7 @@ fn rar_populates_mode_when_available() {
     let entries = ar.entries().unwrap().to_vec();
     let f = entries
         .iter()
-        .find(|e| e.path.to_str() == Some("f.txt"))
+        .find(|e| e.path == Path::new("f.txt"))
         .expect("f.txt not found in meta.rar");
     // The unrar crate exposes file_attr: u32 on FileHeader.
     // For Unix-created RARs, file_attr is the full POSIX st_mode (e.g. 0o100755).

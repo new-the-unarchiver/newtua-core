@@ -39,7 +39,7 @@ fn tar_dot_z_lists_members() {
 
     let idx = entries
         .iter()
-        .position(|e| e.path.to_string_lossy() == "a.txt")
+        .position(|e| e.path == Path::new("a.txt"))
         .unwrap();
     let mut body = Vec::new();
     reader.read_entry(idx, &mut body).expect("read a.txt");
@@ -48,7 +48,7 @@ fn tar_dot_z_lists_members() {
     let entries = reader.entries().expect("entries");
     let idx_b = entries
         .iter()
-        .position(|e| e.path.to_string_lossy() == "b.txt")
+        .position(|e| e.path == Path::new("b.txt"))
         .unwrap();
     let mut body_b = Vec::new();
     reader.read_entry(idx_b, &mut body_b).expect("read b.txt");

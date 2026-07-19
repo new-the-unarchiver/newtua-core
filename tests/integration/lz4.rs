@@ -40,7 +40,7 @@ fn tar_dot_lz4_lists_members() {
 
     let idx = entries
         .iter()
-        .position(|e| e.path.to_string_lossy() == "a.txt")
+        .position(|e| e.path == Path::new("a.txt"))
         .unwrap();
     let mut body = Vec::new();
     reader.read_entry(idx, &mut body).expect("read a.txt");

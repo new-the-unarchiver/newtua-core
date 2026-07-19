@@ -38,7 +38,7 @@ fn lists_known_member() {
     // The fixture was created with a single file "f.txt"
     let file_entry = entries
         .iter()
-        .find(|e| e.path.to_str().unwrap_or("") == "f.txt")
+        .find(|e| e.path == Path::new("f.txt"))
         .expect("f.txt not found in fixture entries");
 
     assert_eq!(file_entry.kind, EntryKind::File);
@@ -52,7 +52,7 @@ fn reads_exact_bytes_from_fixture() {
 
     let idx = entries
         .iter()
-        .position(|e| e.path.to_str().unwrap_or("") == "f.txt")
+        .position(|e| e.path == Path::new("f.txt"))
         .expect("f.txt not in entries");
 
     let mut out = Vec::new();
@@ -78,7 +78,7 @@ fn nested_full_paths_and_kinds() {
     assert_eq!(ar.format(), FormatId::Xar);
     let entries = ar.entries().unwrap();
 
-    let by_path = |p: &str| entries.iter().find(|e| e.path.to_str() == Some(p));
+    let by_path = |p: &str| entries.iter().find(|e| e.path == Path::new(p));
 
     // Nested files carry their full path, not just the leaf name.
     assert_eq!(

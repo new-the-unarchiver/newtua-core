@@ -283,20 +283,17 @@ fn tar_populates_mode_and_symlink() {
 
     let file = entries
         .iter()
-        .find(|e| e.path.to_str() == Some("exec.sh"))
+        .find(|e| e.path == Path::new("exec.sh"))
         .unwrap();
     assert_eq!(file.mode, Some(0o755));
     assert_eq!(file.kind, EntryKind::File);
 
-    let dir = entries
-        .iter()
-        .find(|e| e.path.to_str() == Some("d"))
-        .unwrap();
+    let dir = entries.iter().find(|e| e.path == Path::new("d")).unwrap();
     assert!(dir.is_dir());
 
     let link = entries
         .iter()
-        .find(|e| e.path.to_str() == Some("link"))
+        .find(|e| e.path == Path::new("link"))
         .unwrap();
     assert_eq!(
         link.kind,

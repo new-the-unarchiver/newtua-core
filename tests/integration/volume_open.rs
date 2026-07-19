@@ -12,6 +12,7 @@
 ///   Opening part1 should list 1 entry and extract the full file.
 use newtua_core::{OpenOptions, open};
 use std::io::Write;
+use std::path::Path;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -68,7 +69,7 @@ fn split_zip_opens_via_001_suffix() {
     // Extract entry "a.txt" (index 0) and verify content.
     let a_idx = entries
         .iter()
-        .position(|e| e.path.to_str() == Some("a.txt"))
+        .position(|e| e.path == Path::new("a.txt"))
         .unwrap();
     let mut out = Vec::new();
     ar.read_entry(a_idx, &mut out).unwrap();

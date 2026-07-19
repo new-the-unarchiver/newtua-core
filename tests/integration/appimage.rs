@@ -6,7 +6,7 @@
 //! Type 1). This keeps the ELF layout visible in code and avoids committing
 //! blobs that merely concatenate existing fixtures.
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use newtua_core::archive::{ArchiveReader, EntryKind, FormatId, OpenOptions};
 use newtua_core::detect::open;
@@ -57,7 +57,7 @@ fn body_of(reader: &mut dyn ArchiveReader, name: &str) -> Vec<u8> {
         let entries = reader.entries().expect("entries");
         entries
             .iter()
-            .position(|e| e.path.to_string_lossy() == name)
+            .position(|e| e.path == Path::new(name))
             .unwrap_or_else(|| panic!("entry {name} not found"))
     };
     let mut body = Vec::new();
@@ -71,15 +71,18 @@ fn type2_squashfs_gzip_lists_and_extracts() {
     let mut reader = open(app.path(), &OpenOptions::default()).expect("open appimage");
     assert_eq!(reader.format(), FormatId::AppImage);
 
-    let names: Vec<String> = reader
+    let names: Vec<PathBuf> = reader
         .entries()
         .expect("entries")
         .iter()
-        .map(|e| e.path.to_string_lossy().into_owned())
+        .map(|e| e.path.clone())
         .collect();
-    assert!(names.iter().any(|n| n == "hello.txt"), "names: {names:?}");
     assert!(
-        names.iter().any(|n| n == "sub/nested.txt"),
+        names.iter().any(|n| n == Path::new("hello.txt")),
+        "names: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == Path::new("sub/nested.txt")),
         "names: {names:?}"
     );
 
@@ -107,7 +110,7 @@ fn type1_iso_lists_and_extracts() {
     let entries = reader.entries().expect("entries");
     let hello = entries
         .iter()
-        .find(|e| e.path.to_string_lossy() == "hello.txt")
+        .find(|e| e.path == Path::new("hello.txt"))
         .expect("hello.txt");
     assert_eq!(hello.kind, EntryKind::File);
     assert_eq!(body_of(reader.as_mut(), "hello.txt"), b"hello iso\n");

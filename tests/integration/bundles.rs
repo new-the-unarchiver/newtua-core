@@ -13,7 +13,7 @@ fn body_of(reader: &mut dyn newtua_core::archive::ArchiveReader, name: &str) -> 
         let entries = reader.entries().expect("entries");
         entries
             .iter()
-            .position(|e| e.path.to_string_lossy() == name)
+            .position(|e| e.path == Path::new(name))
             .unwrap_or_else(|| panic!("entry {name} not found"))
     };
     let mut body = Vec::new();
