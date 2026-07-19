@@ -18,4 +18,18 @@ newtua-unrar, newtua-apfs, newtua-hfsplus and newtua-cdfs — which retain the
 licenses of their respective upstream projects. Each fork's README explains why it exists
 and states the license it carries.
 
+RAR support and the UnRAR license. RAR archives are read through libunrar, by
+way of the newtua-unrar fork. The UnRAR sources are not part of this
+repository: Cargo fetches them (as unrar_sys) at build time. They carry a
+license of their own (© Alexander Roshal) that permits use in any software
+handling RAR archives, but forbids using the code to build a RAR-compatible
+archiver.
+
+That restriction reaches no user of this software. newtua never creates
+archives — it extracts and lists only — so no RAR compressor can be derived
+from it. Where a build does combine the two, the result is conveyed under
+section 4 of the LGPL v3, which permits a Combined Work under other terms
+provided the library is identified and its license supplied. Binary artifacts
+published by this project ship the UnRAR license text alongside this notice.
+
 SPDX-License-Identifier: LGPL-3.0-or-later
