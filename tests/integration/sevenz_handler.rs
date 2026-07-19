@@ -1,5 +1,8 @@
 use newtua_core::format::SevenZHandler;
-use newtua_core::{EntryKind, ExtractOptions, FormatHandler, OpenOptions, Source, extract_all};
+use newtua_core::{FormatHandler, OpenOptions, Source};
+// Used only by the symlink tests below, which are Unix-only.
+#[cfg(unix)]
+use newtua_core::{EntryKind, ExtractOptions, extract_all};
 
 // Fixture: pre-built 7z archive with one entry "a.txt" = "hello 7z".
 const FIXTURE: &[u8] = include_bytes!("../fixtures/hello.7z");
