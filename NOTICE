@@ -13,9 +13,9 @@ ported from XADMaster (© Dag Ågren and contributors, GNU LGPL). Because the
 engine links those LGPL components, newtua-core is itself distributed under the
 LGPL.
 
-The engine also depends on three forced forks of third-party crates —
-newtua-unrar, newtua-apfs and newtua-hfsplus — which retain the licenses of
-their respective upstream projects. Each fork's README explains why it exists
+The engine also depends on four forced forks of third-party crates —
+newtua-unrar, newtua-apfs, newtua-hfsplus and newtua-cdfs — which retain the
+licenses of their respective upstream projects. Each fork's README explains why it exists
 and states the license it carries.
 
 SPDX-License-Identifier: LGPL-3.0-or-later

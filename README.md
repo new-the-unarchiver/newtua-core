@@ -109,10 +109,14 @@ Ports from XADMaster, backed by the `newtua-formats` crate family.
 
 ## Dependencies
 
-The engine depends on three **forced forks** — `newtua-unrar`,
-`newtua-apfs`, `newtua-hfsplus`. We do not develop them and will drop them
-as soon as the upstream crates meet our requirements. Each fork's README
-explains why it exists.
+The engine depends on four **forced forks** — `newtua-unrar`,
+`newtua-apfs`, `newtua-hfsplus` and `newtua-cdfs`. We do not develop them and
+will drop them as soon as the upstream crates meet our requirements. Each
+fork's README explains why it exists.
+
+None of them requires a system library. That is largely the point of
+`newtua-cdfs`: upstream `cdfs` would otherwise make every Linux build depend on
+`libfuse3`, for a mounting feature this engine never uses.
 
 ## Tests
 

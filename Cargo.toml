@@ -1,6 +1,6 @@
 [package]
 name = "newtua-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "LGPL-3.0-or-later"
@@ -43,7 +43,11 @@ roxmltree = "0.21"
 # File/Component/Directory tables to real install paths (model C) and reuses
 # CabHandler for the embedded CAB bytes. Always built.
 msi = "0.10"
-cdfs = "0.2.3"
+# ISO 9660 (.iso): forced fork of `cdfs`. Its last release declares `fuser` as
+# an ordinary dependency of the library, so building on Linux would demand the
+# system libfuse3 package for a mounting feature we never use. Upstream already
+# split the binary off; the fix is unreleased. Lib name stays `cdfs`.
+cdfs = { package = "newtua-cdfs", version = "0.2.4-newtua.1" }
 goblin = { version = "0.10", default-features = false, features = ["pe32", "pe64", "std", "endian_fd"] }
 warc = "0.4"
 # SquashFS (.squashfs/.sfs): pure-Rust reader. Explicit gzip/zstd/lz4/lzo +
