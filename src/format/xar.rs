@@ -231,12 +231,20 @@ fn collect(
         // already guarded by `safe_join`, but skipping these keeps the listing
         // metadata honest (no `../` or absolute paths shown). Descendants of a
         // rejected directory are skipped with it.
-        let np = Path::new(&name);
-        if np.is_absolute()
-            || np
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
+        //
+        // The test is by component, not `is_absolute()`: on Windows a leading
+        // slash is "rooted" but not absolute (only `C:\` or a UNC path is), so
+        // `is_absolute()` would wave `/etc/passwd` through there. This matches
+        // what `safe_join` does, and behaves the same on every platform.
+        let normalized = name.replace('\\', "/");
+        if Path::new(&normalized).components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
             continue;
         }
         let path = parent.join(&name);
@@ -665,17 +673,38 @@ mod tests {
         assert!(matches!(ar.read_entry(0, &mut out), Err(Error::Corrupt(_))));
     }
 
-    /// Names with `..` or absolute paths are skipped from the listing.
+    /// Names that escape the extraction root are skipped from the listing, on
+    /// every platform. A rooted name like `/etc/passwd` is the interesting one:
+    /// Windows does not consider it absolute, so a `is_absolute()` test would
+    /// let it through there.
     #[test]
     fn traversal_names_are_skipped() {
         let xml = "<xar><toc>\
             <file id=\"1\"><name>../evil</name><type>file</type></file>\
             <file id=\"2\"><name>/etc/passwd</name><type>file</type></file>\
-            <file id=\"3\"><name>ok.txt</name><type>file</type></file>\
+            <file id=\"3\"><name>..\\evil</name><type>file</type></file>\
+            <file id=\"4\"><name>ok.txt</name><type>file</type></file>\
             </toc></xar>";
         let mut ar = open_bytes(build_xar(xml)).expect("open should succeed");
         let entries = ar.entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path.to_str(), Some("ok.txt"));
+    }
+
+    /// A drive letter is an escape only where drives exist. On Unix `C:` is an
+    /// ordinary directory name and the entry is legitimately kept, so this
+    /// expectation is platform-specific rather than shared with the test above.
+    #[test]
+    fn drive_letter_names_are_skipped_on_windows() {
+        let xml = "<xar><toc>\
+            <file id=\"1\"><name>C:\\Windows\\evil</name><type>file</type></file>\
+            </toc></xar>";
+        let mut ar = open_bytes(build_xar(xml)).expect("open should succeed");
+        let entries = ar.entries().unwrap();
+        if cfg!(windows) {
+            assert!(entries.is_empty(), "a drive-qualified name must be skipped");
+        } else {
+            assert_eq!(entries.len(), 1, "`C:` is a plain directory name here");
+        }
     }
 }
