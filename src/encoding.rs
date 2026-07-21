@@ -13,6 +13,14 @@ pub fn decode_names(raw: &[Vec<u8>], override_label: Option<&str>) -> Vec<String
         .collect()
 }
 
+/// The encoding label [`decode_names`] would pick for this set of names.
+/// A separate function rather than a change to `decode_names`: that one has
+/// thirteen call sites, and changing its signature just for the label is not
+/// worth it.
+pub fn detect_encoding(raw: &[Vec<u8>], override_label: Option<&str>) -> String {
+    resolve_encoding(raw, override_label).name().to_owned()
+}
+
 fn resolve_encoding(raw: &[Vec<u8>], override_label: Option<&str>) -> &'static Encoding {
     if let Some(label) = override_label {
         if let Some(enc) = Encoding::for_label(label.as_bytes()) {
@@ -49,6 +57,16 @@ mod tests {
         let raw = vec![vec![b'c', b'a', b'f', 0xE9]];
         let out = decode_names(&raw, Some("windows-1252"));
         assert_eq!(out, vec!["café".to_string()]);
+    }
+
+    #[test]
+    fn detect_encoding_reports_the_label() {
+        let utf8 = vec!["café.txt".as_bytes().to_vec()];
+        assert_eq!(detect_encoding(&utf8, None), "UTF-8");
+
+        // Кириллица в windows-1251: "файл" = F4 E0 E9 EB
+        let legacy = vec![vec![0xF4, 0xE0, 0xE9, 0xEB]];
+        assert_eq!(detect_encoding(&legacy, Some("koi8-r")), "KOI8-R");
     }
 
     #[test]

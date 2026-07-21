@@ -10,7 +10,7 @@ pub use archive::{
 };
 
 pub mod encoding;
-pub use encoding::decode_names;
+pub use encoding::{decode_names, detect_encoding};
 
 pub mod path_safety;
 pub use path_safety::{safe_join, safe_symlink_target};
