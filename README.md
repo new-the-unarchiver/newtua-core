@@ -29,6 +29,39 @@ fn main() -> newtua_core::Result<()> {
 }
 ```
 
+## Entry names and their encoding
+
+An archive is not obliged to store names in UTF-8, and older ones rarely do.
+Every `Entry` therefore carries both forms: `path_raw` holds the bytes exactly
+as the archive stores them, and `path` holds the decoded, normalized path.
+Base your path-safety checks on `path_raw` — decoding can distort a name.
+
+The engine decides on one encoding for the whole archive rather than guessing
+per name: it feeds every raw name to the detector at once, so a short name that
+would be ambiguous on its own is resolved by the rest of the set. Names that are
+all valid UTF-8 take that path directly.
+
+`detect_encoding` reports the label that decoding would settle on, which is
+what a front-end needs to show the user which encoding was assumed:
+
+```rust
+use newtua_core::{OpenOptions, detect_encoding, open};
+use std::path::Path;
+
+let mut reader = open(Path::new("old.zip"), &OpenOptions::default())?;
+let raw: Vec<Vec<u8>> = reader.entries()?.iter().map(|e| e.path_raw.clone()).collect();
+
+println!("{}", detect_encoding(&raw, None));   // e.g. "windows-1251"
+```
+
+To override the guess, set `OpenOptions::encoding_override` — the same label
+then also comes back from `detect_encoding(&raw, Some(label))`. An unknown
+label is ignored and detection proceeds as usual.
+
+`decode_names` is the decoding itself: it takes the same set of raw names and
+returns the decoded strings, using exactly the encoding `detect_encoding`
+reports.
+
 ## Supported formats
 
 Every variant below is a `FormatId` from [`src/archive.rs`](src/archive.rs).
@@ -126,7 +159,7 @@ the test files embed at compile time with `include_bytes!`. Shipping them would
 blow past the 10 MiB package limit, and shipping the tests without them would
 hand you a suite that cannot compile at all.
 
-Nothing is hidden. All 572 tests and every fixture live in the
+Nothing is hidden. All 574 tests and every fixture live in the
 [repository on GitHub](https://github.com/new-the-unarchiver/newtua-core) and
 run in CI on Linux, macOS and Windows. To run them yourself:
 
