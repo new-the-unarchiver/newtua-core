@@ -12,7 +12,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
-use newtua_core::archive::{EntryKind, FormatId, OpenOptions};
+use newtua_core::archive::{ArchiveReader, EntryKind, FormatId, OpenOptions};
 use newtua_core::detect;
 use newtua_core::error::Error;
 
@@ -20,6 +20,44 @@ fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name)
+}
+
+/// Write `fixture(src)`'s bytes into a temp file named `dst` and open it.
+fn open_renamed(
+    src: &str,
+    dst: &str,
+) -> (
+    tempfile::TempDir,
+    newtua_core::error::Result<Box<dyn ArchiveReader>>,
+) {
+    let bytes = std::fs::read(fixture(src)).expect("read fixture");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(dst);
+    std::fs::write(&path, &bytes).expect("write renamed");
+    let r = detect::open(&path, &OpenOptions::default());
+    (dir, r)
+}
+
+#[test]
+fn iso_content_under_wrong_extension_is_detected_by_content() {
+    // A real ISO renamed away from `.iso`: the CD001 signature lives at 0x8001,
+    // past the registry's 512-byte header peek, so detection must fall back to a
+    // content probe rather than trusting the extension.
+    let (_d, r) = open_renamed("sample.iso", "renamed.bin");
+    let mut reader = r.expect("mislabeled iso must be detected by content");
+    assert_eq!(reader.format(), FormatId::Iso);
+    assert_eq!(reader.entries().expect("entries").len(), 3);
+}
+
+#[test]
+fn other_format_named_iso_is_not_shadowed_by_iso_handler() {
+    // A SquashFS image mislabeled with a `.iso` extension must open as SquashFS.
+    // IsoHandler used to claim any `.iso` at full confidence, then fail its
+    // CD001 check and mask the genuine content handler.
+    let (_d, r) = open_renamed("tree-gzip.squashfs", "mislabeled.iso");
+    let mut reader = r.expect("squashfs named .iso must open as squashfs");
+    assert_eq!(reader.format(), FormatId::Squashfs);
+    assert!(!reader.entries().expect("entries").is_empty());
 }
 
 #[test]

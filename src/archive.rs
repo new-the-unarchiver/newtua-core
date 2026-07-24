@@ -114,6 +114,11 @@ pub struct Confidence(pub u8);
 
 impl Confidence {
     pub const NONE: Confidence = Confidence(0);
+    /// Matched by file extension alone, with no content signature to confirm it
+    /// (the format's magic lives past the registry's 512-byte header peek).
+    /// Below `MAGIC` on purpose: a genuine content-magic match for another
+    /// format must win, so an extension guess never shadows it.
+    pub const EXTENSION: Confidence = Confidence(50);
     pub const MAGIC: Confidence = Confidence(100);
 }
 

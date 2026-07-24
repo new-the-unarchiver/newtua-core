@@ -11,6 +11,43 @@ fn fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+/// Write `fixture(src)`'s bytes into a temp file named `dst` and open it.
+fn open_renamed(
+    src: &str,
+    dst: &str,
+) -> (
+    tempfile::TempDir,
+    newtua_core::error::Result<Box<dyn ArchiveReader>>,
+) {
+    let bytes = std::fs::read(fixture(src)).expect("read fixture");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(dst);
+    std::fs::write(&path, &bytes).expect("write renamed");
+    let r = open(&path, &OpenOptions::default());
+    (dir, r)
+}
+
+#[test]
+fn hfsplus_content_under_wrong_extension_is_detected_by_content() {
+    // A real HFS+ volume renamed away from `.hfs`: the `H+`/`HX` signature sits
+    // at offset 1024, past the registry's 512-byte header peek, so detection
+    // must fall back to a content probe rather than trusting the extension.
+    let (_d, r) = open_renamed("hfs_ci.hfs", "renamed.bin");
+    let mut reader = r.expect("mislabeled hfs+ must be detected by content");
+    assert_eq!(reader.format(), FormatId::HfsPlus);
+    assert!(!reader.entries().expect("entries").is_empty());
+}
+
+#[test]
+fn other_format_named_hfs_is_not_shadowed_by_hfsplus_handler() {
+    // A SquashFS image mislabeled with a `.hfs` extension must open as SquashFS,
+    // not be masked by HfsPlusHandler's extension claim.
+    let (_d, r) = open_renamed("tree-gzip.squashfs", "mislabeled.hfs");
+    let mut reader = r.expect("squashfs named .hfs must open as squashfs");
+    assert_eq!(reader.format(), FormatId::Squashfs);
+    assert!(!reader.entries().expect("entries").is_empty());
+}
+
 fn body_of(reader: &mut dyn ArchiveReader, name: &str) -> Vec<u8> {
     let idx = {
         let entries = reader.entries().expect("entries");
@@ -100,7 +137,7 @@ fn probe_recognizes_extensions_without_magic() {
     for name in ["image.hfs", "image.hfsplus", "image.HFSX"] {
         assert_eq!(
             hfs_probe.probe(&[0u8; 512], Some(name)),
-            newtua_core::archive::Confidence::MAGIC,
+            newtua_core::archive::Confidence::EXTENSION,
             "extension {name}"
         );
     }

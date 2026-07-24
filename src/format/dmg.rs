@@ -16,9 +16,7 @@ use crate::archive::{ArchiveReader, Confidence, FormatHandler, FormatId, OpenOpt
 use crate::detect::TempBackedReader;
 use crate::error::{Error, Result};
 use crate::format::apfs::{APFS_MAGIC, APFS_MAGIC_OFFSET, open_apfs};
-use crate::format::hfsplus::{
-    HFS_PLUS_SIGNATURE, HFSX_SIGNATURE, VOLUME_HEADER_OFFSET, open_hfsplus,
-};
+use crate::format::hfsplus::{VOLUME_HEADER_OFFSET, is_hfsplus_signature, open_hfsplus};
 use crate::format::xar::exceeds_nesting_depth;
 
 /// Read a big-endian `u32` at byte offset `off` in `b`. Callers bounds-check
@@ -251,10 +249,7 @@ fn locate_volume(raw_path: &Path) -> Result<Box<dyn ArchiveReader>> {
     if let Some(inner) = sweep_for_volume(
         raw_path,
         VOLUME_HEADER_OFFSET,
-        |sig: &[u8; 2]| {
-            let signature = u16::from_be_bytes(*sig);
-            signature == HFS_PLUS_SIGNATURE || signature == HFSX_SIGNATURE
-        },
+        |sig: &[u8; 2]| is_hfsplus_signature(*sig),
         open_hfsplus,
     )? {
         return Ok(inner);

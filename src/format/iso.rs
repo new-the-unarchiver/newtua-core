@@ -1,4 +1,4 @@
-use std::io::{Read, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -21,7 +21,10 @@ impl FormatHandler for IsoHandler {
     }
 
     /// Detect by `.iso` extension only: the CD001 signature lives at offset 0x8001,
-    /// far beyond the 512-byte header that the registry peeks.
+    /// far beyond the 512-byte header that the registry peeks. Reported at
+    /// `EXTENSION` confidence (below `MAGIC`) so a genuine other-format file
+    /// mislabeled `.iso` (e.g. a SquashFS image) still wins on content; a real
+    /// ISO renamed away from `.iso` is instead caught by `has_iso_signature`.
     fn probe(&self, _header: &[u8], name: Option<&str>) -> Confidence {
         let is_iso = name.is_some_and(|n| {
             Path::new(n)
@@ -29,7 +32,7 @@ impl FormatHandler for IsoHandler {
                 .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
         });
         if is_iso {
-            Confidence::MAGIC
+            Confidence::EXTENSION
         } else {
             Confidence::NONE
         }
@@ -47,10 +50,7 @@ impl FormatHandler for IsoHandler {
         };
 
         // Validate CD001 at offset 0x8001 before handing to cdfs.
-        inner.seek(SeekFrom::Start(0x8001))?;
-        let mut sig = [0u8; 5];
-        inner.read_exact(&mut sig)?;
-        if &sig != b"CD001" {
+        if !cd001_matches(inner.as_mut())? {
             return Err(Error::UnknownFormat);
         }
         inner.seek(SeekFrom::Start(0))?;
@@ -72,6 +72,25 @@ impl FormatHandler for IsoHandler {
         })?;
         Ok(Box::new(reader))
     }
+}
+
+/// Read the 5-byte descriptor at 0x8001 and report whether it is the ISO 9660
+/// `CD001` magic. Leaves the cursor just past the descriptor. Shared by
+/// `IsoHandler::open` (validation) and `has_iso_signature` (content detection).
+fn cd001_matches(r: &mut dyn ReadSeek) -> std::io::Result<bool> {
+    r.seek(SeekFrom::Start(0x8001))?;
+    let mut sig = [0u8; 5];
+    r.read_exact(&mut sig)?;
+    Ok(&sig == b"CD001")
+}
+
+/// Content probe: `true` when `path` carries the ISO 9660 `CD001` descriptor at
+/// offset 0x8001. Used by `open_single` to detect an ISO whose extension was
+/// changed or dropped, since the signature sits past the registry's header peek.
+pub(crate) fn has_iso_signature(path: &Path) -> bool {
+    std::fs::File::open(path)
+        .and_then(|mut f| cd001_matches(&mut f))
+        .unwrap_or(false)
 }
 
 // ── Tree walk ─────────────────────────────────────────────────────────────────
@@ -233,12 +252,18 @@ mod tests {
 
     #[test]
     fn probe_positive_iso_extension() {
-        assert_eq!(IsoHandler.probe(&[], Some("disk.iso")), Confidence::MAGIC);
+        assert_eq!(
+            IsoHandler.probe(&[], Some("disk.iso")),
+            Confidence::EXTENSION
+        );
     }
 
     #[test]
     fn probe_positive_iso_extension_uppercase() {
-        assert_eq!(IsoHandler.probe(&[], Some("disk.ISO")), Confidence::MAGIC);
+        assert_eq!(
+            IsoHandler.probe(&[], Some("disk.ISO")),
+            Confidence::EXTENSION
+        );
     }
 
     #[test]

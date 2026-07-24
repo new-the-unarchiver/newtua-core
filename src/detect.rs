@@ -109,9 +109,9 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
     handlers.push(Box::new(StuffItHandler));
     handlers.push(Box::new(StuffItXHandler));
     // --- newtua-alz / newtua-nsis --- (NsisHandler's probe is always NONE, so
-    // it is registry-invisible — unlike DmgHandler, whose probe fires for
-    // `.dmg` and whose registration is a live fallback. NSIS is reached only
-    // via the `MZ` early branch in open_single; registered here for uniform
+    // it is registry-invisible — like DmgHandler, which the early branch in
+    // open_single intercepts before its probe is ever consulted. NSIS is reached
+    // only via the `MZ` early branch in open_single; registered here for uniform
     // enumeration.)
     handlers.push(Box::new(AlzHandler));
     handlers.push(Box::new(NsisHandler));
@@ -415,8 +415,13 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
     // lives in the last 512 bytes, so a DMG mislabeled with another extension
     // (e.g. a `.dmg` renamed to `.iso`, as reported) is invisible to the
     // registry's header peek. Check the extension first (cheap), then fall back
-    // to a content probe of the trailer, and route either to DmgHandler before
-    // the compression layer below can swallow the first chunk's codec magic.
+    // to a content probe of the trailer.
+    //
+    // This probe reads the file tail on every non-`.dmg` open. It must stay here,
+    // ahead of BOTH the compression layer (above rationale) and the registry:
+    // IsoHandler now claims `.iso` at `EXTENSION` confidence, so a DMG named
+    // `.iso` would be captured by the registry and never reach the late content
+    // fallback. Do not gate or move it later without re-checking that path.
     if lower_name.ends_with(".dmg") || crate::format::dmg::has_koly_trailer(path) {
         return DmgHandler.open(src, opts);
     }
@@ -479,7 +484,20 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
             best = Some((c, i));
         }
     }
-    let (_, idx) = best.ok_or(Error::UnknownFormat)?;
+    let Some((_, idx)) = best else {
+        // No registry handler matched. Fall back to the deep-signature formats
+        // whose magic lives past the 512-byte header peek and so can only be
+        // confirmed by a targeted read: content-detect a mislabeled ISO/HFS+
+        // (wrong or missing extension). Genuine content-magic formats already
+        // won above, so this never shadows them.
+        if crate::format::iso::has_iso_signature(path) {
+            return IsoHandler.open(Source::path(path)?, opts);
+        }
+        if crate::format::hfsplus::has_hfsplus_signature(path) {
+            return HfsPlusHandler.open(Source::path(path)?, opts);
+        }
+        return Err(Error::UnknownFormat);
+    };
     // Re-open to get a fresh seekable source at position 0.
     let fresh_src = Source::path(path)?;
     handlers.into_iter().nth(idx).unwrap().open(fresh_src, opts)

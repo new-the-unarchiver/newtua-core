@@ -41,10 +41,12 @@ impl FormatHandler for HfsPlusHandler {
 
     /// Detect by extension only: the Volume Header (and its `H+`/`HX`
     /// signature) sits at offset 1024, past the 512-byte header the registry
-    /// peeks — same situation as ISO's `CD001` at 0x8001. A bare, extensionless
-    /// HFS+ stream is therefore not detected via the registry; the DMG
-    /// container (#21b) calls `open_hfsplus` directly instead, bypassing
-    /// `probe` entirely.
+    /// peeks — same situation as ISO's `CD001` at 0x8001. Reported at
+    /// `EXTENSION` confidence (below `MAGIC`) so a genuine other-format file
+    /// mislabeled `.hfs` still wins on content; a real HFS+ volume renamed away
+    /// from these extensions (or a bare, extensionless stream) is caught by
+    /// `has_hfsplus_signature`. The DMG container (#21b) still calls
+    /// `open_hfsplus` directly, bypassing `probe` entirely.
     fn probe(&self, _header: &[u8], name: Option<&str>) -> Confidence {
         let is_hfs = name.is_some_and(|n| {
             Path::new(n).extension().is_some_and(|e| {
@@ -54,7 +56,7 @@ impl FormatHandler for HfsPlusHandler {
             })
         });
         if is_hfs {
-            Confidence::MAGIC
+            Confidence::EXTENSION
         } else {
             Confidence::NONE
         }
@@ -155,6 +157,28 @@ impl Seek for OffsetReader {
         self.file.seek(SeekFrom::Start(self.base + self.pos))?;
         Ok(self.pos)
     }
+}
+
+/// `true` when the two big-endian bytes are an HFS+ (`H+`) or HFSX (`HX`) Volume
+/// Header signature. Shared with the DMG container's volume sweep (`dmg.rs`).
+pub(crate) fn is_hfsplus_signature(sig: [u8; 2]) -> bool {
+    let sig = u16::from_be_bytes(sig);
+    sig == HFS_PLUS_SIGNATURE || sig == HFSX_SIGNATURE
+}
+
+/// Content probe: `true` when `path` carries an HFS+ (`H+`) or HFSX (`HX`)
+/// Volume Header signature at offset 1024. Used by `open_single` to detect a
+/// volume whose extension was changed or dropped, since the signature sits past
+/// the registry's header peek.
+pub(crate) fn has_hfsplus_signature(path: &Path) -> bool {
+    (|| -> std::io::Result<[u8; 2]> {
+        let mut f = File::open(path)?;
+        f.seek(SeekFrom::Start(VOLUME_HEADER_OFFSET))?;
+        let mut sig = [0u8; 2];
+        f.read_exact(&mut sig)?;
+        Ok(sig)
+    })()
+    .is_ok_and(is_hfsplus_signature)
 }
 
 /// Open the HFS+/HFSX volume whose Volume Header begins `offset` bytes into
@@ -287,26 +311,26 @@ mod tests {
     }
 
     #[test]
-    fn probe_hfs_extension_is_magic() {
+    fn probe_hfs_extension_is_extension_confidence() {
         assert_eq!(
             HfsPlusHandler.probe(&[], Some("image.hfs")),
-            Confidence::MAGIC
+            Confidence::EXTENSION
         );
     }
 
     #[test]
-    fn probe_hfsplus_extension_is_magic() {
+    fn probe_hfsplus_extension_is_extension_confidence() {
         assert_eq!(
             HfsPlusHandler.probe(&[], Some("image.HFSPLUS")),
-            Confidence::MAGIC
+            Confidence::EXTENSION
         );
     }
 
     #[test]
-    fn probe_hfsx_extension_is_magic() {
+    fn probe_hfsx_extension_is_extension_confidence() {
         assert_eq!(
             HfsPlusHandler.probe(&[], Some("image.hfsx")),
-            Confidence::MAGIC
+            Confidence::EXTENSION
         );
     }
 
