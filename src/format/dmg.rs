@@ -66,6 +66,15 @@ fn read_koly(path: &Path) -> Result<Koly> {
     parse_koly(&buf)
 }
 
+/// Content probe: `true` when `path` ends with a valid `koly` trailer, i.e. it
+/// is a UDIF (DMG) image regardless of its file extension. Used by `open_single`
+/// to route a mislabeled DMG (e.g. a `.dmg` renamed to `.iso`) to `DmgHandler`,
+/// since the trailer lives in the last 512 bytes — past the registry's header
+/// peek — and the extension cannot be trusted.
+pub(crate) fn has_koly_trailer(path: &Path) -> bool {
+    read_koly(path).is_ok()
+}
+
 /// Parse a 512-byte koly trailer block (already read into memory).
 fn parse_koly(buf: &[u8; KOLY_SIZE as usize]) -> Result<Koly> {
     if be_u32(buf, 0x00) != KOLY_SIGNATURE {

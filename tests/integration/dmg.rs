@@ -104,6 +104,21 @@ fn dmg_dir_read_is_empty() {
 }
 
 #[test]
+fn dmg_content_named_iso_is_detected_by_koly_trailer() {
+    // Reported as `Airmail_26_0_19_MAS_TNT.iso`: a real DMG mislabeled with a
+    // `.iso` extension. The koly trailer lives in the last 512 bytes, so the
+    // format must be recognized by content, not by extension -- otherwise the
+    // `.iso` name routes to IsoHandler, which fails its CD001 check and yields
+    // UnknownFormat.
+    let bytes = std::fs::read(fixture("dmg_zlib.dmg")).expect("read fixture");
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let path = tmp_dir.path().join("mislabeled.iso");
+    std::fs::write(&path, &bytes).expect("write mislabeled iso");
+
+    assert_standard_fixture_content(&path);
+}
+
+#[test]
 fn read_entry_out_of_range_is_invalid_index() {
     let mut reader = open(&fixture("dmg_zlib.dmg"), &OpenOptions::default()).expect("open");
     let n = reader.entries().expect("entries").len();

@@ -411,7 +411,13 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
     // whole file as one compressed stream and fail once it runs past that
     // first chunk's boundary. Routing `.dmg` straight to DmgHandler bypasses
     // that layer entirely; `koly`'s own magic is validated inside `open`.
-    if lower_name.ends_with(".dmg") {
+    // A DMG is recognized by its `koly` trailer, not its extension: the trailer
+    // lives in the last 512 bytes, so a DMG mislabeled with another extension
+    // (e.g. a `.dmg` renamed to `.iso`, as reported) is invisible to the
+    // registry's header peek. Check the extension first (cheap), then fall back
+    // to a content probe of the trailer, and route either to DmgHandler before
+    // the compression layer below can swallow the first chunk's codec magic.
+    if lower_name.ends_with(".dmg") || crate::format::dmg::has_koly_trailer(path) {
         return DmgHandler.open(src, opts);
     }
 
