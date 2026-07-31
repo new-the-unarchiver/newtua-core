@@ -111,6 +111,9 @@ All open through the shared zip engine; only the reported `FormatId` differs.
 | `Odt` | OpenDocument text (`.odt`) |
 | `Ods` | OpenDocument spreadsheet (`.ods`) |
 | `Odp` | OpenDocument presentation (`.odp`) |
+| `War` | Java web application archive (`.war`) |
+| `Appx` | Windows app package (`.appx`) |
+| `Xpi` | Mozilla browser extension (`.xpi`) |
 | `Crx` | Chrome extension (`.crx`, `Cr24` header + embedded zip) |
 | `Conda` | Conda package (`.conda`, zip of `*.tar.zst` members) |
 

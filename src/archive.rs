@@ -40,6 +40,12 @@ pub enum FormatId {
     Odt,
     Ods,
     Odp,
+    /// Java web application archive (`.war`).
+    War,
+    /// Windows app package (`.appx`).
+    Appx,
+    /// Mozilla browser extension / add-on (`.xpi`).
+    Xpi,
     /// Chrome extension: zip following the `Cr24` header (CRX2/CRX3).
     Crx,
     /// Conda package (`.conda`): an outer zip containing `*.tar.zst` members;
