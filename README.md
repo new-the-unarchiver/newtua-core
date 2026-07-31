@@ -75,7 +75,7 @@ Every variant below is a `FormatId` from [`src/archive.rs`](src/archive.rs).
 | `Gzip` | `.gz` (single compressed file, no container) |
 | `Bzip2` | `.bz2` (single compressed file, no container) |
 | `Xz` | `.xz` (single compressed file, no container) |
-| `Raw` | any other single decompressed stream (e.g. `.zst`, `.lz4`, `.Z`, `.br`, `.sz`, `.lzma`) |
+| `Raw` | any other single decompressed stream (e.g. `.zst`, `.lz4`, `.Z`, `.br`, `.sz`, `.lzma`, `.lz`) |
 | `SevenZ` | `.7z`, incl. AES-256 encryption |
 | `Rar` | `.rar`, single- and multi-volume |
 | `Cab` | `.cab` |

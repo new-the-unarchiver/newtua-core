@@ -132,6 +132,7 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
 /// - Lzc:   `1f 9d`
 /// - Lz4:   `04 22 4d 18`
 /// - Snappy: `ff 06 00 00 73 4e 61 50 70 59`
+/// - Lzip:  `4c 5a 49 50 01` (`LZIP` + format version)
 pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     if header.starts_with(&[0x1f, 0x8b]) {
         return Some(Compressor::Gzip);
@@ -159,6 +160,13 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
         // 0xff, 3-byte little-endian length 6, payload `sNaPpY`. Raw (unframed)
         // Snappy has no header at all and is intentionally not detected.
         return Some(Compressor::Snappy);
+    }
+    if header.starts_with(b"LZIP\x01") {
+        // lzip (`.lz`). The version byte is part of the signature on purpose:
+        // only format version 1 is decodable (see `Compressor::Lzip`), so a
+        // version-0 or future-version file must fall through and be reported
+        // as an unknown format rather than opened and then failed mid-read.
+        return Some(Compressor::Lzip);
     }
     None
 }
@@ -364,7 +372,7 @@ fn stem_without_compressor_ext(path: &Path) -> String {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
 
     for ext in &[
-        ".gz", ".bz2", ".xz", ".zst", ".Z", ".lz4", ".br", ".sz", ".lzma",
+        ".gz", ".bz2", ".xz", ".zst", ".Z", ".lz4", ".br", ".sz", ".lzma", ".lz",
     ] {
         if let Some(stem) = name.strip_suffix(ext) {
             return stem.to_string();
@@ -712,8 +720,26 @@ mod tests {
             detect_compressor_by_ext("archive.tar.lzma"),
             Some(Compressor::Lzma)
         );
-        // `.lz` is lzip, a different container — not claimed here.
+        // `.lz` is lzip, a different container. It is not claimed *here*
+        // because it does not belong here: lzip has a real signature and is
+        // detected by content, in `detect_compressor`, one arm below Snappy.
+        // This assertion pins the split, not the absence of lzip support —
+        // `detect_compressor_recognizes_lzip` is the other half of it.
         assert_eq!(detect_compressor_by_ext("data.lz"), None);
+        assert_eq!(detect_compressor(b"LZIP\x01\x0c"), Some(Compressor::Lzip));
+    }
+
+    #[test]
+    fn detect_compressor_recognizes_lzip() {
+        // `LZIP` + format version 1 + coded dictionary size (0x0c = 4 KiB).
+        assert_eq!(detect_compressor(b"LZIP\x01\x0c"), Some(Compressor::Lzip));
+        // The version byte is part of the signature: version 0 is the 2008
+        // format with a different trailer, and we decode only version 1, so it
+        // must not be claimed here.
+        assert_eq!(detect_compressor(b"LZIP\x00\x0c"), None);
+        assert_eq!(detect_compressor(b"LZIP\x02\x0c"), None);
+        // Magic alone, with nothing after it, is not enough.
+        assert_eq!(detect_compressor(b"LZIP"), None);
     }
 
     #[test]
@@ -765,6 +791,24 @@ mod tests {
         assert_eq!(
             stem_without_compressor_ext(Path::new("notes.txt.sz")),
             "notes.txt"
+        );
+    }
+
+    #[test]
+    fn stem_strips_lz() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/tmp/payload.tar.lz")),
+            "payload.tar"
+        );
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("hello.txt.lz")),
+            "hello.txt"
+        );
+        // `.lzma` must keep winning over `.lz` — it is listed first, and the
+        // loop takes the first suffix that matches.
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("hello.txt.lzma")),
+            "hello.txt"
         );
     }
 
