@@ -399,6 +399,29 @@ pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
     Ok(filled >= 263 && &buf[257..262] == b"ustar")
 }
 
+/// Check whether a reader starts with the cpio SVR4 "new ASCII" magic
+/// (`070701`). Rewinds the reader to position 0 after the check.
+///
+/// This is the companion of [`is_tar`] for the one other archive format looked
+/// for inside a decompressed stream (`.cpgz` — cpio inside gzip — is what macOS
+/// Archive Utility produces). The magic checked here is exactly the one
+/// `CpioHandler::probe` accepts, so anything detected here can also be opened;
+/// the odc/crc variants stay a single entry, as they do today.
+pub(crate) fn is_cpio<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
+    let mut buf = [0u8; 6];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    reader.seek(SeekFrom::Start(0))?;
+    Ok(filled == buf.len() && &buf == b"070701")
+}
+
 // ── open_single ───────────────────────────────────────────────────────────────
 
 /// Internal helper: open a single concrete file path (no volume logic).
@@ -461,16 +484,29 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
         let mut tmp = tempfile::NamedTempFile::new()?;
         let size = std::io::copy(&mut decoded, &mut tmp)?;
 
-        // Step 2: peek the decompressed content for the tar ustar magic.
+        // Step 2: peek the decompressed content for an archive we unwrap here.
         // The io::copy above left the file cursor at the end; rewind first.
+        //
+        // Exactly two formats are looked for, in this order: tar, then cpio
+        // (`.cpgz` — what macOS Archive Utility produces — is cpio inside gzip).
+        // Deliberately NOT the whole registry: a `.zip.gz`, `.7z.gz` and every
+        // other nesting must keep coming out as one entry holding the raw inner
+        // file. Do not "while we're here" this into a general re-dispatch.
+        // Both checks are by content, never by file name.
         tmp.as_file_mut().seek(SeekFrom::Start(0))?;
         let tar_detected = is_tar(tmp.as_file_mut())?;
+        let cpio_detected = !tar_detected && is_cpio(tmp.as_file_mut())?;
 
-        if tar_detected {
-            // Open the temp file as a seekable tar archive.
+        if tar_detected || cpio_detected {
+            // Open the temp file as a seekable archive; TempBackedReader keeps
+            // the temp file alive for as long as the reader lives.
             let temp_path = tmp.into_temp_path();
-            let tar_src = Source::path(&temp_path)?;
-            let inner = TarHandler.open(tar_src, opts)?;
+            let inner_src = Source::path(&temp_path)?;
+            let inner = if tar_detected {
+                TarHandler.open(inner_src, opts)?
+            } else {
+                CpioHandler.open(inner_src, opts)?
+            };
             return Ok(Box::new(TempBackedReader::new(inner, temp_path)));
         } else {
             // Plain compressed file — present as one entry.
@@ -539,11 +575,14 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
 ///    Within direct open:
 ///
 ///    - If a compression wrapper is detected (gzip/bzip2/xz), decompress to a
-///      temp file, then peek for tar magic at offset 257:
-///      - If tar → open as tar (file-backed via temp), wrapped so the temp file
-///        outlives the reader.
-///      - If not tar → return a [`SingleFileReader`] with one entry whose name
+///      temp file, then peek its content for tar magic at offset 257 and then
+///      for the cpio newc magic at offset 0 — those two formats only:
+///      - If tar or cpio → open with that handler (file-backed via temp),
+///        wrapped so the temp file outlives the reader.
+///      - Otherwise → return a [`SingleFileReader`] with one entry whose name
 ///        is the original file name with the compressor extension stripped.
+///        A nested `.zip.gz`/`.7z.gz` lands here on purpose: the decompressed
+///        content is not re-dispatched through the registry.
 ///    - Otherwise, select the handler with the highest `Confidence` from the
 ///      registry and delegate to it.
 pub fn open(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
@@ -601,6 +640,30 @@ mod tests {
     #[test]
     fn empty_header_returns_none() {
         assert_eq!(detect_compressor(&[]), None);
+    }
+
+    #[test]
+    fn is_cpio_matches_only_the_newc_magic() {
+        use std::io::Cursor;
+
+        let mut newc = Cursor::new(b"070701000000".to_vec());
+        assert!(is_cpio(&mut newc).unwrap());
+        // Rewound for the caller.
+        assert_eq!(newc.position(), 0);
+
+        // odc (070707) and crc (070702) are not opened by CpioHandler, so they
+        // must not be claimed here either — they stay a single entry.
+        let mut odc = Cursor::new(b"070707000000".to_vec());
+        assert!(!is_cpio(&mut odc).unwrap());
+        let mut crc = Cursor::new(b"070702000000".to_vec());
+        assert!(!is_cpio(&mut crc).unwrap());
+
+        let mut zip = Cursor::new(b"PK\x03\x04....".to_vec());
+        assert!(!is_cpio(&mut zip).unwrap());
+
+        // Shorter than the magic — no match, no panic.
+        let mut tiny = Cursor::new(b"0707".to_vec());
+        assert!(!is_cpio(&mut tiny).unwrap());
     }
 
     #[test]

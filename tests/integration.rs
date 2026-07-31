@@ -27,6 +27,8 @@ mod bundles;
 mod cab_handler;
 #[path = "integration/conda.rs"]
 mod conda;
+#[path = "integration/cpgz.rs"]
+mod cpgz;
 #[path = "integration/cpio_handler.rs"]
 mod cpio_handler;
 #[path = "integration/deb_handler.rs"]
