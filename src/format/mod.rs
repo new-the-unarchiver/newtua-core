@@ -69,6 +69,10 @@ pub use dmg::DmgHandler;
 pub mod apfs;
 pub use apfs::ApfsHandler;
 
+// WPRESS (.wpress): WordPress site dump, in-house reader (no dependency).
+pub mod wpress;
+pub use wpress::WpressHandler;
+
 // Legacy formats from the `newtua-formats` family (ports from XADMaster). Thin
 // adapters over the upstream crates' uniform recognize/open/entries/read_entry
 // API; see legacy/mod.rs.

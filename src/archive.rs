@@ -68,6 +68,9 @@ pub enum FormatId {
     /// blkx/mish chunk tables, decoded into a raw disk image and handed to the
     /// filesystem layer inside (HFS+ or APFS).
     Dmg,
+    /// WPRESS (`.wpress`): the WordPress site dump written by the All-in-One WP
+    /// Migration plugin — fixed-length text headers, bodies stored raw.
+    Wpress,
     /// APFS (Apple File System) read-only filesystem: a bare container (`NXSB`
     /// magic) or the filesystem layer inside a DMG image. Supports transparent
     /// `decmpfs` decompression, unlike the HFS+ handler.

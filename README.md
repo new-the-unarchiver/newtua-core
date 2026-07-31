@@ -94,6 +94,7 @@ Every variant below is a `FormatId` from [`src/archive.rs`](src/archive.rs).
 | `HfsPlus` | `.hfs`/`.hfsplus`/`.hfsx` (HFS+/HFSX volumes, incl. `decmpfs`) |
 | `Dmg` | `.dmg` (Apple Disk Image / UDIF container) |
 | `Apfs` | Apple File System, bare container or embedded in a DMG |
+| `Wpress` | `.wpress` (WordPress site dump: All-in-One WP Migration) |
 
 ### Zip-based containers
 

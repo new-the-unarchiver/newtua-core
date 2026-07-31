@@ -14,7 +14,7 @@ use crate::format::{
     LbrHandler, LzxHandler, MacBinaryHandler, MsiHandler, NsisHandler, PackItHandler,
     PowerPackerHandler, RarHandler, RpmHandler, SevenZHandler, SfxHandler, SquashfsHandler,
     SqueezeHandler, StuffIt5Handler, StuffItHandler, StuffItXHandler, TarHandler, WarcHandler,
-    WimHandler, XarHandler, ZipBundleHandler, ZipHandler, ZooHandler, bundle,
+    WimHandler, WpressHandler, XarHandler, ZipBundleHandler, ZipHandler, ZooHandler, bundle,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -84,6 +84,12 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
     // probe never actually fires: `.dmg` is intercepted by the early extension
     // branch in open_single (before the registry loop), so dispatch is there.
     handlers.push(Box::new(DmgHandler));
+    // WpressHandler: detected by the `.wpress` extension alone — the format has
+    // no magic anywhere, so there is nothing for a header peek to match. The
+    // guess is confirmed inside `open` by parsing the first header (same shape
+    // as ISO/HFS+). At `EXTENSION` confidence it cannot shadow a content match,
+    // and no peer claims `.wpress`, so there is no tie-break here.
+    handlers.push(Box::new(WpressHandler));
     // Legacy formats (newtua-formats family). Content-first detection via the
     // upstream `recognize`; their magics/extensions don't tie with the modern
     // handlers above, so they're simply appended. ARC has no content sniff and
@@ -673,11 +679,14 @@ mod tests {
 
     #[test]
     fn registry_has_expected_handlers() {
-        // 20 базовых + 16 legacy (6 dos + 5 mac + 3 stuffit + alz + nsis + 3 amiga)
+        // 21 базовый + 16 legacy (6 dos + 5 mac + 3 stuffit + alz + nsis + 3 amiga)
         // + zip-бандлы + CRX + Conda.
+        //
+        // Базовых стало 21: к двадцати добавился WpressHandler (`.wpress`),
+        // зарегистрированный сразу за DmgHandler.
         assert_eq!(
             registry().len(),
-            20 + 6 + 5 + 3 + 2 + 3 + bundle::ZIP_BUNDLES.len() + 2
+            21 + 6 + 5 + 3 + 2 + 3 + bundle::ZIP_BUNDLES.len() + 2
         );
     }
 

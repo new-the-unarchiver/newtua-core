@@ -85,6 +85,8 @@ mod volume_open;
 mod warc_handler;
 #[path = "integration/wim.rs"]
 mod wim;
+#[path = "integration/wpress.rs"]
+mod wpress;
 #[path = "integration/xar_handler.rs"]
 mod xar_handler;
 #[path = "integration/zip_handler.rs"]
