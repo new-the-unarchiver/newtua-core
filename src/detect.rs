@@ -399,16 +399,18 @@ pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
     Ok(filled >= 263 && &buf[257..262] == b"ustar")
 }
 
-/// Check whether a reader starts with the cpio SVR4 "new ASCII" magic
-/// (`070701`). Rewinds the reader to position 0 after the check.
+/// Check whether a reader starts with a cpio magic this crate can open —
+/// SVR4 "new ASCII" (`070701`) or POSIX "old portable"/odc (`070707`).
+/// Rewinds the reader to position 0 after the check.
 ///
 /// This is the companion of [`is_tar`] for the one other archive format looked
 /// for inside a decompressed stream (`.cpgz` — cpio inside gzip — is what macOS
-/// Archive Utility produces). The magic checked here is exactly the one
-/// `CpioHandler::probe` accepts, so anything detected here can also be opened;
-/// the odc/crc variants stay a single entry, as they do today.
+/// Archive Utility produces; its engine, `ditto`, writes the odc variant).
+/// The set checked here is exactly what `CpioHandler::probe` accepts, so
+/// anything detected here can also be opened; the crc variant (`070702`) is not
+/// implemented and stays a single entry.
 pub(crate) fn is_cpio<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
-    let mut buf = [0u8; 6];
+    let mut buf = [0u8; crate::format::cpio::MAGIC_LEN];
     let mut filled = 0usize;
     while filled < buf.len() {
         match reader.read(&mut buf[filled..]) {
@@ -419,7 +421,7 @@ pub(crate) fn is_cpio<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
         }
     }
     reader.seek(SeekFrom::Start(0))?;
-    Ok(filled == buf.len() && &buf == b"070701")
+    Ok(filled == buf.len() && crate::format::cpio::is_supported_magic(&buf))
 }
 
 // ── open_single ───────────────────────────────────────────────────────────────
@@ -576,7 +578,7 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
 ///
 ///    - If a compression wrapper is detected (gzip/bzip2/xz), decompress to a
 ///      temp file, then peek its content for tar magic at offset 257 and then
-///      for the cpio newc magic at offset 0 — those two formats only:
+///      for a cpio magic (newc or odc) at offset 0 — those two formats only:
 ///      - If tar or cpio → open with that handler (file-backed via temp),
 ///        wrapped so the temp file outlives the reader.
 ///      - Otherwise → return a [`SingleFileReader`] with one entry whose name
@@ -643,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn is_cpio_matches_only_the_newc_magic() {
+    fn is_cpio_matches_the_variants_cpio_handler_opens() {
         use std::io::Cursor;
 
         let mut newc = Cursor::new(b"070701000000".to_vec());
@@ -651,10 +653,13 @@ mod tests {
         // Rewound for the caller.
         assert_eq!(newc.position(), 0);
 
-        // odc (070707) and crc (070702) are not opened by CpioHandler, so they
-        // must not be claimed here either — they stay a single entry.
+        // odc (070707) is what `ditto` writes, so a real `.cpgz` lands here.
         let mut odc = Cursor::new(b"070707000000".to_vec());
-        assert!(!is_cpio(&mut odc).unwrap());
+        assert!(is_cpio(&mut odc).unwrap());
+        assert_eq!(odc.position(), 0);
+
+        // crc (070702) is not opened by CpioHandler, so it must not be claimed
+        // here either — it stays a single entry.
         let mut crc = Cursor::new(b"070702000000".to_vec());
         assert!(!is_cpio(&mut crc).unwrap());
 
