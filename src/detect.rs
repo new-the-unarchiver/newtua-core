@@ -131,6 +131,7 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
 /// - Zstd:  `28 b5 2f fd`
 /// - Lzc:   `1f 9d`
 /// - Lz4:   `04 22 4d 18`
+/// - Snappy: `ff 06 00 00 73 4e 61 50 70 59`
 pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     if header.starts_with(&[0x1f, 0x8b]) {
         return Some(Compressor::Gzip);
@@ -151,6 +152,13 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
         // LZ4 frame format. Legacy frame (0x02 0x21 0x4C 0x18) is intentionally
         // unsupported — lz4_flex's FrameDecoder doesn't decode it. TODO if needed.
         return Some(Compressor::Lz4);
+    }
+    if header.starts_with(&[0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59]) {
+        // Framed Snappy (`.sz`, Keka's SNAPPY; snzip's default `framing2`).
+        // The signature is the mandatory first chunk of the stream: type byte
+        // 0xff, 3-byte little-endian length 6, payload `sNaPpY`. Raw (unframed)
+        // Snappy has no header at all and is intentionally not detected.
+        return Some(Compressor::Snappy);
     }
     None
 }
@@ -348,7 +356,7 @@ impl ArchiveReader for SingleFileReader {
 fn stem_without_compressor_ext(path: &Path) -> String {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
 
-    for ext in &[".gz", ".bz2", ".xz", ".zst", ".Z", ".lz4", ".br"] {
+    for ext in &[".gz", ".bz2", ".xz", ".zst", ".Z", ".lz4", ".br", ".sz"] {
         if let Some(stem) = name.strip_suffix(ext) {
             return stem.to_string();
         }
@@ -695,6 +703,33 @@ mod tests {
         // size, not a fixed tag), but any input that isn't another format's
         // magic would serve equally.
         assert_eq!(detect_compressor(&[0x0b, 0x00, 0x80]), None);
+    }
+
+    #[test]
+    fn detect_compressor_recognizes_snappy() {
+        // Framed Snappy (framing2): the stream-identifier chunk — type 0xff,
+        // 3-byte length 0x000006, payload `sNaPpY`.
+        assert_eq!(
+            detect_compressor(&[
+                0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59, 0x01
+            ]),
+            Some(Compressor::Snappy)
+        );
+        // A prefix of the identifier is not enough — raw (unframed) Snappy has
+        // no magic and must stay undetected.
+        assert_eq!(detect_compressor(&[0xFF, 0x06, 0x00, 0x00]), None);
+    }
+
+    #[test]
+    fn stem_strips_sz() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/tmp/data.tar.sz")),
+            "data.tar"
+        );
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("notes.txt.sz")),
+            "notes.txt"
+        );
     }
 
     #[test]

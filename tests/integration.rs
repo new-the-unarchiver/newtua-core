@@ -63,6 +63,8 @@ mod selection;
 mod sevenz_handler;
 #[path = "integration/sfx_handler.rs"]
 mod sfx_handler;
+#[path = "integration/snappy.rs"]
+mod snappy;
 #[path = "integration/source.rs"]
 mod source;
 #[path = "integration/squashfs.rs"]

@@ -10,6 +10,9 @@ pub enum Compressor {
     Lzc,
     Lz4,
     Brotli,
+    /// Framed Snappy (the `framing2` stream format), what Keka calls SNAPPY.
+    /// Raw, unframed Snappy is deliberately not supported: it has no magic.
+    Snappy,
 }
 
 pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<Box<dyn Read>> {
@@ -27,6 +30,7 @@ pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> std::io::Result<B
         Compressor::Brotli => Ok(Box::new(brotli_decompressor::Decompressor::new(
             inner, 4096,
         ))),
+        Compressor::Snappy => Ok(Box::new(snap::read::FrameDecoder::new(inner))),
     }
 }
 
@@ -161,6 +165,43 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, BROTLI_HELLO_PLAIN);
+    }
+
+    // Framed Snappy (framing2) produced by the reference tool Keka ships,
+    // `snzip 1.0.5`, over `SNAPPY_HELLO_PLAIN`:
+    //   /Applications/Keka.app/Contents/MacOS/Keka --ignore-file-access \
+    //       --cli snzip -c hello.txt > hello.txt.sz
+    // Decoding an outside-produced stream (rather than a round-trip through
+    // `snap`'s own encoder) is what actually proves we read what Keka writes.
+    const SNAPPY_HELLO: &[u8] = &[
+        0xff, 0x06, 0x00, 0x00, 0x73, 0x4e, 0x61, 0x50, 0x70, 0x59, 0x01, 0x16, 0x00, 0x00, 0xe1,
+        0xcb, 0xb1, 0xd2, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x66, 0x72, 0x6f, 0x6d, 0x20, 0x73,
+        0x6e, 0x61, 0x70, 0x70, 0x79, 0x0a,
+    ];
+    const SNAPPY_HELLO_PLAIN: &[u8] = b"hello from snappy\n";
+
+    #[test]
+    fn snappy_decodes_known_stream() {
+        let mut r = decompressor(
+            Compressor::Snappy,
+            Box::new(std::io::Cursor::new(SNAPPY_HELLO)),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, SNAPPY_HELLO_PLAIN);
+    }
+
+    #[test]
+    fn corrupt_snappy_errors_on_read() {
+        // Keep the stream-identifier chunk intact, replace the data chunk with
+        // garbage: the decoder must error, not panic or spin.
+        let mut bytes = SNAPPY_HELLO[..10].to_vec();
+        bytes.extend_from_slice(&[0xFF; 32]);
+        let mut r =
+            decompressor(Compressor::Snappy, Box::new(std::io::Cursor::new(bytes))).unwrap();
+        let mut out = Vec::new();
+        assert!(r.read_to_end(&mut out).is_err());
     }
 
     #[test]
