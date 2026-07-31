@@ -168,16 +168,23 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
 ///
 /// This is intentionally separate from `detect_compressor` (which inspects bytes):
 /// magic-less formats are detected only by an explicit extension, never by
-/// content (same deliberate asymmetry as `.lzma`). `lower_name` must already be
-/// lowercased by the caller.
+/// content. `lower_name` must already be lowercased by the caller.
 ///
 /// - `.br` / `.tar.br` → Brotli
+/// - `.lzma` / `.tar.lzma` → bare LZMA1 (the "alone" container)
 ///
 /// Add future extension-only (magic-less) compressors here — one `ends_with`
 /// arm each — and keep `detect_compressor` (the byte-magic detector) untouched.
 fn detect_compressor_by_ext(lower_name: &str) -> Option<Compressor> {
     if lower_name.ends_with(".br") {
         return Some(Compressor::Brotli);
+    }
+    if lower_name.ends_with(".lzma") {
+        // Bare LZMA1 ("alone" format), the same decoder deb/rpm already use for
+        // their payloads. Its header is coder properties plus a dictionary size,
+        // with no tag: any file could start that way, so detecting it by content
+        // would claim arbitrary data. Extension only, on purpose.
+        return Some(Compressor::Lzma);
     }
     None
 }
@@ -356,7 +363,9 @@ impl ArchiveReader for SingleFileReader {
 fn stem_without_compressor_ext(path: &Path) -> String {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
 
-    for ext in &[".gz", ".bz2", ".xz", ".zst", ".Z", ".lz4", ".br", ".sz"] {
+    for ext in &[
+        ".gz", ".bz2", ".xz", ".zst", ".Z", ".lz4", ".br", ".sz", ".lzma",
+    ] {
         if let Some(stem) = name.strip_suffix(ext) {
             return stem.to_string();
         }
@@ -694,6 +703,33 @@ mod tests {
     }
 
     #[test]
+    fn detect_compressor_by_ext_recognizes_lzma() {
+        assert_eq!(
+            detect_compressor_by_ext("data.lzma"),
+            Some(Compressor::Lzma)
+        );
+        assert_eq!(
+            detect_compressor_by_ext("archive.tar.lzma"),
+            Some(Compressor::Lzma)
+        );
+        // `.lz` is lzip, a different container — not claimed here.
+        assert_eq!(detect_compressor_by_ext("data.lz"), None);
+    }
+
+    #[test]
+    fn lzma_has_no_content_magic() {
+        // Asymmetry guard, same as Brotli's below: bare LZMA1 must never be
+        // recognised by content. Its first byte is packed coder properties
+        // (`5d` for the common lc/lp/pb preset), not a tag, and the next four
+        // are a dictionary size — nothing there is reliably distinguishable
+        // from arbitrary data, so a magic branch would produce false hits.
+        assert_eq!(
+            detect_compressor(&[0x5d, 0x00, 0x00, 0x80, 0x00, 0xff]),
+            None
+        );
+    }
+
+    #[test]
     fn brotli_has_no_content_magic() {
         // Asymmetry guard: Brotli must never be recognised by content magic —
         // it has no signature, so `detect_compressor` (the byte-magic detector)
@@ -728,6 +764,18 @@ mod tests {
         );
         assert_eq!(
             stem_without_compressor_ext(Path::new("notes.txt.sz")),
+            "notes.txt"
+        );
+    }
+
+    #[test]
+    fn stem_strips_lzma() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/tmp/data.tar.lzma")),
+            "data.tar"
+        );
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("notes.txt.lzma")),
             "notes.txt"
         );
     }

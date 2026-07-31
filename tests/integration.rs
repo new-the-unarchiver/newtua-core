@@ -47,6 +47,8 @@ mod legacy;
 mod lz4;
 #[path = "integration/lzc.rs"]
 mod lzc;
+#[path = "integration/lzma.rs"]
+mod lzma;
 #[path = "integration/macos_skip.rs"]
 mod macos_skip;
 #[path = "integration/msi_handler.rs"]
