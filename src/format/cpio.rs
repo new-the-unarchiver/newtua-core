@@ -1,17 +1,20 @@
-//! cpio (`.cpio`) — the two ASCII variants that can be read here: SVR4 "new
-//! ASCII" (`070701`, what GNU/BSD `cpio -o -H newc` writes) and POSIX.1 "old
-//! portable" / odc (`070707`, what `ditto` writes). The crc variant (`070702`)
-//! is not implemented and is deliberately not claimed — see
-//! `is_supported_magic`.
+//! cpio (`.cpio`) — the three ASCII variants read here: SVR4 "new ASCII"
+//! (`070701`, what GNU/BSD `cpio -o -H newc` writes), the same layout with a
+//! filled-in checksum field, `crc` (`070702`, `cpio -o -H crc`), and POSIX.1
+//! "old portable" / odc (`070707`, what `ditto` writes).
 //!
 //! Reached two ways: from the registry, on a bare `.cpio`; and from
 //! `detect.rs`, which checks a just-decompressed stream for a cpio magic once
 //! tar has been ruled out. That second path is what opens a `.cpgz` from macOS
 //! Archive Utility — odc inside gzip.
 //!
-//! Both variants are parsed here, by hand. Nothing is delegated: a third-party
+//! All of them are parsed here, by hand. Nothing is delegated: a third-party
 //! newc reader used to do this and turned every name that was not UTF-8 into an
 //! open error, which is exactly the case `decode_names` exists for.
+//!
+//! `crc` is newc with two differences and no third: its magic, and its `check`
+//! field, which newc leaves zero. So one parser walks both — see [`NewcVariant`]
+//! — and the only extra work is at read time, where the checksum is verified.
 //!
 //! # How an archive is opened
 //!
@@ -27,10 +30,10 @@
 //!   every record is checked against it (`body offset + declared length ≤ file
 //!   length`), which catches a truncation *earlier* than reading would, and the
 //!   next record's magic still has to be where the skip lands.
-//! * **`Source::Stream`, newc.** Spilled to a temp file first and then walked
-//!   as above, so newc has one parser rather than two. `Source` is a public
-//!   type, so a caller of the library can hand us a stream even though nothing
-//!   inside the crate builds one.
+//! * **`Source::Stream`, newc and crc.** Spilled to a temp file first and then
+//!   walked as above, so they have one parser rather than two. `Source` is a
+//!   public type, so a caller of the library can hand us a stream even though
+//!   nothing inside the crate builds one.
 //! * **`Source::Stream`, odc.** Still makes one streaming pass, concatenating
 //!   every regular-file body into a temp file and keeping per-entry offsets
 //!   into it (`Scan`).
@@ -58,6 +61,9 @@ const S_IFREG: u32 = 0o100000; // regular file
 
 /// SVR4 "new ASCII" — what GNU/BSD `cpio -o -H newc` writes.
 pub(crate) const MAGIC_NEWC: &[u8; 6] = b"070701";
+/// SVR4 "new ASCII" with a checksum — what `cpio -o -H crc` writes. The record
+/// layout is byte-for-byte the newc one; see [`NewcVariant`].
+pub(crate) const MAGIC_CRC: &[u8; 6] = b"070702";
 /// POSIX.1 "old portable" (odc) — what `ditto`, and therefore macOS Archive
 /// Utility, writes.
 pub(crate) const MAGIC_ODC: &[u8; 6] = b"070707";
@@ -66,10 +72,11 @@ pub(crate) const MAGIC_LEN: usize = 6;
 
 /// Whether `magic` is a variant this handler can open.
 ///
-/// `070702` (crc) is deliberately absent: it is not implemented, so claiming it
-/// would turn a readable single entry into an open error.
+/// Kept in one place because `detect.rs` asks the same question of a
+/// just-decompressed stream (`is_cpio`): what is claimed there has to be exactly
+/// what `open` can then parse.
 pub(crate) fn is_supported_magic(magic: &[u8]) -> bool {
-    magic == MAGIC_NEWC || magic == MAGIC_ODC
+    magic == MAGIC_NEWC || magic == MAGIC_CRC || magic == MAGIC_ODC
 }
 
 // ── Handler ──────────────────────────────────────────────────────────────────
@@ -82,9 +89,9 @@ impl FormatHandler for CpioHandler {
     }
 
     fn probe(&self, header: &[u8], _name: Option<&str>) -> Confidence {
-        // Detect the two ASCII variants that can actually be read: SVR4 "new
-        // ASCII" (070701) and POSIX "old portable" / odc (070707).
-        // 070702 (crc) is future work.
+        // The three ASCII variants that can be read: SVR4 "new ASCII" (070701),
+        // the same layout with a checksum (070702, crc) and POSIX "old
+        // portable" / odc (070707).
         if header.len() >= MAGIC_LEN && is_supported_magic(&header[..MAGIC_LEN]) {
             Confidence::MAGIC
         } else {
@@ -103,7 +110,8 @@ impl FormatHandler for CpioHandler {
                 inner.read_exact(&mut magic).map_err(io_err_to_corrupt)?;
                 return match &magic {
                     MAGIC_ODC => open_odc_seekable(inner, file_len, opts),
-                    MAGIC_NEWC => open_newc_seekable(inner, file_len, opts),
+                    MAGIC_NEWC => open_newc_seekable(inner, file_len, opts, NewcVariant::Newc),
+                    MAGIC_CRC => open_newc_seekable(inner, file_len, opts, NewcVariant::Crc),
                     _ => Err(unsupported_magic(&magic)),
                 };
             }
@@ -122,12 +130,17 @@ impl FormatHandler for CpioHandler {
         let stream: Box<dyn Read> = Box::new(Cursor::new(magic).chain(reader));
 
         match &magic {
-            // newc keeps a single parser, the seeking one: an unseekable stream
-            // is spilled to a temp file and walked from there. Nothing in the
-            // crate builds a `Source::Stream`, but the type is public.
-            MAGIC_NEWC => {
+            // newc and crc keep a single parser, the seeking one: an unseekable
+            // stream is spilled to a temp file and walked from there. Nothing in
+            // the crate builds a `Source::Stream`, but the type is public.
+            MAGIC_NEWC | MAGIC_CRC => {
+                let variant = if &magic == MAGIC_CRC {
+                    NewcVariant::Crc
+                } else {
+                    NewcVariant::Newc
+                };
                 let (file, file_len) = spill_to_temp(stream)?;
-                open_newc_seekable(Box::new(file), file_len, opts)
+                open_newc_seekable(Box::new(file), file_len, opts, variant)
             }
             MAGIC_ODC => finish(scan_odc(stream)?, opts),
             _ => Err(unsupported_magic(&magic)),
@@ -149,6 +162,23 @@ struct EntryMeta {
     size: u64,
     mode: u32,
     modified: Option<SystemTime>,
+    /// What the crc variant's `check` field promised the body adds up to;
+    /// `None` for newc and odc, which carry no checksum at all — so every odc
+    /// record below leaves it `None`.
+    checksum: Option<u32>,
+}
+
+/// Where an entry's body lives, and what it has to add up to once read.
+///
+/// The offset is into the temp file on the streaming path and into the archive
+/// itself on the seekable one; `read_entry` does not care which.
+#[derive(Clone, Copy)]
+struct Body {
+    offset: u64,
+    size: u64,
+    /// See [`EntryMeta::checksum`]. Verified while the body is copied out, not
+    /// while the listing is built — a listing must never read a body.
+    checksum: Option<u32>,
 }
 
 /// Result of one streaming pass over an archive: all regular-file bodies
@@ -217,6 +247,71 @@ const NEWC_MODE: (usize, usize) = (14, 8);
 const NEWC_MTIME: (usize, usize) = (46, 8);
 const NEWC_FILESIZE: (usize, usize) = (54, 8);
 const NEWC_NAMESIZE: (usize, usize) = (94, 8);
+const NEWC_CHECK: (usize, usize) = (102, 8);
+
+/// Which of the two newc-shaped variants an archive uses.
+///
+/// The record layout is identical down to the byte — the same 110-byte header,
+/// the same thirteen fields, the same four-byte padding of name and body — so
+/// one walk serves both and `newc` is the name every header-level error uses.
+/// `Crc` differs in exactly two places: the magic, and the `check` field, which
+/// it fills with the sum of the body's bytes instead of zero.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NewcVariant {
+    Newc,
+    Crc,
+}
+
+impl NewcVariant {
+    /// The six magic bytes every record of this variant must start with.
+    fn magic(self) -> &'static [u8; MAGIC_LEN] {
+        match self {
+            Self::Newc => MAGIC_NEWC,
+            Self::Crc => MAGIC_CRC,
+        }
+    }
+
+    /// How the variant names itself in an error message.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Newc => "newc",
+            Self::Crc => "crc",
+        }
+    }
+}
+
+/// The crc variant's checksum: every byte of the body added up, kept to 32 bits.
+///
+/// Despite the variant's name this is not a CRC at all — GNU cpio sums the
+/// bytes as unsigned and lets the total wrap, which is what `wrapping_add`
+/// reproduces.
+fn body_checksum(bytes: &[u8]) -> u32 {
+    bytes
+        .iter()
+        .fold(0u32, |acc, b| acc.wrapping_add(u32::from(*b)))
+}
+
+/// A `Write` that adds up every byte on its way through, so the crc variant's
+/// checksum can be computed while the body streams to its destination. A body
+/// can be gigabytes; nothing is held to be summed afterwards.
+struct SummingWriter<'a> {
+    inner: &'a mut dyn Write,
+    sum: u32,
+}
+
+impl Write for SummingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Only the bytes the sink actually took are counted: a short write must
+        // not make the sum run ahead of the output.
+        let n = self.inner.write(buf)?;
+        self.sum = self.sum.wrapping_add(body_checksum(&buf[..n]));
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 /// Parse one fixed-width ASCII-hex header field — the newc counterpart of
 /// [`parse_octal`], and strict for the same reason: garbage in a header must be
@@ -260,13 +355,19 @@ fn pad4(len: u64) -> u64 {
     (4 - (len % 4)) % 4
 }
 
-/// Walk a newc archive by its headers, skipping every body by seeking — the
-/// counterpart of [`scan_odc_seekable`], and the same shape: nothing is
-/// allocated to a declared size, and every declared length is checked against
-/// the file length before it is used to move.
+/// Walk a newc-shaped archive — variant `Newc` or `Crc` — by its headers,
+/// skipping every body by seeking. The counterpart of [`scan_odc_seekable`],
+/// and the same shape: nothing is allocated to a declared size, and every
+/// declared length is checked against the file length before it is used to
+/// move.
+///
+/// For `Crc` the `check` field is picked up here and carried to `read_entry`;
+/// it is *not* verified here, because verifying it means reading the body and a
+/// listing must never do that.
 fn scan_newc_seekable(
     src: &mut dyn ReadSeek,
     file_len: u64,
+    variant: NewcVariant,
 ) -> Result<(Vec<Vec<u8>>, Vec<EntryMeta>)> {
     let mut reader = BufReader::with_capacity(SCAN_BUF, src);
     let mut raw_names: Vec<Vec<u8>> = Vec::new();
@@ -284,9 +385,11 @@ fn scan_newc_seekable(
             format_args!("record header"),
         )?;
         reader.read_exact(&mut header).map_err(io_err_to_corrupt)?;
-        if &header[..MAGIC_LEN] != MAGIC_NEWC {
+        if &header[..MAGIC_LEN] != variant.magic() {
             return Err(Error::Corrupt(format!(
-                "cpio newc: record at offset {pos} does not start with 070701"
+                "cpio {}: record at offset {pos} does not start with {}",
+                variant.label(),
+                String::from_utf8_lossy(variant.magic()),
             )));
         }
 
@@ -294,9 +397,20 @@ fn scan_newc_seekable(
         let mtime = newc_field(&header, NEWC_MTIME, "mtime")?;
         let filesize = newc_field(&header, NEWC_FILESIZE, "filesize")?;
         let namesize = newc_field(&header, NEWC_NAMESIZE, "namesize")?;
+        // Only crc fills this field; newc writes zeros there and a zero is a
+        // legitimate checksum, so the variant — not the value — decides whether
+        // there is anything to verify. The field is eight hex digits, so it
+        // cannot exceed u32.
+        let checksum = match variant {
+            NewcVariant::Crc => Some(newc_field(&header, NEWC_CHECK, "check")? as u32),
+            NewcVariant::Newc => None,
+        };
 
         if namesize == 0 {
-            return Err(Error::Corrupt("cpio newc: zero-length name".into()));
+            return Err(Error::Corrupt(format!(
+                "cpio {}: zero-length name",
+                variant.label()
+            )));
         }
         let after_name = advance(after_header, namesize, file_len, format_args!("entry name"))?;
         let mut name = Vec::new();
@@ -344,6 +458,7 @@ fn scan_newc_seekable(
                     size: filesize,
                     mode,
                     modified,
+                    checksum,
                 });
             }
             S_IFDIR => {
@@ -357,6 +472,7 @@ fn scan_newc_seekable(
                     size: 0,
                     mode,
                     modified,
+                    checksum: None,
                 });
             }
             S_IFLNK => {
@@ -379,6 +495,9 @@ fn scan_newc_seekable(
                     size: filesize,
                     mode,
                     modified,
+                    // A symlink's target never goes through `read_entry`, so
+                    // there is no copy to verify a checksum against.
+                    checksum: None,
                 });
             }
             _ => {
@@ -394,15 +513,16 @@ fn scan_newc_seekable(
     Ok((raw_names, metas))
 }
 
-/// Open a seekable newc archive: list it from the headers, then keep `inner`
-/// open so bodies can be read straight out of it.
+/// Open a seekable newc-shaped archive — newc or crc: list it from the headers,
+/// then keep `inner` open so bodies can be read straight out of it.
 fn open_newc_seekable(
     mut inner: Box<dyn ReadSeek>,
     file_len: u64,
     opts: &OpenOptions,
+    variant: NewcVariant,
 ) -> Result<Box<dyn ArchiveReader>> {
     inner.seek(SeekFrom::Start(0))?;
-    let (raw_names, metas) = scan_newc_seekable(inner.as_mut(), file_len)?;
+    let (raw_names, metas) = scan_newc_seekable(inner.as_mut(), file_len, variant)?;
     let (entries, bodies) = build_entries(raw_names, metas, opts);
     Ok(Box::new(CpioSeekReader {
         src: inner,
@@ -559,6 +679,7 @@ fn scan_odc(reader: Box<dyn Read>) -> Result<Scan> {
                     size: filesize,
                     mode,
                     modified,
+                    checksum: None,
                 });
             }
             S_IFDIR => {
@@ -577,6 +698,7 @@ fn scan_odc(reader: Box<dyn Read>) -> Result<Scan> {
                     size: 0,
                     mode,
                     modified,
+                    checksum: None,
                 });
             }
             S_IFLNK => {
@@ -596,6 +718,7 @@ fn scan_odc(reader: Box<dyn Read>) -> Result<Scan> {
                     size: filesize,
                     mode,
                     modified,
+                    checksum: None,
                 });
             }
             _ => {
@@ -729,6 +852,7 @@ fn scan_odc_seekable(
                     size: filesize,
                     mode,
                     modified,
+                    checksum: None,
                 });
             }
             S_IFDIR => {
@@ -742,6 +866,7 @@ fn scan_odc_seekable(
                     size: 0,
                     mode,
                     modified,
+                    checksum: None,
                 });
             }
             S_IFLNK => {
@@ -762,6 +887,7 @@ fn scan_odc_seekable(
                     size: filesize,
                     mode,
                     modified,
+                    checksum: None,
                 });
             }
             _ => {
@@ -816,14 +942,14 @@ fn finish(scan: Scan, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
 }
 
 /// Build the entry list shared by both readers: names are decoded once for the
-/// whole archive, and each entry gets the `(offset, size)` of its body — in the
-/// temp file for the streaming path, in the archive itself for the seekable
+/// whole archive, and each entry gets the [`Body`] it is read from — located in
+/// the temp file for the streaming path, in the archive itself for the seekable
 /// one. `None` means there is no body to read (directory, symlink).
 fn build_entries(
     raw_names: Vec<Vec<u8>>,
     metas: Vec<EntryMeta>,
     opts: &OpenOptions,
-) -> (Vec<Entry>, Vec<Option<(u64, u64)>>) {
+) -> (Vec<Entry>, Vec<Option<Body>>) {
     let encoding_label = opts.encoding_override.as_deref();
     let names = decode_names(&raw_names, encoding_label);
     // Decode symlink targets only if there are any; on the common
@@ -844,7 +970,7 @@ fn build_entries(
     let mut entries: Vec<Entry> = Vec::with_capacity(metas.len());
     // Where the body lives; `None` for entries with no body (dirs, symlinks).
     // `read_entry` keys off this, not off `size`.
-    let mut offsets: Vec<Option<(u64, u64)>> = Vec::with_capacity(metas.len());
+    let mut offsets: Vec<Option<Body>> = Vec::with_capacity(metas.len());
 
     for (i, (meta, raw_name)) in metas.into_iter().zip(raw_names).enumerate() {
         let name_str = names[i].trim_end_matches('/');
@@ -852,7 +978,14 @@ fn build_entries(
         // always does; its first record is the bare "." for the packed root).
         let name_str = name_str.strip_prefix("./").unwrap_or(name_str);
         let (kind, body) = match meta.kind {
-            KindRaw::File => (EntryKind::File, Some((meta.offset, meta.size))),
+            KindRaw::File => (
+                EntryKind::File,
+                Some(Body {
+                    offset: meta.offset,
+                    size: meta.size,
+                    checksum: meta.checksum,
+                }),
+            ),
             KindRaw::Dir => (EntryKind::Dir, None),
             KindRaw::Symlink(_) => (
                 EntryKind::Symlink {
@@ -880,9 +1013,10 @@ fn build_entries(
 
 pub struct CpioReader {
     entries: Vec<Entry>,
-    /// Per-entry body location `(offset_in_temp, byte_count)`; `None` for entries
-    /// with no body (dirs, symlinks).
-    offsets: Vec<Option<(u64, u64)>>,
+    /// Per-entry body, located in the temp file; `None` for entries with no body
+    /// (dirs, symlinks). This reader serves the streaming odc path only, and odc
+    /// carries no checksum, so `Body::checksum` here is always `None`.
+    offsets: Vec<Option<Body>>,
     /// Temp file holding all regular-file bodies, concatenated.
     _temp: tempfile::TempPath,
 }
@@ -900,16 +1034,16 @@ impl ArchiveReader for CpioReader {
         if idx >= self.entries.len() {
             return Err(Error::InvalidIndex(idx));
         }
-        let Some((offset, size)) = self.offsets[idx] else {
+        let Some(body) = self.offsets[idx] else {
             // Directory or symlink — no body to read.
             return Ok(());
         };
-        crate::detect::read_temp_slice(&self._temp, offset, size, out)
+        crate::detect::read_temp_slice(&self._temp, body.offset, body.size, out)
     }
 }
 
-/// Reader for a seekable odc archive: no temp file, no copies — the archive
-/// itself is held open and each body is read where it lies.
+/// Reader for a seekable archive of any variant: no temp file, no copies — the
+/// archive itself is held open and each body is read where it lies.
 ///
 /// The source has to outlive nothing else here, but it does have to die before
 /// the temp path a `.cpgz` is unpacked to: that path belongs to
@@ -918,9 +1052,9 @@ impl ArchiveReader for CpioReader {
 pub struct CpioSeekReader {
     src: Box<dyn ReadSeek>,
     entries: Vec<Entry>,
-    /// Parallel to `entries`: `(offset_in_archive, byte_count)` of the body,
-    /// `None` for entries that have none (dirs, symlinks).
-    bodies: Vec<Option<(u64, u64)>>,
+    /// Parallel to `entries`: where the body lies in the archive and what it
+    /// must sum to; `None` for entries that have none (dirs, symlinks).
+    bodies: Vec<Option<Body>>,
 }
 
 impl ArchiveReader for CpioSeekReader {
@@ -934,25 +1068,61 @@ impl ArchiveReader for CpioSeekReader {
 
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
         let slot = *self.bodies.get(idx).ok_or(Error::InvalidIndex(idx))?;
-        let Some((offset, size)) = slot else {
+        let Some(Body {
+            offset,
+            size,
+            checksum,
+        }) = slot
+        else {
             // Directory or symlink — no body to read.
             return Ok(());
         };
         if size == 0 {
-            return Ok(());
+            // No bytes, so nothing to copy — but an empty body still has to add
+            // up to what the header claimed, which for crc is zero.
+            return self.verify_checksum(idx, checksum, 0);
         }
         self.src.seek(SeekFrom::Start(offset))?;
         // `size` was checked against the file length while scanning, but the
         // copy is still capped by `take` and the output grows as bytes arrive —
         // nothing is reserved up front. A short read means the file shrank or
         // lied; it is an error, never a silently truncated entry.
-        let copied = std::io::copy(&mut (&mut self.src).take(size), out)?;
+        //
+        // The crc variant's checksum is summed *through* the copy rather than
+        // over a buffered body: a body can be gigabytes and must never be held
+        // in memory just to be added up.
+        let (copied, sum) = match checksum {
+            None => (std::io::copy(&mut (&mut self.src).take(size), out)?, 0),
+            Some(_) => {
+                let mut summing = SummingWriter { inner: out, sum: 0 };
+                let copied = std::io::copy(&mut (&mut self.src).take(size), &mut summing)?;
+                (copied, summing.sum)
+            }
+        };
         if copied != size {
             return Err(Error::Corrupt(format!(
                 "cpio: truncated body at offset {offset} ({copied} of {size} bytes)"
             )));
         }
-        Ok(())
+        self.verify_checksum(idx, checksum, sum)
+    }
+}
+
+impl CpioSeekReader {
+    /// Hold a body's summed bytes against what its header promised.
+    ///
+    /// `declared` is `None` for every variant but crc, and then there is nothing
+    /// to check. A mismatch is an error: crc is the only cpio variant that
+    /// carries any integrity check at all, and handing out content that failed
+    /// it would throw the one guarantee the variant exists for away.
+    fn verify_checksum(&self, idx: usize, declared: Option<u32>, actual: u32) -> Result<()> {
+        match declared {
+            Some(want) if want != actual => Err(Error::Corrupt(format!(
+                "cpio crc: checksum mismatch for {}: header says {want:#010x}, body sums to {actual:#010x}",
+                self.entries[idx].path.display()
+            ))),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -988,9 +1158,11 @@ mod tests {
     }
 
     #[test]
-    fn probe_rejects_crc_variant() {
-        // 070702 is the crc variant — not supported.
-        assert_eq!(CpioHandler.probe(b"070702...", None), Confidence::NONE);
+    fn probe_accepts_crc_variant() {
+        // 070702 is the crc variant: the newc layout with the `check` field
+        // filled in. It used to be refused here on the grounds of not being
+        // implemented; it is implemented now.
+        assert_eq!(CpioHandler.probe(b"070702...", None), Confidence::MAGIC);
     }
 
     #[test]
@@ -1564,10 +1736,224 @@ mod tests {
     }
 
     #[test]
-    fn is_supported_magic_covers_newc_and_odc_only() {
-        assert!(is_supported_magic(b"070701"));
-        assert!(is_supported_magic(b"070707"));
-        assert!(!is_supported_magic(b"070702")); // crc — future work
+    fn is_supported_magic_covers_newc_crc_and_odc() {
+        assert!(is_supported_magic(b"070701")); // newc
+        assert!(is_supported_magic(b"070702")); // crc
+        assert!(is_supported_magic(b"070707")); // odc
+        // 070703 does not exist; only the three above do.
+        assert!(!is_supported_magic(b"070703"));
         assert!(!is_supported_magic(b"PK\x03\x04"));
+    }
+
+    // ── crc (070702): the newc walk plus a checksum verified at read time ────
+
+    /// The variant's checksum on a body whose bytes are known by hand: three
+    /// bytes of 0xFF sum to 0x2FD, so the wrap is not what is being tested here
+    /// — the plain sum is.
+    #[test]
+    fn body_checksum_sums_bytes_as_unsigned() {
+        assert_eq!(body_checksum(b""), 0);
+        assert_eq!(body_checksum(b"hi"), u32::from(b'h') + u32::from(b'i'));
+        assert_eq!(body_checksum(&[0xFF, 0xFF, 0xFF]), 0x2FD);
+        // A megabyte of 0xFF: 0x0FF0_0000. Far past what a u8 or u16
+        // accumulator could hold, and the bytes are counted unsigned — a signed
+        // reading would give -1 each and land nowhere near this.
+        assert_eq!(body_checksum(&vec![0xFFu8; 1 << 20]), 0x0FF0_0000);
+    }
+
+    /// Build one crc record. Identical to [`newc_record`] but for the magic and
+    /// the `check` field, which really is the sum of the body's bytes — unless
+    /// `check` overrides it, which is how the mismatch test forges one.
+    fn crc_record_with_check(name: &[u8], mode: u32, body: &[u8], check: Option<u32>) -> Vec<u8> {
+        let mut rec = newc_record(name, mode, body);
+        rec[..MAGIC_LEN].copy_from_slice(MAGIC_CRC);
+        let (off, len) = NEWC_CHECK;
+        let sum = check.unwrap_or_else(|| body_checksum(body));
+        rec[off..off + len].copy_from_slice(format!("{sum:08x}").as_bytes());
+        rec
+    }
+
+    fn crc_record(name: &[u8], mode: u32, body: &[u8]) -> Vec<u8> {
+        crc_record_with_check(name, mode, body, None)
+    }
+
+    /// The closing record every crc archive ends with. Its `check` is zero,
+    /// like every empty body's.
+    fn crc_trailer() -> Vec<u8> {
+        crc_record(b"TRAILER!!!", 0, b"")
+    }
+
+    /// The heart of the ticket: a crc archive lists as fast as a newc one. The
+    /// checksum is *not* verified while the listing is built — doing so would
+    /// mean reading every body, which is exactly what the seekable walk exists
+    /// to avoid.
+    #[test]
+    fn seekable_crc_lists_without_reading_bodies() {
+        const BODY: usize = 1024 * 1024;
+        let bodies: Vec<Vec<u8>> = (0..4u8).map(|i| vec![b'a' + i; BODY]).collect();
+        let mut archive = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            archive.extend_from_slice(&crc_record(
+                format!("file{i}.bin").as_bytes(),
+                S_IFREG | 0o644,
+                body,
+            ));
+        }
+        archive.extend_from_slice(&crc_trailer());
+        let total = archive.len() as u64;
+        assert!(total > 4 * 1024 * 1024);
+
+        let (src, counter) = counting_source(archive);
+        let mut reader = CpioHandler
+            .open(src, &OpenOptions::default())
+            .expect("open crc from a seekable source");
+
+        let listing_reads = counter.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(reader.entries().expect("entries").len(), 4);
+        assert!(
+            listing_reads < 512 * 1024,
+            "listing read {listing_reads} bytes of a {total}-byte archive; \
+             the checksum is being verified at open time instead of at read time"
+        );
+
+        // And a matching checksum reads silently, at the cost of its own body.
+        let before = counter.load(std::sync::atomic::Ordering::Relaxed);
+        let mut out = Vec::new();
+        reader.read_entry(2, &mut out).expect("read_entry");
+        assert_eq!(out, bodies[2]);
+        let body_reads = counter.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert!(
+            body_reads < 2 * BODY as u64,
+            "reading one 1 MiB body took {body_reads} bytes"
+        );
+    }
+
+    /// A forged `check` field is caught — and only when the body is read, not
+    /// when the archive is opened.
+    #[test]
+    fn crc_checksum_mismatch_is_an_error_at_read_time() {
+        let body = b"the quick brown fox";
+        let mut archive = crc_record_with_check(
+            b"a.txt",
+            S_IFREG | 0o644,
+            body,
+            Some(body_checksum(body) ^ 1),
+        );
+        archive.extend_from_slice(&crc_record(b"b.txt", S_IFREG | 0o644, b"intact"));
+        archive.extend_from_slice(&crc_trailer());
+
+        let (src, _) = counting_source(archive);
+        let mut reader = CpioHandler
+            .open(src, &OpenOptions::default())
+            .expect("a bad checksum must not stop the archive from opening");
+        assert_eq!(reader.entries().unwrap().len(), 2);
+
+        let err = reader
+            .read_entry(0, &mut Vec::new())
+            .expect_err("a mismatched checksum must be an error, not silent content");
+        match err {
+            Error::Corrupt(msg) => {
+                assert!(msg.contains("a.txt"), "the entry must be named: {msg}");
+                assert!(msg.contains("checksum"), "{msg}");
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+
+        // The neighbouring record is untouched by the failure.
+        let mut out = Vec::new();
+        reader.read_entry(1, &mut out).expect("read_entry 1");
+        assert_eq!(out, b"intact");
+    }
+
+    /// The whole archive: dirs, symlinks, an empty file and the padding newc
+    /// alignment demands — all read back with their checksums matching.
+    #[test]
+    fn crc_reads_a_whole_tree_with_matching_checksums() {
+        let mut archive = crc_record(b"sub", S_IFDIR | 0o755, b"");
+        archive.extend_from_slice(&crc_record(b"sub/link", S_IFLNK | 0o777, b"a.txt"));
+        // A body of high bytes, so a sum that wrapped or treated bytes as signed
+        // would not match.
+        let high: Vec<u8> = (0..300u32).map(|i| (i % 256) as u8).collect();
+        archive.extend_from_slice(&crc_record(b"a.txt", S_IFREG | 0o644, &high));
+        archive.extend_from_slice(&crc_record(b"empty.bin", S_IFREG | 0o600, b""));
+        archive.extend_from_slice(&crc_trailer());
+
+        let (src, _) = counting_source(archive);
+        let mut reader = CpioHandler.open(src, &OpenOptions::default()).unwrap();
+        let entries = reader.entries().unwrap().to_vec();
+        assert_eq!(entries.len(), 4);
+        assert!(matches!(entries[0].kind, EntryKind::Dir));
+        assert!(matches!(
+            &entries[1].kind,
+            EntryKind::Symlink { target } if target == Path::new("a.txt")
+        ));
+        assert_eq!(entries[2].path, Path::new("a.txt"));
+        assert_eq!(entries[2].mode, Some(S_IFREG | 0o644));
+
+        let mut out = Vec::new();
+        reader.read_entry(2, &mut out).expect("read a.txt");
+        assert_eq!(out, high);
+        out.clear();
+        reader.read_entry(3, &mut out).expect("read empty.bin");
+        assert!(out.is_empty());
+    }
+
+    /// An empty body whose header claims a non-zero sum is still a mismatch —
+    /// the zero-length shortcut must not skip the check.
+    #[test]
+    fn crc_empty_body_with_a_wrong_checksum_is_an_error() {
+        let mut archive = crc_record_with_check(b"empty.bin", S_IFREG | 0o644, b"", Some(1));
+        archive.extend_from_slice(&crc_trailer());
+
+        let (src, _) = counting_source(archive);
+        let mut reader = CpioHandler.open(src, &OpenOptions::default()).unwrap();
+        let err = reader
+            .read_entry(0, &mut Vec::new())
+            .expect_err("an empty body must still add up to what was promised");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+    }
+
+    /// A crc record inside a newc archive (or the other way round) desynchronises
+    /// nothing, because the walk pins the magic it started with.
+    #[test]
+    fn crc_walk_refuses_a_newc_record() {
+        let mut archive = crc_record(b"a.txt", S_IFREG | 0o644, b"one");
+        archive.extend_from_slice(&newc_record(b"b.txt", S_IFREG | 0o644, b"two"));
+        archive.extend_from_slice(&crc_trailer());
+
+        let err = open_err(archive);
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+    }
+
+    /// A `Source::Stream` of crc bytes takes the same spill-to-temp path newc
+    /// does, checksum and all.
+    #[test]
+    fn streamed_crc_goes_through_a_temp_file() {
+        let mut archive = crc_record(b"a.txt", S_IFREG | 0o644, b"one\n");
+        archive.extend_from_slice(&crc_record_with_check(
+            b"bad.bin",
+            S_IFREG | 0o600,
+            b"two two\n",
+            Some(0),
+        ));
+        archive.extend_from_slice(&crc_trailer());
+
+        let src = Source::Stream {
+            inner: Box::new(Cursor::new(archive)),
+            path: None,
+        };
+        let mut reader = CpioHandler
+            .open(src, &OpenOptions::default())
+            .expect("open crc from a stream");
+        assert_eq!(reader.entries().unwrap().len(), 2);
+
+        let mut out = Vec::new();
+        reader.read_entry(0, &mut out).expect("read_entry 0");
+        assert_eq!(out, b"one\n");
+        // The checksum survives the spill: the forged one still fails.
+        let err = reader
+            .read_entry(1, &mut Vec::new())
+            .expect_err("the spilled path must verify the checksum too");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
     }
 }

@@ -465,16 +465,16 @@ pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
     Ok(filled >= 263 && &buf[257..262] == b"ustar")
 }
 
-/// Check whether a reader starts with a cpio magic this crate can open —
-/// SVR4 "new ASCII" (`070701`) or POSIX "old portable"/odc (`070707`).
-/// Rewinds the reader to position 0 after the check.
+/// Check whether a reader starts with a cpio magic this crate can open — SVR4
+/// "new ASCII" (`070701`), its checksummed twin crc (`070702`) or POSIX "old
+/// portable"/odc (`070707`). Rewinds the reader to position 0 after the check.
 ///
 /// This is the companion of [`is_tar`] for the one other archive format looked
 /// for inside a decompressed stream (`.cpgz` — cpio inside gzip — is what macOS
 /// Archive Utility produces; its engine, `ditto`, writes the odc variant).
-/// The set checked here is exactly what `CpioHandler::probe` accepts, so
-/// anything detected here can also be opened; the crc variant (`070702`) is not
-/// implemented and stays a single entry.
+/// The question is delegated to `cpio::is_supported_magic` rather than restated
+/// here, so the set claimed here cannot drift from the set `CpioHandler::open`
+/// can actually parse.
 pub(crate) fn is_cpio<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
     let mut buf = [0u8; crate::format::cpio::MAGIC_LEN];
     let filled = peek_from_start(reader, &mut buf)?;
@@ -716,10 +716,13 @@ mod tests {
         assert!(is_cpio(&mut odc).unwrap());
         assert_eq!(odc.position(), 0);
 
-        // crc (070702) is not opened by CpioHandler, so it must not be claimed
-        // here either — it stays a single entry.
+        // crc (070702) — three variants now, not two: `CpioHandler` gained it,
+        // so it has to be claimed here too, or a `.cpio.gz` of that variant
+        // would come out of the compression layer as one opaque entry while a
+        // bare `.cpio` of the same bytes opened fine.
         let mut crc = Cursor::new(b"070702000000".to_vec());
-        assert!(!is_cpio(&mut crc).unwrap());
+        assert!(is_cpio(&mut crc).unwrap());
+        assert_eq!(crc.position(), 0);
 
         let mut zip = Cursor::new(b"PK\x03\x04....".to_vec());
         assert!(!is_cpio(&mut zip).unwrap());

@@ -29,6 +29,8 @@ mod cab_handler;
 mod conda;
 #[path = "integration/cpgz.rs"]
 mod cpgz;
+#[path = "integration/cpio_crc.rs"]
+mod cpio_crc;
 #[path = "integration/cpio_handler.rs"]
 mod cpio_handler;
 #[path = "integration/cpio_newc.rs"]
