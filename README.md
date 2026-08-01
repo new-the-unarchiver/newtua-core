@@ -81,7 +81,7 @@ Every variant below is a `FormatId` from [`src/archive.rs`](src/archive.rs).
 | `Cab` | `.cab` |
 | `Ar` | `.ar`/`.a` |
 | `Deb` | `.deb` (Debian package, ar + tar members) |
-| `Cpio` | `.cpio` and `.cpgz` (cpio inside a compressor), newc and odc variants |
+| `Cpio` | `.cpio` and `.cpgz` (cpio inside a compressor); the newc, crc and odc variants |
 | `Rpm` | `.rpm` |
 | `Xar` | `.xar`/`.pkg` |
 | `Msi` | `.msi` (Windows Installer, CFB + embedded CAB) |

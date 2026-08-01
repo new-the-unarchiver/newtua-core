@@ -187,7 +187,7 @@ fn trim_nuls(bytes: &mut Vec<u8>) {
     }
 }
 
-/// The error a magic that is neither variant produces.
+/// The error a magic that is none of the three variants produces.
 fn unsupported_magic(magic: &[u8]) -> Error {
     Error::Corrupt(format!(
         "unsupported cpio magic {:?}",

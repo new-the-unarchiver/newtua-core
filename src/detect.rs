@@ -229,8 +229,11 @@ fn detect_compressor_by_ext(lower_name: &str) -> Option<Compressor> {
 /// while keeping a temp file alive (and auto-deleted on drop).
 ///
 /// Used for multi-volume reconstruction, the decompressed temp file backing a
-/// tar-inside-compressed-file, SFX carving, and the format-specific readers
-/// (deb/rpm) that decompress a payload to a temp file. By default `format()`
+/// tar- or cpio-inside-compressed-file (`.tar.gz`, `.cpgz`), SFX carving, and
+/// the format-specific readers (deb/rpm) that decompress a payload to a temp
+/// file. The cpio reader has no temp file of its own — it reads bodies straight
+/// out of this one, which is exactly why the wrapper has to outlive it. By
+/// default `format()`
 /// delegates to the inner reader; pass a `format_override` to report a wrapper
 /// format (e.g. `Deb`/`Rpm`) instead of the inner payload format.
 pub(crate) struct TempBackedReader {
@@ -622,7 +625,8 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
 ///
 ///    - If a compression wrapper is detected (gzip/bzip2/xz), decompress to a
 ///      temp file, then peek its content for tar magic at offset 257 and then
-///      for a cpio magic (newc or odc) at offset 0 — those two formats only:
+///      for a cpio magic (newc, crc or odc) at offset 0 — those two formats
+///      only:
 ///      - If tar or cpio → open with that handler (file-backed via temp),
 ///        wrapped so the temp file outlives the reader.
 ///      - Otherwise → return a [`SingleFileReader`] with one entry whose name

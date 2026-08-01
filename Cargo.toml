@@ -41,6 +41,15 @@ time = "0.3"
 sevenz-rust2 = { version = "0.21", features = ["aes256"] }
 unrar = { package = "newtua-unrar", version = "0.5.8-newtua.1" }
 tempfile = "3"
+# cpio (.cpio/.cpgz) has no crate behind it on purpose — all three ASCII
+# variants (newc 070701, crc 070702, odc 070707) are parsed in format/cpio.rs.
+# `cpio = "0.4"` used to read newc and was dropped: it runs every entry name
+# through String::from_utf8, so one CP1251/Shift-JIS/Latin-1 name failed the
+# whole open — precisely the case `decode_names` exists for — and it read no
+# other variant. The alternatives share one shape or another of the same
+# problem: names decoded eagerly as UTF-8, a front-to-back stream that cannot
+# skip a body by seeking (so listing costs a full copy), or a build that needs
+# Unix-only pieces we ship on Windows too.
 rpm = { version = "0.25", default-features = false }
 # XAR (.xar/.pkg): in-house decode-only reader (header + zlib TOC + heap). Uses
 # the shared flate2/bzip2/xz2 plus a tiny XML DOM; no apple-xar, no `ring`.
