@@ -41,7 +41,6 @@ time = "0.3"
 sevenz-rust2 = { version = "0.21", features = ["aes256"] }
 unrar = { package = "newtua-unrar", version = "0.5.8-newtua.1" }
 tempfile = "3"
-cpio = "0.4"
 rpm = { version = "0.25", default-features = false }
 # XAR (.xar/.pkg): in-house decode-only reader (header + zlib TOC + heap). Uses
 # the shared flate2/bzip2/xz2 plus a tiny XML DOM; no apple-xar, no `ring`.

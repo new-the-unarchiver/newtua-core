@@ -9,23 +9,31 @@
 //! tar has been ruled out. That second path is what opens a `.cpgz` from macOS
 //! Archive Utility — odc inside gzip.
 //!
+//! Both variants are parsed here, by hand. Nothing is delegated: a third-party
+//! newc reader used to do this and turned every name that was not UTF-8 into an
+//! open error, which is exactly the case `decode_names` exists for.
+//!
 //! # How an archive is opened
 //!
 //! cpio is a sequential format, but the file it lives in usually is not, and
 //! that decides which of the two paths `open` takes:
 //!
-//! * **Seekable source, odc.** The listing is built from the headers alone:
-//!   every body is *skipped by seeking*, never read, and the source stays open
-//!   so `read_entry` can seek back to a body on demand (`CpioSeekReader`). No
-//!   temp file is written at all. This is the path a `.cpgz` takes, where the
+//! * **Seekable source.** The listing is built from the headers alone: every
+//!   body is *skipped by seeking*, never read, and the source stays open so
+//!   `read_entry` can seek back to a body on demand (`CpioSeekReader`). No temp
+//!   file is written at all. This is the path a `.cpgz` takes, where the
 //!   decompression layer has already spent one temp file on the gzip stream.
 //!   Integrity does not suffer: the file length is taken once at open time and
 //!   every record is checked against it (`body offset + declared length ≤ file
 //!   length`), which catches a truncation *earlier* than reading would, and the
 //!   next record's magic still has to be where the skip lands.
-//! * **Everything else** — a non-seekable `Source::Stream`, and newc for now —
-//!   makes one streaming pass, concatenating every regular-file body into a
-//!   temp file and keeping per-entry offsets into it (`Scan`).
+//! * **`Source::Stream`, newc.** Spilled to a temp file first and then walked
+//!   as above, so newc has one parser rather than two. `Source` is a public
+//!   type, so a caller of the library can hand us a stream even though nothing
+//!   inside the crate builds one.
+//! * **`Source::Stream`, odc.** Still makes one streaming pass, concatenating
+//!   every regular-file body into a temp file and keeping per-entry offsets
+//!   into it (`Scan`).
 
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -85,28 +93,26 @@ impl FormatHandler for CpioHandler {
     }
 
     fn open(&self, src: Source, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
-        // cpio is a sequential streaming format; we can read from either source.
         let raw: Box<dyn Read> = match src {
             Source::Seekable { mut inner, .. } => {
-                // A seekable source can be listed from the headers alone. Only
-                // odc goes that way today; newc still streams (its parser is
-                // the `cpio` crate's, which cannot seek).
+                // A seekable source is listed from the headers alone, both
+                // variants; the body offsets point into the archive itself.
                 let file_len = inner.seek(SeekFrom::End(0))?;
                 inner.seek(SeekFrom::Start(0))?;
                 let mut magic = [0u8; MAGIC_LEN];
                 inner.read_exact(&mut magic).map_err(io_err_to_corrupt)?;
-                if &magic == MAGIC_ODC {
-                    return open_odc_seekable(inner, file_len, opts);
-                }
-                inner.seek(SeekFrom::Start(0))?;
-                inner
+                return match &magic {
+                    MAGIC_ODC => open_odc_seekable(inner, file_len, opts),
+                    MAGIC_NEWC => open_newc_seekable(inner, file_len, opts),
+                    _ => Err(unsupported_magic(&magic)),
+                };
             }
             Source::Stream { inner, .. } => inner,
         };
-        // Both scanners walk the stream header by header — 110 bytes for newc,
-        // 76 plus the name for odc — and `Source` hands over an unbuffered
-        // file. Without this, a tree of 10 000 files costs tens of thousands of
-        // syscalls; bodies still go through `io::copy` and are unaffected.
+        // The odc scanner walks the stream header by header — 76 bytes plus the
+        // name — and `Source` hands over an unbuffered file. Without this, a
+        // tree of 10 000 files costs tens of thousands of syscalls; bodies still
+        // go through `io::copy` and are unaffected.
         let mut reader: Box<dyn Read> = Box::new(BufReader::with_capacity(64 * 1024, raw));
 
         // Pick the variant from the leading magic. A `Source::Stream` cannot be
@@ -115,18 +121,17 @@ impl FormatHandler for CpioHandler {
         reader.read_exact(&mut magic).map_err(io_err_to_corrupt)?;
         let stream: Box<dyn Read> = Box::new(Cursor::new(magic).chain(reader));
 
-        let scan = match &magic {
-            MAGIC_NEWC => scan_newc(stream)?,
-            MAGIC_ODC => scan_odc(stream)?,
-            _ => {
-                return Err(Error::Corrupt(format!(
-                    "unsupported cpio magic {:?}",
-                    String::from_utf8_lossy(&magic)
-                )));
+        match &magic {
+            // newc keeps a single parser, the seeking one: an unseekable stream
+            // is spilled to a temp file and walked from there. Nothing in the
+            // crate builds a `Source::Stream`, but the type is public.
+            MAGIC_NEWC => {
+                let (file, file_len) = spill_to_temp(stream)?;
+                open_newc_seekable(Box::new(file), file_len, opts)
             }
-        };
-
-        finish(scan, opts)
+            MAGIC_ODC => finish(scan_odc(stream)?, opts),
+            _ => Err(unsupported_magic(&magic)),
+        }
     }
 }
 
@@ -161,53 +166,191 @@ fn trim_nuls(bytes: &mut Vec<u8>) {
     }
 }
 
+/// The error a magic that is neither variant produces.
+fn unsupported_magic(magic: &[u8]) -> Error {
+    Error::Corrupt(format!(
+        "unsupported cpio magic {:?}",
+        String::from_utf8_lossy(magic)
+    ))
+}
+
+/// Drain `stream` into an unnamed temp file and hand back the file, rewound,
+/// together with its length. Used for the one path that cannot seek.
+fn spill_to_temp(mut stream: Box<dyn Read>) -> Result<(std::fs::File, u64)> {
+    let mut file = tempfile::tempfile()?;
+    let len = std::io::copy(&mut stream, &mut file)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok((file, len))
+}
+
 // ── newc (070701) ────────────────────────────────────────────────────────────
 
-/// Stream a newc archive, copying regular-file bodies into one shared temp file
-/// and recording `(offset, size)` per entry.
-fn scan_newc(reader: Box<dyn Read>) -> Result<Scan> {
-    let mut temp = tempfile::NamedTempFile::new()?;
+/// Fixed header length of the newc variant: the magic plus thirteen fields of
+/// eight ASCII hex digits each.
+const NEWC_HEADER_LEN: usize = 110;
+
+/// Field spans of the newc header (SVR4 "new ASCII"). Every field is eight
+/// ASCII hexadecimal digits, no separators:
+///
+/// ```text
+///  off  len  field
+///    0    6  magic     "070701"
+///    6    8  ino
+///   14    8  mode
+///   22    8  uid
+///   30    8  gid
+///   38    8  nlink
+///   46    8  mtime
+///   54    8  filesize
+///   62    8  devmajor
+///   70    8  devminor
+///   78    8  rdevmajor
+///   86    8  rdevminor
+///   94    8  namesize  includes the name's trailing NUL
+///  102    8  check     zero unless the variant is crc (070702)
+/// ```
+///
+/// Unlike odc, newc pads: the name is followed by NULs until `110 + namesize`
+/// is a multiple of four, and the body by NULs until `filesize` is. Getting
+/// that wrong desynchronises every record after the first.
+const NEWC_MODE: (usize, usize) = (14, 8);
+const NEWC_MTIME: (usize, usize) = (46, 8);
+const NEWC_FILESIZE: (usize, usize) = (54, 8);
+const NEWC_NAMESIZE: (usize, usize) = (94, 8);
+
+/// Parse one fixed-width ASCII-hex header field — the newc counterpart of
+/// [`parse_octal`], and strict for the same reason: garbage in a header must be
+/// an error, never a silently wrong number. Both digit cases are accepted (GNU
+/// writes lowercase, some writers uppercase) and the space/NUL padding some
+/// writers leave around the digits is tolerated. Accumulation goes through
+/// `checked_*`, so an all-`f` field cannot wrap — it simply fails.
+fn parse_hex(field: &[u8]) -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut seen_digit = false;
+    for &b in field {
+        let digit = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            // Padding: skipped before the number, ends it after.
+            b' ' | 0 => {
+                if seen_digit {
+                    break;
+                }
+                continue;
+            }
+            _ => return None,
+        };
+        seen_digit = true;
+        value = value.checked_mul(16)?.checked_add(u64::from(digit))?;
+    }
+    seen_digit.then_some(value)
+}
+
+/// Read a newc header field by `(offset, len)` and parse it, or fail with a
+/// message naming the field.
+fn newc_field(header: &[u8], span: (usize, usize), name: &str) -> Result<u64> {
+    let (off, len) = span;
+    parse_hex(&header[off..off + len])
+        .ok_or_else(|| Error::Corrupt(format!("cpio newc: bad hex in {name} field")))
+}
+
+/// Bytes of NUL padding that follow `len` to bring it up to a multiple of four.
+fn pad4(len: u64) -> u64 {
+    (4 - (len % 4)) % 4
+}
+
+/// Walk a newc archive by its headers, skipping every body by seeking — the
+/// counterpart of [`scan_odc_seekable`], and the same shape: nothing is
+/// allocated to a declared size, and every declared length is checked against
+/// the file length before it is used to move.
+fn scan_newc_seekable(
+    src: &mut dyn ReadSeek,
+    file_len: u64,
+) -> Result<(Vec<Vec<u8>>, Vec<EntryMeta>)> {
+    let mut reader = BufReader::with_capacity(SCAN_BUF, src);
     let mut raw_names: Vec<Vec<u8>> = Vec::new();
     let mut metas: Vec<EntryMeta> = Vec::new();
-
-    let mut current: Box<dyn Read> = reader;
+    let mut header = [0u8; NEWC_HEADER_LEN];
+    let mut pos: u64 = 0;
 
     loop {
-        let entry_reader = cpio::NewcReader::new(current).map_err(io_err_to_corrupt)?;
+        // Where the skip landed must hold another record; an archive that ends
+        // without its TRAILER is truncated, and says so here.
+        let after_header = advance(
+            pos,
+            NEWC_HEADER_LEN as u64,
+            file_len,
+            format_args!("record header"),
+        )?;
+        reader.read_exact(&mut header).map_err(io_err_to_corrupt)?;
+        if &header[..MAGIC_LEN] != MAGIC_NEWC {
+            return Err(Error::Corrupt(format!(
+                "cpio newc: record at offset {pos} does not start with 070701"
+            )));
+        }
 
-        if entry_reader.entry().is_trailer() {
-            // Consume the trailer; we don't need the underlying reader.
-            let _ = entry_reader.finish();
+        let mode = newc_field(&header, NEWC_MODE, "mode")? as u32;
+        let mtime = newc_field(&header, NEWC_MTIME, "mtime")?;
+        let filesize = newc_field(&header, NEWC_FILESIZE, "filesize")?;
+        let namesize = newc_field(&header, NEWC_NAMESIZE, "namesize")?;
+
+        if namesize == 0 {
+            return Err(Error::Corrupt("cpio newc: zero-length name".into()));
+        }
+        let after_name = advance(after_header, namesize, file_len, format_args!("entry name"))?;
+        let mut name = Vec::new();
+        take_exact(&mut reader, namesize, &mut name, format_args!("entry name"))?;
+        // `namesize` counts the terminating NUL; drop it and any extra padding.
+        // The extra matters: `dracut-cpio` pads the name out to a filesystem
+        // block boundary with further NULs, all of them counted in `namesize`.
+        trim_nuls(&mut name);
+
+        if name == b"TRAILER!!!" {
             break;
         }
 
-        let entry = entry_reader.entry().clone();
-        let mode = entry.mode();
-        let file_size = entry.file_size() as u64;
-        let name_str = entry.name().to_owned();
-        let modified = unix_secs_to_systime(entry.mtime() as u64);
+        // Padding is counted from the start of the record, header included.
+        let body_start = advance(
+            after_name,
+            pad4(NEWC_HEADER_LEN as u64 + namesize),
+            file_len,
+            format_args!("name padding"),
+        )?;
+        let after_body = advance(
+            body_start,
+            filesize,
+            file_len,
+            format_args!("body of {}", String::from_utf8_lossy(&name)),
+        )?;
+        // The body's own padding, unlike the name's, is counted from the body
+        // alone — it starts on a four-byte boundary already.
+        let next = advance(
+            after_body,
+            pad4(filesize),
+            file_len,
+            format_args!("body padding"),
+        )?;
+        let modified = unix_secs_to_systime(mtime);
 
         match mode & S_IFMT {
             S_IFREG => {
-                // Regular file: stream body into the shared temp file.
-                let offset = temp.seek(SeekFrom::End(0))?;
-                current = Box::new(
-                    entry_reader
-                        .to_writer(&mut temp)
-                        .map_err(io_err_to_corrupt)?,
-                );
-                raw_names.push(name_str.into_bytes());
+                // The body stays where it is; only its coordinates are kept.
+                skip_to(&mut reader, after_name, next)?;
+                raw_names.push(name);
                 metas.push(EntryMeta {
                     kind: KindRaw::File,
-                    offset,
-                    size: file_size,
+                    offset: body_start,
+                    size: filesize,
                     mode,
                     modified,
                 });
             }
             S_IFDIR => {
-                current = Box::new(entry_reader.finish().map_err(io_err_to_corrupt)?);
-                raw_names.push(name_str.into_bytes());
+                // Directories carry no body, but skip `filesize` anyway so a
+                // non-conforming writer cannot desynchronise the walk.
+                skip_to(&mut reader, after_name, next)?;
+                raw_names.push(name);
                 metas.push(EntryMeta {
                     kind: KindRaw::Dir,
                     offset: 0,
@@ -217,40 +360,55 @@ fn scan_newc(reader: Box<dyn Read>) -> Result<Scan> {
                 });
             }
             S_IFLNK => {
-                // Symlink: body is the link target. `file_size` is an
-                // attacker-controlled header field, so cap the capacity hint
-                // (the Vec still grows as `to_writer` streams the real bytes)
-                // to avoid a multi-GB eager allocation on a crafted header.
-                let cap = (file_size as usize).min(64 * 1024);
-                let mut target_bytes = Vec::with_capacity(cap);
-                current = Box::new(
-                    entry_reader
-                        .to_writer(&mut target_bytes)
-                        .map_err(io_err_to_corrupt)?,
-                );
-                trim_nuls(&mut target_bytes);
-                raw_names.push(name_str.into_bytes());
+                // Symlink targets are read here rather than skipped: they are a
+                // few bytes each and the entry list needs them right away.
+                skip_to(&mut reader, after_name, body_start)?;
+                let mut target = Vec::new();
+                take_exact(
+                    &mut reader,
+                    filesize,
+                    &mut target,
+                    format_args!("symlink target"),
+                )?;
+                trim_nuls(&mut target);
+                skip_to(&mut reader, after_body, next)?;
+                raw_names.push(name);
                 metas.push(EntryMeta {
-                    kind: KindRaw::Symlink(target_bytes),
+                    kind: KindRaw::Symlink(target),
                     offset: 0,
-                    size: file_size,
+                    size: filesize,
                     mode,
                     modified,
                 });
             }
             _ => {
-                // Special node (char/block device, fifo, socket) or hardlink —
-                // skip silently per the spec.
-                current = Box::new(entry_reader.finish().map_err(io_err_to_corrupt)?);
+                // Special node (char/block device, fifo, socket) or a hardlink
+                // body — skipped, as in the odc walk.
+                skip_to(&mut reader, after_name, next)?;
             }
         }
+
+        pos = next;
     }
 
-    Ok(Scan {
-        temp,
-        raw_names,
-        metas,
-    })
+    Ok((raw_names, metas))
+}
+
+/// Open a seekable newc archive: list it from the headers, then keep `inner`
+/// open so bodies can be read straight out of it.
+fn open_newc_seekable(
+    mut inner: Box<dyn ReadSeek>,
+    file_len: u64,
+    opts: &OpenOptions,
+) -> Result<Box<dyn ArchiveReader>> {
+    inner.seek(SeekFrom::Start(0))?;
+    let (raw_names, metas) = scan_newc_seekable(inner.as_mut(), file_len)?;
+    let (entries, bodies) = build_entries(raw_names, metas, opts);
+    Ok(Box::new(CpioSeekReader {
+        src: inner,
+        entries,
+        bodies,
+    }))
 }
 
 // ── odc (070707) ─────────────────────────────────────────────────────────────
@@ -339,7 +497,7 @@ fn take_exact(
     let moved = std::io::copy(&mut reader.take(n), out)?;
     if moved != n {
         return Err(Error::Corrupt(format!(
-            "cpio odc: truncated {what} ({moved} of {n} bytes)"
+            "cpio: truncated {what} ({moved} of {n} bytes)"
         )));
     }
     Ok(())
@@ -460,13 +618,13 @@ fn scan_odc(reader: Box<dyn Read>) -> Result<Scan> {
     })
 }
 
-// ── odc (070707), seekable: headers only ─────────────────────────────────────
+// ── Seekable walks: shared machinery ─────────────────────────────────────────
 
-/// Buffer the header walk reads through. Headers are 76 bytes plus a name, so
-/// an unbuffered walk would cost two syscalls per record; one fill covers a few
-/// hundred records of a small-file archive. Bodies are skipped by seeking, so a
-/// large one costs at most one wasted fill.
-const ODC_SCAN_BUF: usize = 64 * 1024;
+/// Buffer the header walk reads through. Headers are 110 bytes (newc) or 76
+/// plus a name (odc), so an unbuffered walk would cost two syscalls per record;
+/// one fill covers a few hundred records of a small-file archive. Bodies are
+/// skipped by seeking, so a large one costs at most one wasted fill.
+const SCAN_BUF: usize = 64 * 1024;
 
 /// Skip forward to `target`, keeping the buffer when the jump is short enough
 /// to land inside it (`seek_relative` does that; a plain `seek` would always
@@ -491,13 +649,13 @@ fn skip_to(reader: &mut BufReader<&mut dyn ReadSeek>, from: u64, target: u64) ->
 
 /// Advance `pos` by `n`, refusing anything that would run past the end of the
 /// file. This is the whole integrity story of the seekable walk: every length
-/// in an odc header is attacker-controlled, and this is where a length that
+/// in a cpio header is attacker-controlled, and this is where a length that
 /// does not fit the file becomes an error instead of a seek into nowhere.
 fn advance(pos: u64, n: u64, file_len: u64, what: std::fmt::Arguments<'_>) -> Result<u64> {
     match pos.checked_add(n) {
         Some(end) if end <= file_len => Ok(end),
         _ => Err(Error::Corrupt(format!(
-            "cpio odc: {what} claims {n} bytes at offset {pos} but the file holds {file_len}"
+            "cpio: {what} claims {n} bytes at offset {pos} but the file holds {file_len}"
         ))),
     }
 }
@@ -512,7 +670,7 @@ fn scan_odc_seekable(
     src: &mut dyn ReadSeek,
     file_len: u64,
 ) -> Result<(Vec<Vec<u8>>, Vec<EntryMeta>)> {
-    let mut reader = BufReader::with_capacity(ODC_SCAN_BUF, src);
+    let mut reader = BufReader::with_capacity(SCAN_BUF, src);
     let mut raw_names: Vec<Vec<u8>> = Vec::new();
     let mut metas: Vec<EntryMeta> = Vec::new();
     let mut header = [0u8; ODC_HEADER_LEN];
@@ -791,7 +949,7 @@ impl ArchiveReader for CpioSeekReader {
         let copied = std::io::copy(&mut (&mut self.src).take(size), out)?;
         if copied != size {
             return Err(Error::Corrupt(format!(
-                "cpio odc: truncated body at offset {offset} ({copied} of {size} bytes)"
+                "cpio: truncated body at offset {offset} ({copied} of {size} bytes)"
             )));
         }
         Ok(())
@@ -864,6 +1022,56 @@ mod tests {
         // 22 sevens overflow u64; `checked_*` turns that into None, not a wrap
         // and not a panic in release or debug.
         assert_eq!(parse_octal(&[b'7'; 22]), None);
+    }
+
+    #[test]
+    fn parse_hex_reads_both_digit_cases() {
+        assert_eq!(parse_hex(b"000081a4"), Some(0o100644));
+        assert_eq!(parse_hex(b"000081A4"), Some(0o100644));
+        assert_eq!(parse_hex(b"00000000"), Some(0));
+        assert_eq!(parse_hex(b"ffffffff"), Some(u64::from(u32::MAX)));
+    }
+
+    #[test]
+    fn parse_hex_tolerates_space_and_nul_padding() {
+        assert_eq!(parse_hex(b"  1a4 "), Some(0x1a4));
+        assert_eq!(parse_hex(b"1a4\0\0\0"), Some(0x1a4));
+    }
+
+    #[test]
+    fn parse_hex_rejects_garbage_without_panicking() {
+        assert_eq!(parse_hex(b"zzzzzzzz"), None); // not hex at all
+        assert_eq!(parse_hex(b"0000g000"), None); // 'g' is past 'f'
+        assert_eq!(parse_hex(b"        "), None); // no digits
+        assert_eq!(parse_hex(b""), None);
+        // 17 f's overflow u64; `checked_*` turns that into None, not a wrap and
+        // not a panic in release or debug.
+        assert_eq!(parse_hex(&[b'f'; 17]), None);
+    }
+
+    #[test]
+    fn pad4_rounds_up_to_four() {
+        assert_eq!(pad4(0), 0);
+        assert_eq!(pad4(1), 3);
+        assert_eq!(pad4(2), 2);
+        assert_eq!(pad4(3), 1);
+        assert_eq!(pad4(4), 0);
+        // A name of 5 bytes after the 110-byte header lands on 115 → 1 pad byte.
+        assert_eq!(pad4(NEWC_HEADER_LEN as u64 + 5), 1);
+    }
+
+    #[test]
+    fn newc_header_spans_match_a_real_record() {
+        // The first record of the committed `cpio_newc.cpio` fixture, verbatim:
+        // one 6-byte file "a.txt" (namesize 6 counts the NUL). Thirteen fields
+        // of eight hex digits after the magic — this pins every span below.
+        let header: &[u8] = b"070701153d6720000081a4000001f500000000000000016a3c29d200000006000000010000001100000000000000000000000600000000";
+        assert_eq!(header.len(), NEWC_HEADER_LEN);
+        assert_eq!(&header[..MAGIC_LEN], MAGIC_NEWC);
+        assert_eq!(newc_field(header, NEWC_MODE, "mode").unwrap(), 0o100644);
+        assert_eq!(newc_field(header, NEWC_MTIME, "mtime").unwrap(), 0x6a3c29d2);
+        assert_eq!(newc_field(header, NEWC_FILESIZE, "filesize").unwrap(), 6);
+        assert_eq!(newc_field(header, NEWC_NAMESIZE, "namesize").unwrap(), 6);
     }
 
     #[test]
@@ -1073,6 +1281,286 @@ mod tests {
 
         let err = open_err(archive);
         assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+    }
+
+    // ── Seekable newc: the same walk, plus the alignment odc does not have ───
+
+    /// Build one newc record: the 110-byte header, the NUL-terminated name
+    /// padded so `110 + namesize` is a multiple of four, then the body padded
+    /// the same way. `extra_nuls` appends further NULs to the name *inside*
+    /// `namesize`, which is what `dracut-cpio` does.
+    fn newc_record_padded(name: &[u8], mode: u32, body: &[u8], extra_nuls: usize) -> Vec<u8> {
+        let namesize = name.len() + 1 + extra_nuls;
+        let mut rec = Vec::new();
+        rec.extend_from_slice(MAGIC_NEWC);
+        // ino, mode, uid, gid, nlink, mtime, filesize, devmajor, devminor,
+        // rdevmajor, rdevminor, namesize, check.
+        let fields: [u64; 13] = [
+            1,
+            u64::from(mode),
+            0,
+            0,
+            1,
+            1,
+            body.len() as u64,
+            0,
+            0,
+            0,
+            0,
+            namesize as u64,
+            0,
+        ];
+        for f in fields {
+            rec.extend_from_slice(format!("{f:08x}").as_bytes());
+        }
+        assert_eq!(rec.len(), NEWC_HEADER_LEN);
+        rec.extend_from_slice(name);
+        rec.resize(rec.len() + 1 + extra_nuls, 0);
+        rec.resize(
+            rec.len() + pad4(NEWC_HEADER_LEN as u64 + namesize as u64) as usize,
+            0,
+        );
+        rec.extend_from_slice(body);
+        rec.resize(rec.len() + pad4(body.len() as u64) as usize, 0);
+        rec
+    }
+
+    fn newc_record(name: &[u8], mode: u32, body: &[u8]) -> Vec<u8> {
+        newc_record_padded(name, mode, body, 0)
+    }
+
+    /// The closing record every newc archive ends with.
+    fn newc_trailer() -> Vec<u8> {
+        newc_record(b"TRAILER!!!", 0, b"")
+    }
+
+    /// The point of the seekable path, for newc this time: listing a 4 MiB
+    /// archive reads a few header-sized buffers, not the four megabytes.
+    #[test]
+    fn seekable_newc_lists_without_reading_bodies() {
+        const BODY: usize = 1024 * 1024;
+        let bodies: Vec<Vec<u8>> = (0..4u8).map(|i| vec![b'a' + i; BODY]).collect();
+        let mut archive = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            archive.extend_from_slice(&newc_record(
+                format!("file{i}.bin").as_bytes(),
+                S_IFREG | 0o644,
+                body,
+            ));
+        }
+        archive.extend_from_slice(&newc_trailer());
+        let total = archive.len() as u64;
+        assert!(total > 4 * 1024 * 1024);
+
+        let (src, counter) = counting_source(archive);
+        let mut reader = CpioHandler
+            .open(src, &OpenOptions::default())
+            .expect("open newc from a seekable source");
+
+        let listing_reads = counter.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(reader.entries().expect("entries").len(), 4);
+        assert!(
+            listing_reads < 512 * 1024,
+            "listing read {listing_reads} bytes of a {total}-byte archive; \
+             bodies are being read instead of skipped"
+        );
+
+        let before = counter.load(std::sync::atomic::Ordering::Relaxed);
+        let mut out = Vec::new();
+        reader.read_entry(2, &mut out).expect("read_entry");
+        assert_eq!(out, bodies[2]);
+        let body_reads = counter.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert!(
+            body_reads < 2 * BODY as u64,
+            "reading one 1 MiB body took {body_reads} bytes"
+        );
+    }
+
+    /// Alignment is the whole difference from odc, so it gets its own test: a
+    /// name and a body that each need padding, followed by another record whose
+    /// content proves the walk did not drift.
+    #[test]
+    fn seekable_newc_honours_name_and_body_padding() {
+        // 110 + namesize must not already be a multiple of four, and the body
+        // length must not either: "ab.txt" is 6 + 1 = 7 → 117, pad 3; the body
+        // "odd" is 3 bytes → pad 1.
+        let first = newc_record(b"ab.txt", S_IFREG | 0o644, b"odd");
+        assert_eq!(pad4(NEWC_HEADER_LEN as u64 + 7), 3);
+        assert_eq!(first.len() % 4, 0, "a record must end four-byte aligned");
+
+        let mut archive = first;
+        archive.extend_from_slice(&newc_record(b"second.bin", S_IFREG | 0o600, b"SECOND"));
+        archive.extend_from_slice(&newc_trailer());
+
+        let (src, _) = counting_source(archive);
+        let mut reader = CpioHandler.open(src, &OpenOptions::default()).unwrap();
+        let entries = reader.entries().unwrap().to_vec();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, Path::new("ab.txt"));
+        assert_eq!(entries[1].path, Path::new("second.bin"));
+
+        let mut out = Vec::new();
+        reader.read_entry(0, &mut out).unwrap();
+        assert_eq!(out, b"odd", "the first body must not include its padding");
+        out.clear();
+        reader.read_entry(1, &mut out).unwrap();
+        assert_eq!(out, b"SECOND", "the second record drifted");
+    }
+
+    /// Dirs and symlinks survive the seeking walk, and the record after them is
+    /// still found — true only if the walk stayed in step across the padding.
+    #[test]
+    fn seekable_newc_keeps_dirs_and_symlinks() {
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&newc_record(b"sub", S_IFDIR | 0o755, b""));
+        archive.extend_from_slice(&newc_record(b"sub/link", S_IFLNK | 0o777, b"a.txt"));
+        archive.extend_from_slice(&newc_record(b"a.txt", S_IFREG | 0o644, b"one\n"));
+        archive.extend_from_slice(&newc_trailer());
+
+        let (src, _) = counting_source(archive);
+        let mut reader = CpioHandler.open(src, &OpenOptions::default()).unwrap();
+        let entries = reader.entries().unwrap().to_vec();
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(entries[0].kind, EntryKind::Dir));
+        assert!(matches!(
+            &entries[1].kind,
+            EntryKind::Symlink { target } if target == Path::new("a.txt")
+        ));
+        assert_eq!(entries[2].path, Path::new("a.txt"));
+
+        let mut out = Vec::new();
+        reader.read_entry(2, &mut out).unwrap();
+        assert_eq!(out, b"one\n");
+    }
+
+    /// A name padded with NULs beyond its terminator — what `dracut-cpio`
+    /// writes — keeps the path it had before this parser was written: the
+    /// previous one trimmed every trailing NUL, and so does this.
+    #[test]
+    fn seekable_newc_trims_extra_nuls_in_a_name() {
+        let mut archive = newc_record_padded(b"a.txt", S_IFREG | 0o644, b"hi", 5);
+        archive.extend_from_slice(&newc_trailer());
+
+        let (src, _) = counting_source(archive);
+        let mut reader = CpioHandler.open(src, &OpenOptions::default()).unwrap();
+        let entries = reader.entries().unwrap().to_vec();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, Path::new("a.txt"));
+        assert_eq!(entries[0].path_raw, b"a.txt");
+        let mut out = Vec::new();
+        reader.read_entry(0, &mut out).unwrap();
+        assert_eq!(out, b"hi", "the record after a padded name must line up");
+    }
+
+    /// Names that are not UTF-8 open, decode through the shared one-encoding
+    /// pass, and keep their exact bytes in `path_raw`. The old parser refused
+    /// the whole archive here.
+    #[test]
+    fn seekable_newc_reads_non_utf8_names() {
+        // "отчет.txt" and "письмо.txt" in windows-1251.
+        let a: &[u8] = &[
+            0xEE, 0xF2, 0xF7, 0xE5, 0xF2, b'.', b't', b'x', b't', // отчет.txt
+        ];
+        let b: &[u8] = &[
+            0xEF, 0xE8, 0xF1, 0xFC, 0xEC, 0xEE, b'.', b't', b'x', b't', // письмо.txt
+        ];
+        let mut archive = newc_record(a, S_IFREG | 0o644, b"one");
+        archive.extend_from_slice(&newc_record(b, S_IFREG | 0o644, b"two"));
+        archive.extend_from_slice(&newc_trailer());
+
+        let opts = OpenOptions {
+            encoding_override: Some("windows-1251".into()),
+            ..OpenOptions::default()
+        };
+        let (src, _) = counting_source(archive);
+        let mut reader = CpioHandler
+            .open(src, &opts)
+            .expect("cp1251 names must open");
+        let entries = reader.entries().unwrap().to_vec();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, Path::new("отчет.txt"));
+        assert_eq!(entries[1].path, Path::new("письмо.txt"));
+        // The exact archive bytes survive, undecoded — path safety keys off
+        // these, not off the decoded name.
+        assert_eq!(entries[0].path_raw, a);
+        assert_eq!(entries[1].path_raw, b);
+
+        let mut out = Vec::new();
+        reader.read_entry(1, &mut out).unwrap();
+        assert_eq!(out, b"two");
+    }
+
+    /// A body cut short is refused at open time, by arithmetic.
+    #[test]
+    fn seekable_newc_truncated_body_is_corrupt_at_open() {
+        let mut archive = newc_record(b"a.txt", S_IFREG | 0o644, &vec![b'x'; 4096]);
+        archive.extend_from_slice(&newc_trailer());
+        archive.truncate(archive.len() - 2048);
+
+        let err = open_err(archive);
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+    }
+
+    /// A crafted `filesize` far larger than the file must fail, not allocate.
+    #[test]
+    fn seekable_newc_oversized_filesize_is_corrupt() {
+        let mut archive = newc_record(b"a.txt", S_IFREG | 0o644, b"tiny");
+        // Overwrite the filesize field with 4 GB - 1.
+        let (off, len) = NEWC_FILESIZE;
+        archive[off..off + len].copy_from_slice(b"ffffffff");
+        archive.extend_from_slice(&newc_trailer());
+
+        let err = open_err(archive);
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+    }
+
+    /// Garbage in a hex field is an error, not a silently wrong number.
+    #[test]
+    fn seekable_newc_garbage_field_is_corrupt() {
+        let mut archive = newc_record(b"a.txt", S_IFREG | 0o644, b"tiny");
+        let (off, len) = NEWC_NAMESIZE;
+        archive[off..off + len].copy_from_slice(b"zzzzzzzz");
+        archive.extend_from_slice(&newc_trailer());
+
+        let err = open_err(archive);
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+    }
+
+    /// Junk where the next header belongs is caught even though the body it
+    /// follows was never read.
+    #[test]
+    fn seekable_newc_rejects_a_bad_record_after_a_skipped_body() {
+        let mut archive = newc_record(b"a.txt", S_IFREG | 0o644, &vec![b'x'; 4096]);
+        let mut junk = newc_trailer();
+        junk[..MAGIC_LEN].copy_from_slice(b"XXXXXX");
+        archive.extend_from_slice(&junk);
+
+        let err = open_err(archive);
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+    }
+
+    /// A `Source::Stream` cannot seek, so newc spills it to a temp file and
+    /// walks that — same entries, same bodies.
+    #[test]
+    fn streamed_newc_goes_through_a_temp_file() {
+        let mut archive = newc_record(b"a.txt", S_IFREG | 0o644, b"one\n");
+        archive.extend_from_slice(&newc_record(b"b.bin", S_IFREG | 0o600, b"two two\n"));
+        archive.extend_from_slice(&newc_trailer());
+
+        let src = Source::Stream {
+            inner: Box::new(Cursor::new(archive)),
+            path: None,
+        };
+        let mut reader = CpioHandler
+            .open(src, &OpenOptions::default())
+            .expect("open newc from a stream");
+        let entries = reader.entries().unwrap().to_vec();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].path, Path::new("b.bin"));
+
+        let mut out = Vec::new();
+        reader.read_entry(1, &mut out).unwrap();
+        assert_eq!(out, b"two two\n");
     }
 
     #[test]
