@@ -289,6 +289,20 @@ fn body_checksum(bytes: &[u8]) -> u32 {
 /// A `Write` that adds up every byte on its way through, so the crc variant's
 /// checksum can be computed while the body streams to its destination. A body
 /// can be gigabytes; nothing is held to be summed afterwards.
+///
+/// **Only regular files go through here, and that is not an optimisation.**
+/// GNU cpio 2.15 fills the `check` field for regular files and writes a plain
+/// zero for everything else, a symlink included — even though a symlink's body
+/// is not empty at all: it holds the target. The committed fixture
+/// `tests/fixtures/cpio_crc_gnu.cpio`, straight from `cpio -o -H crc`, has a
+/// `link` record whose body is the five bytes `a.txt`, sums to 495, and declares
+/// `check = 0`. Sum a symlink's body and hold it against that field and we start
+/// rejecting archives from the reference implementation. Which is why symlinks
+/// and directories reach `read_entry` with no body and no checksum at all — see
+/// `gnu_crc_zeroes_the_checksum_of_a_symlink` in `tests/integration/cpio_crc.rs`.
+/// (Hard links are regular files with `nlink > 1`; GNU cpio stores the body with
+/// the last name only and gives the earlier ones `filesize = 0` and `check = 0`,
+/// which an empty body satisfies.)
 struct SummingWriter<'a> {
     inner: &'a mut dyn Write,
     sum: u32,
@@ -491,7 +505,9 @@ fn scan_newc_seekable(
                     mode,
                     modified,
                     // A symlink's target never goes through `read_entry`, so
-                    // there is no copy to verify a checksum against.
+                    // there is no copy to verify a checksum against — and there
+                    // must not be one: GNU cpio writes a zero `check` here over
+                    // a non-empty body. See [`SummingWriter`].
                     checksum: None,
                 });
             }
