@@ -1,3 +1,15 @@
+//! One module per format, each exposing a `*Handler` that implements
+//! [`crate::archive::FormatHandler`].
+//!
+//! The order of the declarations below carries no meaning. Dispatch priority —
+//! which handler wins when two claim the same bytes — lives entirely in
+//! [`crate::detect::registry`], and that is the only place to change it.
+//!
+//! Two groups are not one-module-per-format: the zip subtypes (jar, apk, docx,
+//! …) all share the zip engine through [`bundle::ZipBundleHandler`] and differ
+//! only in the `FormatId` they report, and `legacy` wraps the `newtua-formats`
+//! crate family in thin adapters.
+
 pub mod ar;
 pub use ar::ArHandler;
 

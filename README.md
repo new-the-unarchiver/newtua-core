@@ -71,7 +71,7 @@ Every variant below is a `FormatId` from [`src/archive.rs`](src/archive.rs).
 | Format | Notes |
 | --- | --- |
 | `Zip` | `.zip`, incl. ZipCrypto/AES encryption, LZMA/Deflate64 members |
-| `Tar` | `.tar` |
+| `Tar` | `.tar`, bare or inside any supported compressor (`.tar.gz`, `.tar.xz`, `.tar.sz`, `.tar.lz`, `.tar.lzma`, …) |
 | `Gzip` | `.gz` (single compressed file, no container) |
 | `Bzip2` | `.bz2` (single compressed file, no container) |
 | `Xz` | `.xz` (single compressed file, no container) |
@@ -81,7 +81,7 @@ Every variant below is a `FormatId` from [`src/archive.rs`](src/archive.rs).
 | `Cab` | `.cab` |
 | `Ar` | `.ar`/`.a` |
 | `Deb` | `.deb` (Debian package, ar + tar members) |
-| `Cpio` | `.cpio` |
+| `Cpio` | `.cpio` and `.cpgz` (cpio inside a compressor), newc and odc variants |
 | `Rpm` | `.rpm` |
 | `Xar` | `.xar`/`.pkg` |
 | `Msi` | `.msi` (Windows Installer, CFB + embedded CAB) |
@@ -163,7 +163,7 @@ the test files embed at compile time with `include_bytes!`. Shipping them would
 blow past the 10 MiB package limit, and shipping the tests without them would
 hand you a suite that cannot compile at all.
 
-Nothing is hidden. All 574 tests and every fixture live in the
+Nothing is hidden. All 656 tests and every fixture live in the
 [repository on GitHub](https://github.com/new-the-unarchiver/newtua-core) and
 run in CI on Linux, macOS and Windows. To run them yourself:
 

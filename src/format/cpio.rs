@@ -1,3 +1,17 @@
+//! cpio (`.cpio`) — the two ASCII variants that can be read here: SVR4 "new
+//! ASCII" (`070701`, what GNU/BSD `cpio -o -H newc` writes) and POSIX.1 "old
+//! portable" / odc (`070707`, what `ditto` writes). The crc variant (`070702`)
+//! is not implemented and is deliberately not claimed — see
+//! `is_supported_magic`.
+//!
+//! Reached two ways: from the registry, on a bare `.cpio`; and from
+//! `detect.rs`, which checks a just-decompressed stream for a cpio magic once
+//! tar has been ruled out. That second path is what opens a `.cpgz` from macOS
+//! Archive Utility — odc inside gzip.
+//!
+//! cpio is sequential, so `open` makes one streaming pass, concatenating every
+//! regular-file body into a temp file and keeping per-entry offsets (`Scan`).
+
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

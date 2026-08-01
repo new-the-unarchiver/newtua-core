@@ -1,3 +1,20 @@
+//! The compression layer: the single-stream wrappers `detect.rs` unwraps before
+//! it looks for an archive inside.
+//!
+//! Ten of them. Eight are recognised by byte magic in
+//! [`crate::detect::detect_compressor`]; the two magic-less ones — Brotli and
+//! bare LZMA1 — are recognised by extension only, in `detect_compressor_by_ext`,
+//! because nothing in their first bytes distinguishes them from arbitrary data.
+//!
+//! **Concatenated members.** Most of these formats let two compressed files be
+//! `cat`-ed together into one valid file. Decoders that follow through:
+//! `MultiGzDecoder` (gzip), zstd's `Decoder` (spans frames on its own) and
+//! `LzipReader` below, which drives `xz2::stream::Stream` by hand precisely
+//! for that. Known gaps: bzip2 (`BzDecoder` stops after the first member and
+//! the rest is silently dropped; `MultiBzDecoder` is the fix) and xz
+//! (`XzDecoder::new` fails on the trailing stream; `new_multi_decoder` is the
+//! fix).
+
 use std::io::{Error, ErrorKind, Read, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6,9 +23,14 @@ pub enum Compressor {
     Bzip2,
     Xz,
     Zstd,
+    /// Bare LZMA1, the "alone" container. Detected by the `.lzma` extension
+    /// only — its header is coder properties plus a dictionary size, with no
+    /// tag, so a content sniff would claim arbitrary data.
     Lzma,
+    /// `compress(1)`'s LZW (`.Z`).
     Lzc,
     Lz4,
+    /// Brotli (`.br`). Detected by extension only: the format has no magic.
     Brotli,
     /// Framed Snappy (the `framing2` stream format), what Keka calls SNAPPY.
     /// Raw, unframed Snappy is deliberately not supported: it has no magic.
