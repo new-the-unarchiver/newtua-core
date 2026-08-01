@@ -239,6 +239,81 @@ fn buffer_strategy_corrupt_size_no_panic() {
     }
 }
 
+// ── Обрезанный архив: где именно он ловится ──────────────────────────────────
+
+/// Построить tar с одной записью на `size` байт тела и вернуть его байты.
+fn tar_bytes_with_body(size: usize) -> Vec<u8> {
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut b = tar::Builder::new(&mut bytes);
+        let data = vec![b'x'; size];
+        let mut h = tar::Header::new_gnu();
+        h.set_size(size as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, "big.bin", &data[..]).unwrap();
+        b.finish().unwrap();
+    }
+    bytes
+}
+
+/// Установлено опытом: обрыв tar ловится РАНЬШЕ извлечения — при построении
+/// оглавления. `index_from_reader` идёт по архиву потоком и пропускает тела
+/// чтением (не seek'ом), поэтому на нехватке байтов tar-крейт отдаёт
+/// «unexpected EOF during skip», и `open` возвращает ошибку, не дав ни одной
+/// записи. Тест закрепляет это наблюдение: заявка «наверное, поймается раньше»
+/// без опыта не считается.
+#[test]
+fn truncated_tar_is_rejected_while_indexing() {
+    let bytes = tar_bytes_with_body(4096);
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    // Заголовок (512) + половина тела: обрыв ровно посреди записи.
+    std::fs::write(tmp.path(), &bytes[..512 + 2048]).unwrap();
+
+    let src = Source::path(tmp.path()).unwrap();
+    let err = TarHandler
+        .open(src, &OpenOptions::default())
+        .err()
+        .expect("truncated tar must not open");
+    assert!(
+        matches!(err, Error::Io(_) | Error::Corrupt(_)),
+        "unexpected error kind: {err}"
+    );
+}
+
+/// А вот если архив укоротили уже ПОСЛЕ открытия, оглавление об этом не знает:
+/// последний рубеж — сверка длины в `read_entry`. Раньше `io::copy` отдавал
+/// `Ok(())` с обрезанным файлом; теперь это ошибка, называющая недобор.
+#[test]
+fn tar_body_truncated_after_open_errors_instead_of_short_read() {
+    let bytes = tar_bytes_with_body(4096);
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), &bytes).unwrap();
+
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = TarHandler.open(src, &OpenOptions::default()).unwrap();
+    assert_eq!(ar.entries().unwrap()[0].size, 4096);
+
+    // Режем файл под открытым читателем: тела остаётся 100 байт из 4096.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(tmp.path())
+        .unwrap()
+        .set_len(512 + 100)
+        .unwrap();
+
+    let mut out = Vec::new();
+    let err = ar
+        .read_entry(0, &mut out)
+        .expect_err("a short body must be an error, not a truncated file");
+    let msg = err.to_string();
+    assert!(matches!(err, Error::Corrupt(_)), "expected Corrupt: {msg}");
+    assert!(
+        msg.contains("tar") && msg.contains("100 of 4096 bytes"),
+        "message must name what was truncated and how much arrived: {msg}"
+    );
+}
+
 // ── Task 3: mode + symlink tests ─────────────────────────────────────────────
 
 fn make_tar_with_meta() -> tempfile::NamedTempFile {

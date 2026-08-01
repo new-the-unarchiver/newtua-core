@@ -131,10 +131,13 @@ impl FormatHandler for WarcHandler {
             offsets.push((offset, size));
         }
 
-        let data = temp.into_temp_path();
+        // Файл разбирается на уже открытый хэндл и путь: читатель держит его
+        // открытым до самого конца — ни одного повторного открытия на запись.
+        let (src, data) = temp.into_parts();
         Ok(Box::new(WarcReader_ {
             entries,
             offsets,
+            src,
             _data: data,
         }))
     }
@@ -239,6 +242,10 @@ struct WarcReader_ {
     entries: Vec<Entry>,
     /// Per-entry `(offset_in_temp, byte_count)`.
     offsets: Vec<(u64, u64)>,
+    /// Открытый хэндл того же temp-файла. Объявлен ДО `_data`: поля дропаются в
+    /// порядке объявления, значит файл закрывается раньше, чем `TempPath` его
+    /// удаляет (на Windows удалить открытый файл нельзя).
+    src: std::fs::File,
     /// Temp file holding all payload bytes, concatenated.
     _data: tempfile::TempPath,
 }
@@ -257,7 +264,8 @@ impl ArchiveReader for WarcReader_ {
             return Err(Error::InvalidIndex(idx));
         }
         let (offset, size) = self.offsets[idx];
-        crate::detect::read_temp_slice(&self._data, offset, size, out)
+        // Ровно `size` байт: недобор — потеря данных, а не успех.
+        crate::detect::copy_slice_exact(&mut self.src, offset, size, out, "warc")
     }
 }
 

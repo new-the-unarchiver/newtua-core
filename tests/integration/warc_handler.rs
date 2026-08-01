@@ -248,6 +248,27 @@ fn warc_truncated_returns_error() {
     );
 }
 
+/// Установлено опытом: обрыв .warc тоже ловится РАНЬШЕ извлечения. Тела всех
+/// записей копируются в общий temp-файл прямо в `open`, и `warc`-крейт на
+/// недочитанном теле отдаёт «Unexpected end of body» — до `entries()` дело не
+/// доходит. В отличие от предыдущего теста здесь берётся валидный многозаписный
+/// архив, обрезанный посреди тела последней записи, а не мусор целиком.
+#[test]
+fn truncated_warc_is_rejected_while_indexing() {
+    let records = make_records();
+    let warc_bytes = build_warc(&records);
+    let cut = warc_bytes.len() - 10;
+    let tmp = write_temp(&warc_bytes[..cut], ".warc");
+
+    let err = open(&tmp, &OpenOptions::default())
+        .err()
+        .expect("truncated warc must not open");
+    assert!(
+        matches!(err, newtua_core::error::Error::Corrupt(_)),
+        "expected Corrupt, got: {err}"
+    );
+}
+
 /// Duplicate URIs get disambiguated with -1, -2, … suffixes.
 #[test]
 fn warc_duplicate_uri_deduplication() {

@@ -284,9 +284,41 @@ impl ArchiveReader for TempBackedReader {
     }
 }
 
+/// Copy exactly `size` bytes starting at `offset` from `src` into `out`.
+///
+/// Недобор — это потеря данных, а не безобидный EOF: `io::copy` отдал бы `Ok`
+/// на укороченном теле, и наверх ушёл бы обрезанный файл под видом успеха.
+/// Поэтому прочитанное сверяется с обещанным и расхождение становится
+/// `Error::Corrupt` — та же форма, что у `WpressReader::read_entry`.
+/// `what` называет источник (`"tar"`, `"warc"`, …), чтобы сообщение говорило,
+/// что именно оборвалось.
+///
+/// Ничего не резервируется под `size`: копия ограничена `take`, а выход растёт
+/// по мере поступления байтов.
+pub(crate) fn copy_slice_exact<R: Read + Seek>(
+    src: &mut R,
+    offset: u64,
+    size: u64,
+    out: &mut dyn Write,
+    what: &str,
+) -> Result<()> {
+    if size == 0 {
+        return Ok(());
+    }
+    src.seek(SeekFrom::Start(offset))?;
+    let copied = std::io::copy(&mut src.by_ref().take(size), out)?;
+    if copied != size {
+        return Err(Error::Corrupt(format!(
+            "{what}: truncated body at offset {offset} ({copied} of {size} bytes)"
+        )));
+    }
+    Ok(())
+}
+
 /// Stream `size` bytes starting at `offset` from the temp file at `path` into
-/// `out`. Shared by handlers (cpio, warc) that concatenate entry bodies into one
-/// temp file and read them back via an `(offset, size)` table.
+/// `out`. Used by handlers that concatenate entry bodies into one temp file and
+/// read them back via an `(offset, size)` table (cpio's streaming path).
+/// Недобор байтов — ошибка, см. [`copy_slice_exact`].
 pub(crate) fn read_temp_slice(
     path: &Path,
     offset: u64,
@@ -294,10 +326,7 @@ pub(crate) fn read_temp_slice(
     out: &mut dyn Write,
 ) -> Result<()> {
     let mut file = std::fs::File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut limited = file.take(size);
-    std::io::copy(&mut limited, out)?;
-    Ok(())
+    copy_slice_exact(&mut file, offset, size, out, "temp payload")
 }
 
 // ── SingleFileReader ──────────────────────────────────────────────────────────
@@ -933,6 +962,42 @@ mod tests {
         assert_eq!(
             stem_without_compressor_ext(Path::new("notes.txt.br")),
             "notes.txt"
+        );
+    }
+
+    #[test]
+    fn copy_slice_exact_copies_the_whole_range() {
+        let mut src = std::io::Cursor::new(b"0123456789".to_vec());
+        let mut out = Vec::new();
+        copy_slice_exact(&mut src, 3, 4, &mut out, "test").unwrap();
+        assert_eq!(out, b"3456");
+    }
+
+    #[test]
+    fn copy_slice_exact_refuses_a_short_read() {
+        // Обещано 8 байт с 6-го, а в источнике их всего 4: молчаливый Ok здесь
+        // и есть та самая тихая потеря данных.
+        let mut src = std::io::Cursor::new(b"0123456789".to_vec());
+        let mut out = Vec::new();
+        let err = copy_slice_exact(&mut src, 6, 8, &mut out, "warc").unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, Error::Corrupt(_)), "expected Corrupt: {msg}");
+        assert!(msg.contains("warc"), "message must name the source: {msg}");
+        assert!(
+            msg.contains("4 of 8 bytes"),
+            "message must say how much arrived: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_temp_slice_refuses_a_short_read() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, b"short").unwrap();
+        let mut out = Vec::new();
+        let err = read_temp_slice(tmp.path(), 0, 99, &mut out).unwrap_err();
+        assert!(
+            matches!(err, Error::Corrupt(_)),
+            "expected Corrupt, got: {err}"
         );
     }
 }
