@@ -1,8 +1,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
 
 use crate::archive::{
-    ArchiveReader, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
+    ArchiveReader, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, ReadSeek, Source,
 };
 use crate::encoding::decode_names;
 use crate::error::{Error, Result, io_err_to_corrupt};
@@ -47,14 +46,19 @@ impl FormatHandler for TarHandler {
         match src {
             Source::Seekable {
                 mut inner,
-                path: Some(ref path),
+                path: Some(_),
             } => {
-                let path = path.clone();
                 // Index by streaming over the file — reads only headers, not payloads.
                 inner.seek(SeekFrom::Start(0))?;
-                let (entries, offsets) = index_from_reader(inner, opts)?;
+                let (entries, offsets) = index_from_reader(&mut inner, opts)?;
+                // Источник остаётся открытым на всё время жизни читателя: файл
+                // открывается один раз, а не заново на каждую извлекаемую запись
+                // (в архиве на 50 000 файлов это было 50 000 открытий).
                 let reader = TarReader {
-                    backing: Backing::File { path, offsets },
+                    backing: Backing::File {
+                        src: inner,
+                        offsets,
+                    },
                     entries,
                 };
                 Ok(Box::new(reader))
@@ -92,9 +96,12 @@ impl FormatHandler for TarHandler {
 // ── Backing strategies ────────────────────────────────────────────────────────
 
 enum Backing {
-    /// Entries are read directly from a file by seeking to recorded offsets.
-    /// No archive data is held in memory.
-    File { path: PathBuf, offsets: Vec<u64> },
+    /// Entries are read directly from the open source by seeking to recorded
+    /// offsets. No archive data is held in memory.
+    File {
+        src: Box<dyn ReadSeek>,
+        offsets: Vec<u64>,
+    },
     /// The entire archive is buffered in memory (Stream source or no file path).
     Buffer { data: Vec<u8>, offsets: Vec<u64> },
 }
@@ -212,15 +219,10 @@ impl ArchiveReader for TarReader {
         let entry = self.entries.get(idx).ok_or(Error::InvalidIndex(idx))?;
         let size = entry.size;
 
-        match &self.backing {
-            Backing::File { path, offsets } => {
-                let offset = offsets[idx];
-                let mut file = std::fs::File::open(path)?;
-                file.seek(SeekFrom::Start(offset))?;
-                // Read exactly `size` bytes — take() stops at EOF naturally.
-                let mut limited = file.take(size);
-                std::io::copy(&mut limited, out)?;
-                Ok(())
+        match &mut self.backing {
+            Backing::File { src, offsets } => {
+                // Ровно `size` байт: недобор — обрезанный архив, а не успех.
+                crate::detect::copy_slice_exact(src, offsets[idx], size, out, "tar")
             }
             Backing::Buffer { data, offsets } => {
                 let start = offsets[idx] as usize;

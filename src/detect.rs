@@ -229,8 +229,11 @@ fn detect_compressor_by_ext(lower_name: &str) -> Option<Compressor> {
 /// while keeping a temp file alive (and auto-deleted on drop).
 ///
 /// Used for multi-volume reconstruction, the decompressed temp file backing a
-/// tar-inside-compressed-file, SFX carving, and the format-specific readers
-/// (deb/rpm) that decompress a payload to a temp file. By default `format()`
+/// tar- or cpio-inside-compressed-file (`.tar.gz`, `.cpgz`), SFX carving, and
+/// the format-specific readers (deb/rpm) that decompress a payload to a temp
+/// file. The cpio reader has no temp file of its own — it reads bodies straight
+/// out of this one, which is exactly why the wrapper has to outlive it. By
+/// default `format()`
 /// delegates to the inner reader; pass a `format_override` to report a wrapper
 /// format (e.g. `Deb`/`Rpm`) instead of the inner payload format.
 pub(crate) struct TempBackedReader {
@@ -284,19 +287,34 @@ impl ArchiveReader for TempBackedReader {
     }
 }
 
-/// Stream `size` bytes starting at `offset` from the temp file at `path` into
-/// `out`. Shared by handlers (cpio, warc) that concatenate entry bodies into one
-/// temp file and read them back via an `(offset, size)` table.
-pub(crate) fn read_temp_slice(
-    path: &Path,
+/// Copy exactly `size` bytes starting at `offset` from `src` into `out`.
+///
+/// Недобор — это потеря данных, а не безобидный EOF: `io::copy` отдал бы `Ok`
+/// на укороченном теле, и наверх ушёл бы обрезанный файл под видом успеха.
+/// Поэтому прочитанное сверяется с обещанным и расхождение становится
+/// `Error::Corrupt` — та же форма, что у `WpressReader::read_entry`.
+/// `what` называет источник (`"tar"`, `"warc"`, …), чтобы сообщение говорило,
+/// что именно оборвалось.
+///
+/// Ничего не резервируется под `size`: копия ограничена `take`, а выход растёт
+/// по мере поступления байтов.
+pub(crate) fn copy_slice_exact<R: Read + Seek>(
+    src: &mut R,
     offset: u64,
     size: u64,
     out: &mut dyn Write,
+    what: &str,
 ) -> Result<()> {
-    let mut file = std::fs::File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut limited = file.take(size);
-    std::io::copy(&mut limited, out)?;
+    if size == 0 {
+        return Ok(());
+    }
+    src.seek(SeekFrom::Start(offset))?;
+    let copied = std::io::copy(&mut src.by_ref().take(size), out)?;
+    if copied != size {
+        return Err(Error::Corrupt(format!(
+            "{what}: truncated body at offset {offset} ({copied} of {size} bytes)"
+        )));
+    }
     Ok(())
 }
 
@@ -436,16 +454,16 @@ pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
     Ok(filled >= 263 && &buf[257..262] == b"ustar")
 }
 
-/// Check whether a reader starts with a cpio magic this crate can open —
-/// SVR4 "new ASCII" (`070701`) or POSIX "old portable"/odc (`070707`).
-/// Rewinds the reader to position 0 after the check.
+/// Check whether a reader starts with a cpio magic this crate can open — SVR4
+/// "new ASCII" (`070701`), its checksummed twin crc (`070702`) or POSIX "old
+/// portable"/odc (`070707`). Rewinds the reader to position 0 after the check.
 ///
 /// This is the companion of [`is_tar`] for the one other archive format looked
 /// for inside a decompressed stream (`.cpgz` — cpio inside gzip — is what macOS
 /// Archive Utility produces; its engine, `ditto`, writes the odc variant).
-/// The set checked here is exactly what `CpioHandler::probe` accepts, so
-/// anything detected here can also be opened; the crc variant (`070702`) is not
-/// implemented and stays a single entry.
+/// The question is delegated to `cpio::is_supported_magic` rather than restated
+/// here, so the set claimed here cannot drift from the set `CpioHandler::open`
+/// can actually parse.
 pub(crate) fn is_cpio<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
     let mut buf = [0u8; crate::format::cpio::MAGIC_LEN];
     let filled = peek_from_start(reader, &mut buf)?;
@@ -607,7 +625,8 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
 ///
 ///    - If a compression wrapper is detected (gzip/bzip2/xz), decompress to a
 ///      temp file, then peek its content for tar magic at offset 257 and then
-///      for a cpio magic (newc or odc) at offset 0 — those two formats only:
+///      for a cpio magic (newc, crc or odc) at offset 0 — those two formats
+///      only:
 ///      - If tar or cpio → open with that handler (file-backed via temp),
 ///        wrapped so the temp file outlives the reader.
 ///      - Otherwise → return a [`SingleFileReader`] with one entry whose name
@@ -687,10 +706,13 @@ mod tests {
         assert!(is_cpio(&mut odc).unwrap());
         assert_eq!(odc.position(), 0);
 
-        // crc (070702) is not opened by CpioHandler, so it must not be claimed
-        // here either — it stays a single entry.
+        // crc (070702) — three variants now, not two: `CpioHandler` gained it,
+        // so it has to be claimed here too, or a `.cpio.gz` of that variant
+        // would come out of the compression layer as one opaque entry while a
+        // bare `.cpio` of the same bytes opened fine.
         let mut crc = Cursor::new(b"070702000000".to_vec());
-        assert!(!is_cpio(&mut crc).unwrap());
+        assert!(is_cpio(&mut crc).unwrap());
+        assert_eq!(crc.position(), 0);
 
         let mut zip = Cursor::new(b"PK\x03\x04....".to_vec());
         assert!(!is_cpio(&mut zip).unwrap());
@@ -933,6 +955,30 @@ mod tests {
         assert_eq!(
             stem_without_compressor_ext(Path::new("notes.txt.br")),
             "notes.txt"
+        );
+    }
+
+    #[test]
+    fn copy_slice_exact_copies_the_whole_range() {
+        let mut src = std::io::Cursor::new(b"0123456789".to_vec());
+        let mut out = Vec::new();
+        copy_slice_exact(&mut src, 3, 4, &mut out, "test").unwrap();
+        assert_eq!(out, b"3456");
+    }
+
+    #[test]
+    fn copy_slice_exact_refuses_a_short_read() {
+        // Обещано 8 байт с 6-го, а в источнике их всего 4: молчаливый Ok здесь
+        // и есть та самая тихая потеря данных.
+        let mut src = std::io::Cursor::new(b"0123456789".to_vec());
+        let mut out = Vec::new();
+        let err = copy_slice_exact(&mut src, 6, 8, &mut out, "warc").unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, Error::Corrupt(_)), "expected Corrupt: {msg}");
+        assert!(msg.contains("warc"), "message must name the source: {msg}");
+        assert!(
+            msg.contains("4 of 8 bytes"),
+            "message must say how much arrived: {msg}"
         );
     }
 }

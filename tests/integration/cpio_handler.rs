@@ -56,40 +56,17 @@ fn cpio_read_entry_out_of_range() {
 /// run from offset 0 of the temp file, returning the first file's content.
 #[test]
 fn cpio_symlink_read_entry_is_empty() {
-    use cpio::NewcBuilder;
-    use cpio::newc::trailer;
-    use std::io::Write as _;
+    use crate::cpio_newc::{as_file, newc_record, newc_trailer};
 
     // Build an in-memory newc archive:
     //   entry 0 — regular file "file.txt" with body b"REGULAR"
     //   entry 1 — symlink "link.txt" -> "file.txt" (target is 8 bytes)
-    let body: &[u8] = b"REGULAR";
-    let output: Vec<u8> = Vec::new();
-
-    // Regular file entry.
-    let builder = NewcBuilder::new("file.txt").ino(1).nlink(1).mode(0o100644);
-    let mut w = builder.write(output, body.len() as u32);
-    w.write_all(body).unwrap();
-    let output = w.finish().unwrap();
-
-    // Symlink entry — body is the link target string.
-    let target: &[u8] = b"file.txt";
-    let builder = NewcBuilder::new("link.txt")
-        .ino(2)
-        .nlink(1)
-        .mode(0o100644)
-        .set_mode_file_type(cpio::newc::ModeFileType::Symlink);
-    let mut w = builder.write(output, target.len() as u32);
-    w.write_all(target).unwrap();
-    let output = w.finish().unwrap();
-
-    // Write the TRAILER record.
-    let output = trailer(output).unwrap();
+    let mut output = newc_record(b"file.txt", 0o100644, b"REGULAR");
+    output.extend_from_slice(&newc_record(b"link.txt", 0o120644, b"file.txt"));
+    output.extend_from_slice(&newc_trailer());
 
     // Persist to a temp file so `detect::open` can read it.
-    let mut tmp = tempfile::NamedTempFile::new().unwrap();
-    tmp.write_all(&output).unwrap();
-    let tmp_path = tmp.into_temp_path();
+    let tmp_path = as_file(&output);
 
     let opts = newtua_core::archive::OpenOptions::default();
     let mut reader =
@@ -121,25 +98,15 @@ fn cpio_symlink_read_entry_is_empty() {
 /// must return an error, not a panic.
 #[test]
 fn truncated_cpio_returns_error() {
-    use std::io::Write as _;
+    use crate::cpio_newc::{as_file, newc_record};
 
     // Build a valid newc header for one file but then truncate the archive
     // (no TRAILER record). We build the archive in memory and write to a
     // temp file so that `detect::open` can open it.
-    let data: &[u8] = b"hi";
-    let output: Vec<u8> = Vec::new();
-    let builder = cpio::NewcBuilder::new("hi.txt")
-        .mode(0o100644)
-        .ino(1)
-        .nlink(1);
-    let mut writer = builder.write(output, data.len() as u32);
-    writer.write_all(data).unwrap();
-    let truncated = writer.finish().unwrap();
-    // truncated contains the entry but NO trailer
+    let truncated = newc_record(b"hi.txt", 0o100644, b"hi");
+    // `truncated` contains the entry but NO trailer.
 
-    let mut tmp = tempfile::NamedTempFile::new().unwrap();
-    tmp.write_all(&truncated).unwrap();
-    let tmp_path = tmp.into_temp_path();
+    let tmp_path = as_file(&truncated);
 
     let opts = OpenOptions::default();
     let result = open(&tmp_path, &opts);
