@@ -2,8 +2,10 @@ use crate::archive::{ArchiveReader, Confidence, FormatHandler, FormatId, OpenOpt
 use crate::error::Result;
 
 /// Internal table of detection extensions: one canonical extension per
-/// subtype. Synonyms (war/ear/aab/docm/...) are deliberately NOT added
-/// here — that's a UI presentation concern, not a detection input.
+/// subtype. Synonyms (ear/aab/docm/...) are deliberately NOT added here —
+/// that's a UI presentation concern, not a detection input. A synonym gets
+/// a row only when it is a subtype in its own right, with its own
+/// `FormatId` to report (as war/appx/xpi are).
 pub(crate) const ZIP_BUNDLES: &[(&str, FormatId)] = &[
     (".jar", FormatId::Jar),
     (".apk", FormatId::Apk),
@@ -15,6 +17,9 @@ pub(crate) const ZIP_BUNDLES: &[(&str, FormatId)] = &[
     (".odt", FormatId::Odt),
     (".ods", FormatId::Ods),
     (".odp", FormatId::Odp),
+    (".war", FormatId::War),
+    (".appx", FormatId::Appx),
+    (".xpi", FormatId::Xpi),
 ];
 
 /// Thin handler: a zip subtype recognized by `PK` magic plus its canonical
@@ -98,8 +103,10 @@ mod tests {
     }
 
     #[test]
-    fn table_covers_ten_bundle_formats() {
-        assert_eq!(ZIP_BUNDLES.len(), 10);
+    fn table_length_matches_the_declared_subtypes() {
+        // 13 = 10 исходных (jar/apk/ipa/epub + docx/xlsx/pptx + odt/ods/odp)
+        // + 3 добавленных ради опознания: war, appx, xpi.
+        assert_eq!(ZIP_BUNDLES.len(), 13);
         for want in [
             FormatId::Jar,
             FormatId::Apk,
@@ -111,6 +118,9 @@ mod tests {
             FormatId::Odt,
             FormatId::Ods,
             FormatId::Odp,
+            FormatId::War,
+            FormatId::Appx,
+            FormatId::Xpi,
         ] {
             assert!(
                 ZIP_BUNDLES.iter().any(|&(_, f)| f == want),

@@ -14,7 +14,7 @@ use crate::format::{
     LbrHandler, LzxHandler, MacBinaryHandler, MsiHandler, NsisHandler, PackItHandler,
     PowerPackerHandler, RarHandler, RpmHandler, SevenZHandler, SfxHandler, SquashfsHandler,
     SqueezeHandler, StuffIt5Handler, StuffItHandler, StuffItXHandler, TarHandler, WarcHandler,
-    WimHandler, XarHandler, ZipBundleHandler, ZipHandler, ZooHandler, bundle,
+    WimHandler, WpressHandler, XarHandler, ZipBundleHandler, ZipHandler, ZooHandler, bundle,
 };
 use crate::volume::{ConcatReader, volume_members};
 
@@ -84,6 +84,12 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
     // probe never actually fires: `.dmg` is intercepted by the early extension
     // branch in open_single (before the registry loop), so dispatch is there.
     handlers.push(Box::new(DmgHandler));
+    // WpressHandler: detected by the `.wpress` extension alone — the format has
+    // no magic anywhere, so there is nothing for a header peek to match. The
+    // guess is confirmed inside `open` by parsing the first header (same shape
+    // as ISO/HFS+). At `EXTENSION` confidence it cannot shadow a content match,
+    // and no peer claims `.wpress`, so there is no tie-break here.
+    handlers.push(Box::new(WpressHandler));
     // Legacy formats (newtua-formats family). Content-first detection via the
     // upstream `recognize`; their magics/extensions don't tie with the modern
     // handlers above, so they're simply appended. ARC has no content sniff and
@@ -131,6 +137,8 @@ pub fn registry() -> Vec<Box<dyn FormatHandler>> {
 /// - Zstd:  `28 b5 2f fd`
 /// - Lzc:   `1f 9d`
 /// - Lz4:   `04 22 4d 18`
+/// - Snappy: `ff 06 00 00 73 4e 61 50 70 59`
+/// - Lzip:  `4c 5a 49 50 01` (`LZIP` + format version)
 pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     if header.starts_with(&[0x1f, 0x8b]) {
         return Some(Compressor::Gzip);
@@ -152,26 +160,67 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
         // unsupported — lz4_flex's FrameDecoder doesn't decode it. TODO if needed.
         return Some(Compressor::Lz4);
     }
+    if header.starts_with(&[0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59]) {
+        // Framed Snappy (`.sz`, Keka's SNAPPY; snzip's default `framing2`).
+        // The signature is the mandatory first chunk of the stream: type byte
+        // 0xff, 3-byte little-endian length 6, payload `sNaPpY`. Raw (unframed)
+        // Snappy has no header at all and is intentionally not detected.
+        return Some(Compressor::Snappy);
+    }
+    if header.starts_with(b"LZIP\x01") {
+        // lzip (`.lz`). The version byte is part of the signature on purpose:
+        // only format version 1 is decodable (see `Compressor::Lzip`), so a
+        // version-0 or future-version file must fall through and be reported
+        // as an unknown format rather than opened and then failed mid-read.
+        return Some(Compressor::Lzip);
+    }
     None
 }
+
+/// Every compressor file-name suffix this crate knows, in scan order.
+///
+/// The single source of truth for two questions that used to keep two lists in
+/// sync: which suffix names a compressor that has **no content magic**
+/// (`Some(_)`, detected by extension alone), and which suffix must be stripped
+/// off to derive the entry name of a plain compressed file (all of them).
+///
+/// A `None` here means "content magic detects this one — the suffix is only
+/// good for naming". Adding a magic-less compressor is one row with `Some(_)`;
+/// `detect_compressor` (the byte-magic detector) stays untouched either way.
+///
+/// **Order matters**: both readers take the first suffix that matches, so a
+/// longer suffix must precede any shorter one it ends with.
+const COMPRESSOR_EXTS: &[(&str, Option<Compressor>)] = &[
+    (".gz", None),
+    (".bz2", None),
+    (".xz", None),
+    (".zst", None),
+    // Uppercase on purpose: `.Z` is compress(1), lowercase `.z` is not.
+    (".Z", None),
+    (".lz4", None),
+    (".br", Some(Compressor::Brotli)),
+    (".sz", None),
+    // Bare LZMA1 ("alone" format), the same decoder deb/rpm already use for
+    // their payloads. Its header is coder properties plus a dictionary size,
+    // with no tag: any file could start that way, so detecting it by content
+    // would claim arbitrary data. Extension only, on purpose.
+    (".lzma", Some(Compressor::Lzma)),
+    (".lz", None),
+];
 
 /// Detect a compressor from the file name's extension, for formats that have
 /// **no content magic** and therefore cannot be recognised by `detect_compressor`.
 ///
 /// This is intentionally separate from `detect_compressor` (which inspects bytes):
 /// magic-less formats are detected only by an explicit extension, never by
-/// content (same deliberate asymmetry as `.lzma`). `lower_name` must already be
-/// lowercased by the caller.
+/// content. `lower_name` must already be lowercased by the caller.
 ///
 /// - `.br` / `.tar.br` → Brotli
-///
-/// Add future extension-only (magic-less) compressors here — one `ends_with`
-/// arm each — and keep `detect_compressor` (the byte-magic detector) untouched.
+/// - `.lzma` / `.tar.lzma` → bare LZMA1 (the "alone" container)
 fn detect_compressor_by_ext(lower_name: &str) -> Option<Compressor> {
-    if lower_name.ends_with(".br") {
-        return Some(Compressor::Brotli);
-    }
-    None
+    COMPRESSOR_EXTS
+        .iter()
+        .find_map(|&(ext, comp)| comp.filter(|_| lower_name.ends_with(ext)))
 }
 
 // ── TempBackedReader ──────────────────────────────────────────────────────────
@@ -345,10 +394,12 @@ impl ArchiveReader for SingleFileReader {
 /// - `data.gz`       → `"data"`
 /// - `archive.tar.bz2` → `"archive.tar"`
 /// - `file.xz`       → `"file"`
+///
+/// The suffix list is [`COMPRESSOR_EXTS`] — every compressor, magic-less or not.
 fn stem_without_compressor_ext(path: &Path) -> String {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
 
-    for ext in &[".gz", ".bz2", ".xz", ".zst", ".Z", ".lz4", ".br"] {
+    for (ext, _) in COMPRESSOR_EXTS {
         if let Some(stem) = name.strip_suffix(ext) {
             return stem.to_string();
         }
@@ -357,10 +408,13 @@ fn stem_without_compressor_ext(path: &Path) -> String {
     name.to_string()
 }
 
-/// Check whether the first 263 bytes of a reader contain the tar `ustar` magic
-/// at offset 257. Rewinds the reader to position 0 after the check.
-pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
-    let mut buf = [0u8; 263];
+/// Fill `buf` from the start of `reader`, then rewind the reader to position 0.
+///
+/// Returns how many bytes were actually read: a short read is not an error, it
+/// just means the file is smaller than `buf` (callers decide what that means).
+/// `Interrupted` is retried, as `read_exact` would do; any other error is
+/// propagated and the reader is left where it is.
+fn peek_from_start<R: Read + Seek>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0usize;
     while filled < buf.len() {
         match reader.read(&mut buf[filled..]) {
@@ -371,7 +425,31 @@ pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
         }
     }
     reader.seek(SeekFrom::Start(0))?;
+    Ok(filled)
+}
+
+/// Check whether the first 263 bytes of a reader contain the tar `ustar` magic
+/// at offset 257. Rewinds the reader to position 0 after the check.
+pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
+    let mut buf = [0u8; 263];
+    let filled = peek_from_start(reader, &mut buf)?;
     Ok(filled >= 263 && &buf[257..262] == b"ustar")
+}
+
+/// Check whether a reader starts with a cpio magic this crate can open —
+/// SVR4 "new ASCII" (`070701`) or POSIX "old portable"/odc (`070707`).
+/// Rewinds the reader to position 0 after the check.
+///
+/// This is the companion of [`is_tar`] for the one other archive format looked
+/// for inside a decompressed stream (`.cpgz` — cpio inside gzip — is what macOS
+/// Archive Utility produces; its engine, `ditto`, writes the odc variant).
+/// The set checked here is exactly what `CpioHandler::probe` accepts, so
+/// anything detected here can also be opened; the crc variant (`070702`) is not
+/// implemented and stays a single entry.
+pub(crate) fn is_cpio<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
+    let mut buf = [0u8; crate::format::cpio::MAGIC_LEN];
+    let filled = peek_from_start(reader, &mut buf)?;
+    Ok(filled == buf.len() && crate::format::cpio::is_supported_magic(&buf))
 }
 
 // ── open_single ───────────────────────────────────────────────────────────────
@@ -436,16 +514,30 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
         let mut tmp = tempfile::NamedTempFile::new()?;
         let size = std::io::copy(&mut decoded, &mut tmp)?;
 
-        // Step 2: peek the decompressed content for the tar ustar magic.
+        // Step 2: peek the decompressed content for an archive we unwrap here.
         // The io::copy above left the file cursor at the end; rewind first.
+        //
+        // Exactly two formats are looked for, in this order: tar, then cpio
+        // (`.cpgz` — what macOS Archive Utility produces — is cpio inside gzip).
+        // Deliberately NOT the whole registry: a `.zip.gz`, `.7z.gz` and every
+        // other nesting must keep coming out as one entry holding the raw inner
+        // file. Do not "while we're here" this into a general re-dispatch.
+        // Both checks are by content, never by file name.
         tmp.as_file_mut().seek(SeekFrom::Start(0))?;
-        let tar_detected = is_tar(tmp.as_file_mut())?;
+        let inner_handler: Option<&dyn FormatHandler> = if is_tar(tmp.as_file_mut())? {
+            Some(&TarHandler)
+        } else if is_cpio(tmp.as_file_mut())? {
+            Some(&CpioHandler)
+        } else {
+            None
+        };
 
-        if tar_detected {
-            // Open the temp file as a seekable tar archive.
+        if let Some(handler) = inner_handler {
+            // Open the temp file as a seekable archive; TempBackedReader keeps
+            // the temp file alive for as long as the reader lives.
             let temp_path = tmp.into_temp_path();
-            let tar_src = Source::path(&temp_path)?;
-            let inner = TarHandler.open(tar_src, opts)?;
+            let inner_src = Source::path(&temp_path)?;
+            let inner = handler.open(inner_src, opts)?;
             return Ok(Box::new(TempBackedReader::new(inner, temp_path)));
         } else {
             // Plain compressed file — present as one entry.
@@ -514,11 +606,14 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
 ///    Within direct open:
 ///
 ///    - If a compression wrapper is detected (gzip/bzip2/xz), decompress to a
-///      temp file, then peek for tar magic at offset 257:
-///      - If tar → open as tar (file-backed via temp), wrapped so the temp file
-///        outlives the reader.
-///      - If not tar → return a [`SingleFileReader`] with one entry whose name
+///      temp file, then peek its content for tar magic at offset 257 and then
+///      for a cpio magic (newc or odc) at offset 0 — those two formats only:
+///      - If tar or cpio → open with that handler (file-backed via temp),
+///        wrapped so the temp file outlives the reader.
+///      - Otherwise → return a [`SingleFileReader`] with one entry whose name
 ///        is the original file name with the compressor extension stripped.
+///        A nested `.zip.gz`/`.7z.gz` lands here on purpose: the decompressed
+///        content is not re-dispatched through the registry.
 ///    - Otherwise, select the handler with the highest `Confidence` from the
 ///      registry and delegate to it.
 pub fn open(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
@@ -579,12 +674,42 @@ mod tests {
     }
 
     #[test]
+    fn is_cpio_matches_the_variants_cpio_handler_opens() {
+        use std::io::Cursor;
+
+        let mut newc = Cursor::new(b"070701000000".to_vec());
+        assert!(is_cpio(&mut newc).unwrap());
+        // Rewound for the caller.
+        assert_eq!(newc.position(), 0);
+
+        // odc (070707) is what `ditto` writes, so a real `.cpgz` lands here.
+        let mut odc = Cursor::new(b"070707000000".to_vec());
+        assert!(is_cpio(&mut odc).unwrap());
+        assert_eq!(odc.position(), 0);
+
+        // crc (070702) is not opened by CpioHandler, so it must not be claimed
+        // here either — it stays a single entry.
+        let mut crc = Cursor::new(b"070702000000".to_vec());
+        assert!(!is_cpio(&mut crc).unwrap());
+
+        let mut zip = Cursor::new(b"PK\x03\x04....".to_vec());
+        assert!(!is_cpio(&mut zip).unwrap());
+
+        // Shorter than the magic — no match, no panic.
+        let mut tiny = Cursor::new(b"0707".to_vec());
+        assert!(!is_cpio(&mut tiny).unwrap());
+    }
+
+    #[test]
     fn registry_has_expected_handlers() {
-        // 20 базовых + 16 legacy (6 dos + 5 mac + 3 stuffit + alz + nsis + 3 amiga)
+        // 21 базовый + 16 legacy (6 dos + 5 mac + 3 stuffit + alz + nsis + 3 amiga)
         // + zip-бандлы + CRX + Conda.
+        //
+        // Базовых стало 21: к двадцати добавился WpressHandler (`.wpress`),
+        // зарегистрированный сразу за DmgHandler.
         assert_eq!(
             registry().len(),
-            20 + 6 + 5 + 3 + 2 + 3 + bundle::ZIP_BUNDLES.len() + 2
+            21 + 6 + 5 + 3 + 2 + 3 + bundle::ZIP_BUNDLES.len() + 2
         );
     }
 
@@ -686,6 +811,51 @@ mod tests {
     }
 
     #[test]
+    fn detect_compressor_by_ext_recognizes_lzma() {
+        assert_eq!(
+            detect_compressor_by_ext("data.lzma"),
+            Some(Compressor::Lzma)
+        );
+        assert_eq!(
+            detect_compressor_by_ext("archive.tar.lzma"),
+            Some(Compressor::Lzma)
+        );
+        // `.lz` is lzip, a different container. It is not claimed *here*
+        // because it does not belong here: lzip has a real signature and is
+        // detected by content, in `detect_compressor`, one arm below Snappy.
+        // This assertion pins the split, not the absence of lzip support —
+        // `detect_compressor_recognizes_lzip` is the other half of it.
+        assert_eq!(detect_compressor_by_ext("data.lz"), None);
+        assert_eq!(detect_compressor(b"LZIP\x01\x0c"), Some(Compressor::Lzip));
+    }
+
+    #[test]
+    fn detect_compressor_recognizes_lzip() {
+        // `LZIP` + format version 1 + coded dictionary size (0x0c = 4 KiB).
+        assert_eq!(detect_compressor(b"LZIP\x01\x0c"), Some(Compressor::Lzip));
+        // The version byte is part of the signature: version 0 is the 2008
+        // format with a different trailer, and we decode only version 1, so it
+        // must not be claimed here.
+        assert_eq!(detect_compressor(b"LZIP\x00\x0c"), None);
+        assert_eq!(detect_compressor(b"LZIP\x02\x0c"), None);
+        // Magic alone, with nothing after it, is not enough.
+        assert_eq!(detect_compressor(b"LZIP"), None);
+    }
+
+    #[test]
+    fn lzma_has_no_content_magic() {
+        // Asymmetry guard, same as Brotli's below: bare LZMA1 must never be
+        // recognised by content. Its first byte is packed coder properties
+        // (`5d` for the common lc/lp/pb preset), not a tag, and the next four
+        // are a dictionary size — nothing there is reliably distinguishable
+        // from arbitrary data, so a magic branch would produce false hits.
+        assert_eq!(
+            detect_compressor(&[0x5d, 0x00, 0x00, 0x80, 0x00, 0xff]),
+            None
+        );
+    }
+
+    #[test]
     fn brotli_has_no_content_magic() {
         // Asymmetry guard: Brotli must never be recognised by content magic —
         // it has no signature, so `detect_compressor` (the byte-magic detector)
@@ -695,6 +865,63 @@ mod tests {
         // size, not a fixed tag), but any input that isn't another format's
         // magic would serve equally.
         assert_eq!(detect_compressor(&[0x0b, 0x00, 0x80]), None);
+    }
+
+    #[test]
+    fn detect_compressor_recognizes_snappy() {
+        // Framed Snappy (framing2): the stream-identifier chunk — type 0xff,
+        // 3-byte length 0x000006, payload `sNaPpY`.
+        assert_eq!(
+            detect_compressor(&[
+                0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59, 0x01
+            ]),
+            Some(Compressor::Snappy)
+        );
+        // A prefix of the identifier is not enough — raw (unframed) Snappy has
+        // no magic and must stay undetected.
+        assert_eq!(detect_compressor(&[0xFF, 0x06, 0x00, 0x00]), None);
+    }
+
+    #[test]
+    fn stem_strips_sz() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/tmp/data.tar.sz")),
+            "data.tar"
+        );
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("notes.txt.sz")),
+            "notes.txt"
+        );
+    }
+
+    #[test]
+    fn stem_strips_lz() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/tmp/payload.tar.lz")),
+            "payload.tar"
+        );
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("hello.txt.lz")),
+            "hello.txt"
+        );
+        // A `.lzma` name keeps its whole suffix: `.lz` is not a suffix of
+        // `.lzma`, so only the `.lzma` row can match it.
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("hello.txt.lzma")),
+            "hello.txt"
+        );
+    }
+
+    #[test]
+    fn stem_strips_lzma() {
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("/tmp/data.tar.lzma")),
+            "data.tar"
+        );
+        assert_eq!(
+            stem_without_compressor_ext(Path::new("notes.txt.lzma")),
+            "notes.txt"
+        );
     }
 
     #[test]

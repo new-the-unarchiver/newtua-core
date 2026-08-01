@@ -29,6 +29,13 @@ zip = { version = "2", features = ["lzma", "bzip2", "zstd", "deflate64", "xz"] }
 zstd = "0.13"
 lz4_flex = "0.11"
 brotli-decompressor = "5"
+# Framed Snappy (`.sz`, what Keka calls SNAPPY): pure Rust, zero runtime
+# dependencies, no `links` and no system library — its build.rs only emits
+# CRC/tag lookup tables as Rust source into OUT_DIR, so the three targets build
+# identically. BSD-3-Clause, compatible with our LGPL-3.0-or-later. Only the
+# framing2 stream format is decoded (it has magic); raw Snappy has none and is
+# deliberately not detected. See decompress.rs and detect_compressor.
+snap = "1"
 tar = "0.4"
 time = "0.3"
 sevenz-rust2 = { version = "0.21", features = ["aes256"] }

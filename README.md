@@ -71,17 +71,17 @@ Every variant below is a `FormatId` from [`src/archive.rs`](src/archive.rs).
 | Format | Notes |
 | --- | --- |
 | `Zip` | `.zip`, incl. ZipCrypto/AES encryption, LZMA/Deflate64 members |
-| `Tar` | `.tar` |
+| `Tar` | `.tar`, bare or inside any supported compressor (`.tar.gz`, `.tar.xz`, `.tar.sz`, `.tar.lz`, `.tar.lzma`, …) |
 | `Gzip` | `.gz` (single compressed file, no container) |
 | `Bzip2` | `.bz2` (single compressed file, no container) |
 | `Xz` | `.xz` (single compressed file, no container) |
-| `Raw` | any other single decompressed stream (e.g. `.zst`, `.lz4`, `.Z`, `.br`) |
+| `Raw` | any other single decompressed stream (e.g. `.zst`, `.lz4`, `.Z`, `.br`, `.sz`, `.lzma`, `.lz`) |
 | `SevenZ` | `.7z`, incl. AES-256 encryption |
 | `Rar` | `.rar`, single- and multi-volume |
 | `Cab` | `.cab` |
 | `Ar` | `.ar`/`.a` |
 | `Deb` | `.deb` (Debian package, ar + tar members) |
-| `Cpio` | `.cpio` |
+| `Cpio` | `.cpio` and `.cpgz` (cpio inside a compressor), newc and odc variants |
 | `Rpm` | `.rpm` |
 | `Xar` | `.xar`/`.pkg` |
 | `Msi` | `.msi` (Windows Installer, CFB + embedded CAB) |
@@ -94,6 +94,7 @@ Every variant below is a `FormatId` from [`src/archive.rs`](src/archive.rs).
 | `HfsPlus` | `.hfs`/`.hfsplus`/`.hfsx` (HFS+/HFSX volumes, incl. `decmpfs`) |
 | `Dmg` | `.dmg` (Apple Disk Image / UDIF container) |
 | `Apfs` | Apple File System, bare container or embedded in a DMG |
+| `Wpress` | `.wpress` (WordPress site dump: All-in-One WP Migration) |
 
 ### Zip-based containers
 
@@ -111,6 +112,9 @@ All open through the shared zip engine; only the reported `FormatId` differs.
 | `Odt` | OpenDocument text (`.odt`) |
 | `Ods` | OpenDocument spreadsheet (`.ods`) |
 | `Odp` | OpenDocument presentation (`.odp`) |
+| `War` | Java web application archive (`.war`) |
+| `Appx` | Windows app package (`.appx`) |
+| `Xpi` | Mozilla browser extension (`.xpi`) |
 | `Crx` | Chrome extension (`.crx`, `Cr24` header + embedded zip) |
 | `Conda` | Conda package (`.conda`, zip of `*.tar.zst` members) |
 
@@ -159,7 +163,7 @@ the test files embed at compile time with `include_bytes!`. Shipping them would
 blow past the 10 MiB package limit, and shipping the tests without them would
 hand you a suite that cannot compile at all.
 
-Nothing is hidden. All 574 tests and every fixture live in the
+Nothing is hidden. All 656 tests and every fixture live in the
 [repository on GitHub](https://github.com/new-the-unarchiver/newtua-core) and
 run in CI on Linux, macOS and Windows. To run them yourself:
 

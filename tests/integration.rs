@@ -27,8 +27,12 @@ mod bundles;
 mod cab_handler;
 #[path = "integration/conda.rs"]
 mod conda;
+#[path = "integration/cpgz.rs"]
+mod cpgz;
 #[path = "integration/cpio_handler.rs"]
 mod cpio_handler;
+#[path = "integration/cpio_odc.rs"]
+mod cpio_odc;
 #[path = "integration/deb_handler.rs"]
 mod deb_handler;
 #[path = "integration/detect.rs"]
@@ -47,6 +51,10 @@ mod legacy;
 mod lz4;
 #[path = "integration/lzc.rs"]
 mod lzc;
+#[path = "integration/lzip.rs"]
+mod lzip;
+#[path = "integration/lzma.rs"]
+mod lzma;
 #[path = "integration/macos_skip.rs"]
 mod macos_skip;
 #[path = "integration/msi_handler.rs"]
@@ -63,6 +71,8 @@ mod selection;
 mod sevenz_handler;
 #[path = "integration/sfx_handler.rs"]
 mod sfx_handler;
+#[path = "integration/snappy.rs"]
+mod snappy;
 #[path = "integration/source.rs"]
 mod source;
 #[path = "integration/squashfs.rs"]
@@ -75,6 +85,8 @@ mod volume_open;
 mod warc_handler;
 #[path = "integration/wim.rs"]
 mod wim;
+#[path = "integration/wpress.rs"]
+mod wpress;
 #[path = "integration/xar_handler.rs"]
 mod xar_handler;
 #[path = "integration/zip_handler.rs"]
