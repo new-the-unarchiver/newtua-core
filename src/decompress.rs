@@ -7,13 +7,16 @@
 //! because nothing in their first bytes distinguishes them from arbitrary data.
 //!
 //! **Concatenated members.** Most of these formats let two compressed files be
-//! `cat`-ed together into one valid file. Decoders that follow through:
-//! `MultiGzDecoder` (gzip), zstd's `Decoder` (spans frames on its own) and
-//! `LzipReader` below, which drives `xz2::stream::Stream` by hand precisely
-//! for that. Known gaps: bzip2 (`BzDecoder` stops after the first member and
-//! the rest is silently dropped; `MultiBzDecoder` is the fix) and xz
-//! (`XzDecoder::new` fails on the trailing stream; `new_multi_decoder` is the
-//! fix).
+//! `cat`-ed together into one valid file, and parallel compressors — `pbzip2`,
+//! which is what Keka runs for bzip2 — write one member per thread, so this is
+//! the common case, not a curiosity. Every multi-member decoder here must span
+//! them: `MultiGzDecoder` (gzip), `MultiBzDecoder` (bzip2),
+//! `XzDecoder::new_multi_decoder` (xz), zstd's `Decoder` (spans frames on its
+//! own) and `LzipReader` below, which drives `xz2::stream::Stream` by hand
+//! precisely for that. The single-member constructors are the trap: `BzDecoder`
+//! stops after the first member and drops the rest *without an error* — the
+//! worst possible failure — while `XzDecoder::new` at least fails loudly on the
+//! second stream.
 
 use std::io::{Error, ErrorKind, Read, Result};
 
@@ -42,8 +45,8 @@ pub enum Compressor {
 pub fn decompressor(kind: Compressor, inner: Box<dyn Read>) -> Result<Box<dyn Read>> {
     match kind {
         Compressor::Gzip => Ok(Box::new(flate2::read::MultiGzDecoder::new(inner))),
-        Compressor::Bzip2 => Ok(Box::new(bzip2::read::BzDecoder::new(inner))),
-        Compressor::Xz => Ok(Box::new(xz2::read::XzDecoder::new(inner))),
+        Compressor::Bzip2 => Ok(Box::new(bzip2::read::MultiBzDecoder::new(inner))),
+        Compressor::Xz => Ok(Box::new(xz2::read::XzDecoder::new_multi_decoder(inner))),
         Compressor::Zstd => Ok(Box::new(zstd::stream::read::Decoder::new(inner)?)),
         Compressor::Lzma => {
             let stream = xz2::stream::Stream::new_lzma_decoder(u64::MAX)?;
@@ -691,6 +694,73 @@ mod full {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, payload);
+    }
+
+    fn bzip2_bytes(data: &[u8]) -> Vec<u8> {
+        let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn xz_bytes(data: &[u8]) -> Vec<u8> {
+        let mut e = xz2::write::XzEncoder::new(Vec::new(), 6);
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn bzip2_multi_member_reads_all_members() {
+        // What `pbzip2` writes — and Keka's default bzip2 path is pbzip2, so
+        // every .bz2 it produces has one member per thread. A single-member
+        // decoder stops after the first and drops the rest without an error.
+        let mut compressed = bzip2_bytes(b"member one\n");
+        compressed.extend_from_slice(&bzip2_bytes(b"member two\n"));
+        compressed.extend_from_slice(&bzip2_bytes(b"member three\n"));
+        let mut r = decompressor(
+            Compressor::Bzip2,
+            Box::new(std::io::Cursor::new(compressed)),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"member one\nmember two\nmember three\n");
+    }
+
+    #[test]
+    fn bzip2_with_garbage_after_a_member_errors_on_read() {
+        // Reading further members must not turn a broken tail into success.
+        let mut compressed = bzip2_bytes(b"good member\n");
+        compressed.extend_from_slice(&[0xFF; 64]);
+        let mut r = decompressor(
+            Compressor::Bzip2,
+            Box::new(std::io::Cursor::new(compressed)),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        assert!(r.read_to_end(&mut out).is_err());
+    }
+
+    #[test]
+    fn xz_multi_stream_reads_all_streams() {
+        // `cat a.xz b.xz` is a valid .xz file; a single-stream decoder rejects
+        // it outright ("corrupt xz stream").
+        let mut compressed = xz_bytes(b"stream one\n");
+        compressed.extend_from_slice(&xz_bytes(b"stream two\n"));
+        let mut r =
+            decompressor(Compressor::Xz, Box::new(std::io::Cursor::new(compressed))).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"stream one\nstream two\n");
+    }
+
+    #[test]
+    fn xz_with_garbage_after_a_stream_errors_on_read() {
+        let mut compressed = xz_bytes(b"good stream\n");
+        compressed.extend_from_slice(&[0xFF; 64]);
+        let mut r =
+            decompressor(Compressor::Xz, Box::new(std::io::Cursor::new(compressed))).unwrap();
+        let mut out = Vec::new();
+        assert!(r.read_to_end(&mut out).is_err());
     }
 
     #[test]

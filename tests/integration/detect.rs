@@ -197,6 +197,92 @@ fn single_xz_non_tar_yields_one_entry() {
     assert_eq!(out, payload, "extracted content mismatch");
 }
 
+/// A .bz2 of several concatenated members — what `pbzip2` (and therefore Keka,
+/// which uses it by default) writes — must yield the whole payload, not just
+/// the first member's share of it.
+#[test]
+fn multi_member_bz2_yields_the_whole_payload() {
+    let parts: [&[u8]; 3] = [b"first thread\n", b"second thread\n", b"third thread\n"];
+    let mut bz2_bytes = Vec::new();
+    for part in parts {
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        enc.write_all(part).unwrap();
+        bz2_bytes.extend_from_slice(&enc.finish().unwrap());
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("threads.txt.bz2");
+    std::fs::write(&path, bz2_bytes).unwrap();
+
+    let mut ar = open(&path, &OpenOptions::default()).unwrap();
+    assert_eq!(ar.entries().unwrap().len(), 1);
+    let mut out = Vec::new();
+    ar.read_entry(0, &mut out).unwrap();
+    assert_eq!(out, parts.concat(), "truncated at a member boundary");
+}
+
+/// The same, wrapped around a tar: a multi-member .tar.bz2 must expand as one
+/// tar, so a member boundary falling mid-archive cannot lose entries.
+#[test]
+fn multi_member_tar_bz2_expands_as_one_tar() {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut b = tar::Builder::new(&mut tar_bytes);
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            let data = vec![b'x'; 4096];
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, name, &data[..]).unwrap();
+        }
+        b.finish().unwrap();
+    }
+    // Split the tar so the second member starts inside it, the way a parallel
+    // compressor chops its input into per-thread blocks.
+    let (head, tail) = tar_bytes.split_at(tar_bytes.len() / 2);
+    let mut bz2_bytes = Vec::new();
+    for part in [head, tail] {
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        enc.write_all(part).unwrap();
+        bz2_bytes.extend_from_slice(&enc.finish().unwrap());
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("payload.tar.bz2");
+    std::fs::write(&path, bz2_bytes).unwrap();
+
+    let mut ar = open(&path, &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap();
+    let names: Vec<_> = entries
+        .iter()
+        .map(|e| e.path.to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["a.txt", "b.txt", "c.txt"]);
+}
+
+/// `cat a.xz b.xz` is a valid .xz file; it must open and yield both streams.
+#[test]
+fn multi_stream_xz_yields_the_whole_payload() {
+    let parts: [&[u8]; 2] = [b"stream one\n", b"stream two\n"];
+    let mut xz_bytes = Vec::new();
+    for part in parts {
+        let mut enc = xz2::write::XzEncoder::new(Vec::new(), 6);
+        enc.write_all(part).unwrap();
+        xz_bytes.extend_from_slice(&enc.finish().unwrap());
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("streams.txt.xz");
+    std::fs::write(&path, xz_bytes).unwrap();
+
+    let mut ar = open(&path, &OpenOptions::default()).unwrap();
+    assert_eq!(ar.entries().unwrap().len(), 1);
+    let mut out = Vec::new();
+    ar.read_entry(0, &mut out).unwrap();
+    assert_eq!(out, parts.concat());
+}
+
 /// A .gz file built with a known mtime must expose that mtime on the single entry.
 /// (RED before fix: modified == None; GREEN after fix: modified == Some(epoch + secs))
 #[test]
