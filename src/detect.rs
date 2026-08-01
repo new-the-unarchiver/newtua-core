@@ -315,20 +315,6 @@ pub(crate) fn copy_slice_exact<R: Read + Seek>(
     Ok(())
 }
 
-/// Stream `size` bytes starting at `offset` from the temp file at `path` into
-/// `out`. Used by handlers that concatenate entry bodies into one temp file and
-/// read them back via an `(offset, size)` table (cpio's streaming path).
-/// Недобор байтов — ошибка, см. [`copy_slice_exact`].
-pub(crate) fn read_temp_slice(
-    path: &Path,
-    offset: u64,
-    size: u64,
-    out: &mut dyn Write,
-) -> Result<()> {
-    let mut file = std::fs::File::open(path)?;
-    copy_slice_exact(&mut file, offset, size, out, "temp payload")
-}
-
 // ── SingleFileReader ──────────────────────────────────────────────────────────
 
 /// Reader that presents a single decompressed file as a one-entry archive.
@@ -989,18 +975,6 @@ mod tests {
         assert!(
             msg.contains("4 of 8 bytes"),
             "message must say how much arrived: {msg}"
-        );
-    }
-
-    #[test]
-    fn read_temp_slice_refuses_a_short_read() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        std::io::Write::write_all(&mut tmp, b"short").unwrap();
-        let mut out = Vec::new();
-        let err = read_temp_slice(tmp.path(), 0, 99, &mut out).unwrap_err();
-        assert!(
-            matches!(err, Error::Corrupt(_)),
-            "expected Corrupt, got: {err}"
         );
     }
 }

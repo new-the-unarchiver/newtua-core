@@ -19,7 +19,8 @@
 //! # How an archive is opened
 //!
 //! cpio is a sequential format, but the file it lives in usually is not, and
-//! that decides which of the two paths `open` takes:
+//! `open` leans on that: every variant is walked by exactly one parser, over a
+//! source that can seek.
 //!
 //! * **Seekable source.** The listing is built from the headers alone: every
 //!   body is *skipped by seeking*, never read, and the source stays open so
@@ -30,15 +31,14 @@
 //!   every record is checked against it (`body offset + declared length ≤ file
 //!   length`), which catches a truncation *earlier* than reading would, and the
 //!   next record's magic still has to be where the skip lands.
-//! * **`Source::Stream`, newc and crc.** Spilled to a temp file first and then
-//!   walked as above, so they have one parser rather than two. `Source` is a
-//!   public type, so a caller of the library can hand us a stream even though
-//!   nothing inside the crate builds one.
-//! * **`Source::Stream`, odc.** Still makes one streaming pass, concatenating
-//!   every regular-file body into a temp file and keeping per-entry offsets
-//!   into it (`Scan`).
+//! * **`Source::Stream`.** Cannot seek, so it is spilled to a temp file whole
+//!   and then walked exactly as above — one parser per variant rather than two,
+//!   for all three of them. The cost is the one the old streaming pass already
+//!   paid: it copied every body to a temp file, and the bodies are nearly the
+//!   whole archive. `Source` is a public type, so a caller of the library can
+//!   hand us a stream even though nothing inside the crate builds one.
 
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -100,52 +100,52 @@ impl FormatHandler for CpioHandler {
     }
 
     fn open(&self, src: Source, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
-        let raw: Box<dyn Read> = match src {
+        // Both kinds of source end up in the same place: one seekable handle on
+        // the whole archive, walked by the one parser its variant has. A stream
+        // cannot seek, so it is spilled to a temp file first — see the module
+        // header for why that is cheaper than it looks.
+        match src {
             Source::Seekable { mut inner, .. } => {
-                // A seekable source is listed from the headers alone, both
-                // variants; the body offsets point into the archive itself.
                 let file_len = inner.seek(SeekFrom::End(0))?;
-                inner.seek(SeekFrom::Start(0))?;
-                let mut magic = [0u8; MAGIC_LEN];
-                inner.read_exact(&mut magic).map_err(io_err_to_corrupt)?;
-                return match &magic {
-                    MAGIC_ODC => open_odc_seekable(inner, file_len, opts),
-                    MAGIC_NEWC => open_newc_seekable(inner, file_len, opts, NewcVariant::Newc),
-                    MAGIC_CRC => open_newc_seekable(inner, file_len, opts, NewcVariant::Crc),
-                    _ => Err(unsupported_magic(&magic)),
-                };
+                open_seekable(inner, file_len, opts)
             }
-            Source::Stream { inner, .. } => inner,
-        };
-        // The odc scanner walks the stream header by header — 76 bytes plus the
-        // name — and `Source` hands over an unbuffered file. Without this, a
-        // tree of 10 000 files costs tens of thousands of syscalls; bodies still
-        // go through `io::copy` and are unaffected.
-        let mut reader: Box<dyn Read> = Box::new(BufReader::with_capacity(64 * 1024, raw));
-
-        // Pick the variant from the leading magic. A `Source::Stream` cannot be
-        // rewound, so the magic is chained back in front of the rest.
-        let mut magic = [0u8; MAGIC_LEN];
-        reader.read_exact(&mut magic).map_err(io_err_to_corrupt)?;
-        let stream: Box<dyn Read> = Box::new(Cursor::new(magic).chain(reader));
-
-        match &magic {
-            // newc and crc keep a single parser, the seeking one: an unseekable
-            // stream is spilled to a temp file and walked from there. Nothing in
-            // the crate builds a `Source::Stream`, but the type is public.
-            MAGIC_NEWC | MAGIC_CRC => {
-                let variant = if &magic == MAGIC_CRC {
-                    NewcVariant::Crc
-                } else {
-                    NewcVariant::Newc
-                };
-                let (file, file_len) = spill_to_temp(stream)?;
-                open_newc_seekable(Box::new(file), file_len, opts, variant)
+            Source::Stream { inner, .. } => {
+                let (file, file_len) = spill_to_temp(inner)?;
+                open_seekable(Box::new(file), file_len, opts)
             }
-            MAGIC_ODC => finish(scan_odc(stream)?, opts),
-            _ => Err(unsupported_magic(&magic)),
         }
     }
+}
+
+/// List a seekable archive of whichever variant it turns out to be, then hand
+/// back the reader that keeps it open so bodies can be read where they lie.
+///
+/// The leading magic picks the walk and nothing after it differs: `crc` is the
+/// newc walk with the `check` field carried along, and the entry list, the name
+/// decoding and the reader are shared by all three.
+fn open_seekable(
+    mut inner: Box<dyn ReadSeek>,
+    file_len: u64,
+    opts: &OpenOptions,
+) -> Result<Box<dyn ArchiveReader>> {
+    inner.seek(SeekFrom::Start(0))?;
+    let mut magic = [0u8; MAGIC_LEN];
+    // A file too short to hold a magic is truncated, not merely unsupported.
+    inner.read_exact(&mut magic).map_err(io_err_to_corrupt)?;
+    inner.seek(SeekFrom::Start(0))?;
+
+    let (raw_names, metas) = match &magic {
+        MAGIC_ODC => scan_odc_seekable(inner.as_mut(), file_len)?,
+        MAGIC_NEWC => scan_newc_seekable(inner.as_mut(), file_len, NewcVariant::Newc)?,
+        MAGIC_CRC => scan_newc_seekable(inner.as_mut(), file_len, NewcVariant::Crc)?,
+        _ => return Err(unsupported_magic(&magic)),
+    };
+    let (entries, bodies) = build_entries(raw_names, metas, opts);
+    Ok(Box::new(CpioSeekReader {
+        src: inner,
+        entries,
+        bodies,
+    }))
 }
 
 // ── Internal types ────────────────────────────────────────────────────────────
@@ -168,10 +168,9 @@ struct EntryMeta {
     checksum: Option<u32>,
 }
 
-/// Where an entry's body lives, and what it has to add up to once read.
-///
-/// The offset is into the temp file on the streaming path and into the archive
-/// itself on the seekable one; `read_entry` does not care which.
+/// Where an entry's body lies in the archive, and what it has to add up to once
+/// read. Offsets are always into the archive the reader holds open — which for
+/// a spilled stream is the temp file that archive was copied to.
 #[derive(Clone, Copy)]
 struct Body {
     offset: u64,
@@ -179,14 +178,6 @@ struct Body {
     /// See [`EntryMeta::checksum`]. Verified while the body is copied out, not
     /// while the listing is built — a listing must never read a body.
     checksum: Option<u32>,
-}
-
-/// Result of one streaming pass over an archive: all regular-file bodies
-/// concatenated into a single temp file, plus per-entry metadata.
-struct Scan {
-    temp: tempfile::NamedTempFile,
-    raw_names: Vec<Vec<u8>>,
-    metas: Vec<EntryMeta>,
 }
 
 /// Drop the trailing NUL bytes cpio pads names and link targets with.
@@ -206,6 +197,10 @@ fn unsupported_magic(magic: &[u8]) -> Error {
 
 /// Drain `stream` into an unnamed temp file and hand back the file, rewound,
 /// together with its length. Used for the one path that cannot seek.
+///
+/// `tempfile::tempfile()` is unlinked the moment it is created, so the file has
+/// no name to leak and the operating system reclaims it when the last handle
+/// closes — which happens when the reader holding it is dropped.
 fn spill_to_temp(mut stream: Box<dyn Read>) -> Result<(std::fs::File, u64)> {
     let mut file = tempfile::tempfile()?;
     let len = std::io::copy(&mut stream, &mut file)?;
@@ -513,24 +508,6 @@ fn scan_newc_seekable(
     Ok((raw_names, metas))
 }
 
-/// Open a seekable newc-shaped archive — newc or crc: list it from the headers,
-/// then keep `inner` open so bodies can be read straight out of it.
-fn open_newc_seekable(
-    mut inner: Box<dyn ReadSeek>,
-    file_len: u64,
-    opts: &OpenOptions,
-    variant: NewcVariant,
-) -> Result<Box<dyn ArchiveReader>> {
-    inner.seek(SeekFrom::Start(0))?;
-    let (raw_names, metas) = scan_newc_seekable(inner.as_mut(), file_len, variant)?;
-    let (entries, bodies) = build_entries(raw_names, metas, opts);
-    Ok(Box::new(CpioSeekReader {
-        src: inner,
-        entries,
-        bodies,
-    }))
-}
-
 // ── odc (070707) ─────────────────────────────────────────────────────────────
 
 /// Fixed header length of the odc variant.
@@ -602,8 +579,8 @@ fn odc_field(header: &[u8], span: (usize, usize), name: &str) -> Result<u64> {
 
 /// Move exactly `n` bytes from `reader` to `out`, or fail as truncated.
 ///
-/// The one way this scanner crosses a record: names go to a `Vec`, bodies to
-/// the temp file, skipped records to `io::sink()`. `n` comes straight out of
+/// The one way a scanner reads part of a record rather than skipping it: names
+/// and symlink targets go to a `Vec`. `n` comes straight out of
 /// the archive, so it must never size an allocation on its own — `io::copy`
 /// grows the destination only as far as the stream really reaches, and a short
 /// read is a truncated archive, not a silently short entry. `what` names the
@@ -621,124 +598,6 @@ fn take_exact(
         )));
     }
     Ok(())
-}
-
-/// Stream an odc archive; the counterpart of [`scan_newc`].
-fn scan_odc(reader: Box<dyn Read>) -> Result<Scan> {
-    let mut temp = tempfile::NamedTempFile::new()?;
-    let mut raw_names: Vec<Vec<u8>> = Vec::new();
-    let mut metas: Vec<EntryMeta> = Vec::new();
-
-    let mut reader = reader;
-    let mut header = [0u8; ODC_HEADER_LEN];
-
-    loop {
-        // A stream that ends without its TRAILER record is truncated; the
-        // read_exact below turns that into Corrupt rather than a silent stop.
-        reader.read_exact(&mut header).map_err(io_err_to_corrupt)?;
-        if &header[..MAGIC_LEN] != MAGIC_ODC {
-            return Err(Error::Corrupt(
-                "cpio odc: record does not start with 070707".into(),
-            ));
-        }
-
-        let mode = odc_field(&header, ODC_MODE, "mode")? as u32;
-        let mtime = odc_field(&header, ODC_MTIME, "mtime")?;
-        let namesize = odc_field(&header, ODC_NAMESIZE, "namesize")?;
-        let filesize = odc_field(&header, ODC_FILESIZE, "filesize")?;
-
-        if namesize == 0 {
-            return Err(Error::Corrupt("cpio odc: zero-length name".into()));
-        }
-        let mut name = Vec::new();
-        take_exact(&mut reader, namesize, &mut name, format_args!("entry name"))?;
-        // `namesize` counts the terminating NUL; drop it and any extra padding.
-        trim_nuls(&mut name);
-
-        if name == b"TRAILER!!!" {
-            break;
-        }
-
-        let modified = unix_secs_to_systime(mtime);
-
-        match mode & S_IFMT {
-            S_IFREG => {
-                let offset = temp.seek(SeekFrom::End(0))?;
-                // `filesize` is untrusted: stream it and check what actually
-                // arrived instead of trusting the header.
-                take_exact(
-                    &mut reader,
-                    filesize,
-                    &mut temp,
-                    format_args!("body of {}", String::from_utf8_lossy(&name)),
-                )?;
-                raw_names.push(name);
-                metas.push(EntryMeta {
-                    kind: KindRaw::File,
-                    offset,
-                    size: filesize,
-                    mode,
-                    modified,
-                    checksum: None,
-                });
-            }
-            S_IFDIR => {
-                // Directories carry no body, but skip `filesize` anyway so a
-                // non-conforming writer cannot desynchronise the stream.
-                take_exact(
-                    &mut reader,
-                    filesize,
-                    &mut std::io::sink(),
-                    format_args!("record body"),
-                )?;
-                raw_names.push(name);
-                metas.push(EntryMeta {
-                    kind: KindRaw::Dir,
-                    offset: 0,
-                    size: 0,
-                    mode,
-                    modified,
-                    checksum: None,
-                });
-            }
-            S_IFLNK => {
-                // Symlink: the body is the link target.
-                let mut target = Vec::new();
-                take_exact(
-                    &mut reader,
-                    filesize,
-                    &mut target,
-                    format_args!("symlink target"),
-                )?;
-                trim_nuls(&mut target);
-                raw_names.push(name);
-                metas.push(EntryMeta {
-                    kind: KindRaw::Symlink(target),
-                    offset: 0,
-                    size: filesize,
-                    mode,
-                    modified,
-                    checksum: None,
-                });
-            }
-            _ => {
-                // Special node (char/block device, fifo, socket) — skipped, as
-                // in the newc path.
-                take_exact(
-                    &mut reader,
-                    filesize,
-                    &mut std::io::sink(),
-                    format_args!("record body"),
-                )?;
-            }
-        }
-    }
-
-    Ok(Scan {
-        temp,
-        raw_names,
-        metas,
-    })
 }
 
 // ── Seekable walks: shared machinery ─────────────────────────────────────────
@@ -892,7 +751,7 @@ fn scan_odc_seekable(
             }
             _ => {
                 // Special node (char/block device, fifo, socket) — skipped, as
-                // in the streaming path.
+                // in the newc walk.
                 skip_to(&mut reader, after_name, after_body)?;
             }
         }
@@ -903,48 +762,12 @@ fn scan_odc_seekable(
     Ok((raw_names, metas))
 }
 
-/// Open a seekable odc archive: list it from the headers, then keep `inner`
-/// open so bodies can be read straight out of it.
-fn open_odc_seekable(
-    mut inner: Box<dyn ReadSeek>,
-    file_len: u64,
-    opts: &OpenOptions,
-) -> Result<Box<dyn ArchiveReader>> {
-    inner.seek(SeekFrom::Start(0))?;
-    let (raw_names, metas) = scan_odc_seekable(inner.as_mut(), file_len)?;
-    let (entries, bodies) = build_entries(raw_names, metas, opts);
-    Ok(Box::new(CpioSeekReader {
-        src: inner,
-        entries,
-        bodies,
-    }))
-}
-
 // ── Shared tail: names, kinds, reader ────────────────────────────────────────
 
-/// Turn a finished [`Scan`] into a reader: decode names once for the whole
-/// archive, then build the entry list.
-fn finish(scan: Scan, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
-    let Scan {
-        temp,
-        raw_names,
-        metas,
-    } = scan;
-
-    let (entries, offsets) = build_entries(raw_names, metas, opts);
-
-    let temp_path = temp.into_temp_path();
-    Ok(Box::new(CpioReader {
-        entries,
-        offsets,
-        _temp: temp_path,
-    }))
-}
-
-/// Build the entry list shared by both readers: names are decoded once for the
-/// whole archive, and each entry gets the [`Body`] it is read from — located in
-/// the temp file for the streaming path, in the archive itself for the seekable
-/// one. `None` means there is no body to read (directory, symlink).
+/// Build the entry list every variant shares: names are decoded once for the
+/// whole archive, and each entry gets the [`Body`] it is read from, located in
+/// the archive itself. `None` means there is no body to read (directory,
+/// symlink).
 fn build_entries(
     raw_names: Vec<Vec<u8>>,
     metas: Vec<EntryMeta>,
@@ -1011,39 +834,10 @@ fn build_entries(
 
 // ── Reader ────────────────────────────────────────────────────────────────────
 
-pub struct CpioReader {
-    entries: Vec<Entry>,
-    /// Per-entry body, located in the temp file; `None` for entries with no body
-    /// (dirs, symlinks). This reader serves the streaming odc path only, and odc
-    /// carries no checksum, so `Body::checksum` here is always `None`.
-    offsets: Vec<Option<Body>>,
-    /// Temp file holding all regular-file bodies, concatenated.
-    _temp: tempfile::TempPath,
-}
-
-impl ArchiveReader for CpioReader {
-    fn format(&self) -> FormatId {
-        FormatId::Cpio
-    }
-
-    fn entries(&mut self) -> Result<&[Entry]> {
-        Ok(&self.entries)
-    }
-
-    fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
-        if idx >= self.entries.len() {
-            return Err(Error::InvalidIndex(idx));
-        }
-        let Some(body) = self.offsets[idx] else {
-            // Directory or symlink — no body to read.
-            return Ok(());
-        };
-        crate::detect::read_temp_slice(&self._temp, body.offset, body.size, out)
-    }
-}
-
-/// Reader for a seekable archive of any variant: no temp file, no copies — the
-/// archive itself is held open and each body is read where it lies.
+/// The one reader this format has: no copies — the archive itself is held open
+/// and each body is read where it lies. For a spilled `Source::Stream` `src` is
+/// the unnamed temp file the archive was copied to, and closing it here is what
+/// releases that file.
 ///
 /// The source has to outlive nothing else here, but it does have to die before
 /// the temp path a `.cpgz` is unpacked to: that path belongs to
@@ -1132,6 +926,8 @@ impl CpioSeekReader {
 mod tests {
     use super::*;
     use crate::Confidence;
+    // Only the tests build an archive in memory; the parser itself never does.
+    use std::io::Cursor;
     use std::path::Path;
 
     #[test]
@@ -1955,5 +1751,119 @@ mod tests {
             .read_entry(1, &mut Vec::new())
             .expect_err("the spilled path must verify the checksum too");
         assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+    }
+
+    // ── A stream must read exactly like the same bytes on disk ───────────────
+
+    /// The same little tree in whichever variant `rec` writes: a directory, a
+    /// symlink, a file whose body length needs newc's padding, one body big
+    /// enough to be worth truncating, and an empty file.
+    fn sample_tree(rec: fn(&[u8], u32, &[u8]) -> Vec<u8>, trailer: fn() -> Vec<u8>) -> Vec<u8> {
+        let mut archive = rec(b"sub", S_IFDIR | 0o755, b"");
+        archive.extend_from_slice(&rec(b"sub/link", S_IFLNK | 0o777, b"a.txt"));
+        archive.extend_from_slice(&rec(b"a.txt", S_IFREG | 0o644, b"odd"));
+        archive.extend_from_slice(&rec(b"sub/big.bin", S_IFREG | 0o600, &vec![b'z'; 5000]));
+        archive.extend_from_slice(&rec(b"empty.bin", S_IFREG | 0o600, b""));
+        archive.extend_from_slice(&trailer());
+        archive
+    }
+
+    /// Open the same bytes twice — once as a seekable source, once as a
+    /// `Source::Stream` — and require the two readers to agree on every entry
+    /// and every body. The stream is spilled to a temp file and then walked by
+    /// the very same parser, so any divergence means the spill lost or shifted
+    /// something.
+    fn assert_stream_matches_file(archive: Vec<u8>, what: &str) {
+        let (src, _) = counting_source(archive.clone());
+        let mut from_file = CpioHandler
+            .open(src, &OpenOptions::default())
+            .unwrap_or_else(|e| panic!("{what}: the seekable open failed: {e}"));
+        let stream = Source::Stream {
+            inner: Box::new(Cursor::new(archive)),
+            path: None,
+        };
+        let mut from_stream = CpioHandler
+            .open(stream, &OpenOptions::default())
+            .unwrap_or_else(|e| panic!("{what}: the stream open failed: {e}"));
+
+        let listed = from_file.entries().expect("entries from the file").to_vec();
+        let streamed = from_stream
+            .entries()
+            .expect("entries from the stream")
+            .to_vec();
+        assert_eq!(listed.len(), streamed.len(), "{what}: entry count");
+        assert!(listed.len() >= 4, "{what}: the sample tree lost entries");
+
+        for (i, (a, b)) in listed.iter().zip(&streamed).enumerate() {
+            assert_eq!(a.path, b.path, "{what}: path of entry {i}");
+            assert_eq!(a.path_raw, b.path_raw, "{what}: raw name of entry {i}");
+            assert_eq!(a.kind, b.kind, "{what}: kind of entry {i}");
+            assert_eq!(a.size, b.size, "{what}: size of entry {i}");
+            assert_eq!(a.mode, b.mode, "{what}: mode of entry {i}");
+            assert_eq!(a.modified, b.modified, "{what}: mtime of entry {i}");
+
+            let mut file_body = Vec::new();
+            let mut stream_body = Vec::new();
+            from_file
+                .read_entry(i, &mut file_body)
+                .unwrap_or_else(|e| panic!("{what}: read_entry {i} from the file: {e}"));
+            from_stream
+                .read_entry(i, &mut stream_body)
+                .unwrap_or_else(|e| panic!("{what}: read_entry {i} from the stream: {e}"));
+            assert_eq!(file_body, stream_body, "{what}: body of entry {i}");
+        }
+    }
+
+    #[test]
+    fn streamed_odc_reads_like_the_same_archive_from_a_file() {
+        assert_stream_matches_file(sample_tree(odc_record, odc_trailer), "odc");
+    }
+
+    #[test]
+    fn streamed_newc_reads_like_the_same_archive_from_a_file() {
+        assert_stream_matches_file(sample_tree(newc_record, newc_trailer), "newc");
+    }
+
+    #[test]
+    fn streamed_crc_reads_like_the_same_archive_from_a_file() {
+        assert_stream_matches_file(sample_tree(crc_record, crc_trailer), "crc");
+    }
+
+    /// A stream that stops mid-body is `Error::Corrupt`, not a quietly short
+    /// listing: the spill copies whatever arrived, and the walk then finds a
+    /// header claiming more bytes than the spilled file holds.
+    #[test]
+    fn a_truncated_stream_is_corrupt_for_every_variant() {
+        for (what, mut archive) in [
+            ("odc", sample_tree(odc_record, odc_trailer)),
+            ("newc", sample_tree(newc_record, newc_trailer)),
+            ("crc", sample_tree(crc_record, crc_trailer)),
+        ] {
+            // Cuts into the 5000-byte body, so the records before it are intact
+            // and only the arithmetic can catch the loss.
+            archive.truncate(archive.len() - 2500);
+            let src = Source::Stream {
+                inner: Box::new(Cursor::new(archive)),
+                path: None,
+            };
+            match CpioHandler.open(src, &OpenOptions::default()) {
+                Ok(_) => panic!("{what}: a truncated stream must not open"),
+                Err(e) => assert!(matches!(e, Error::Corrupt(_)), "{what}: got {e:?}"),
+            }
+        }
+    }
+
+    /// An empty stream is a truncated archive, not a panic and not an empty
+    /// listing: there is not even a magic to spill.
+    #[test]
+    fn an_empty_stream_is_corrupt() {
+        let src = Source::Stream {
+            inner: Box::new(Cursor::new(Vec::new())),
+            path: None,
+        };
+        match CpioHandler.open(src, &OpenOptions::default()) {
+            Ok(_) => panic!("an empty stream must not open"),
+            Err(e) => assert!(matches!(e, Error::Corrupt(_)), "got {e:?}"),
+        }
     }
 }
