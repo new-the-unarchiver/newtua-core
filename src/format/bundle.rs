@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn table_covers_thirteen_bundle_formats() {
+    fn table_length_matches_the_declared_subtypes() {
         // 13 = 10 исходных (jar/apk/ipa/epub + docx/xlsx/pptx + odt/ods/odp)
         // + 3 добавленных ради опознания: war, appx, xpi.
         assert_eq!(ZIP_BUNDLES.len(), 13);

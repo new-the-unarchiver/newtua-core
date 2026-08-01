@@ -19,7 +19,7 @@
 //! dictionary; `payload.tar.lz` codes 7168 bytes — not a power of two, which is
 //! exactly the case the synthesized "alone" header has to round up.
 
-use newtua_core::archive::{FormatId, OpenOptions};
+use newtua_core::archive::{ArchiveReader, FormatId, OpenOptions};
 use newtua_core::detect::open;
 use std::io::Write;
 use std::path::Path;
@@ -28,6 +28,21 @@ fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name)
+}
+
+/// Write `bytes` to a temp file whose name ends in `suffix`, then open it.
+///
+/// The temp file is deleted as this returns, so it is meant for the damaged
+/// inputs below — the ones asserted to fail — not for a reader that goes on to
+/// read from its source.
+fn open_bytes(bytes: &[u8], suffix: &str) -> newtua_core::Result<Box<dyn ArchiveReader>> {
+    let mut tmp = tempfile::Builder::new()
+        .suffix(suffix)
+        .tempfile()
+        .expect("tempfile");
+    tmp.write_all(bytes).expect("write");
+    tmp.flush().expect("flush");
+    open(tmp.path(), &OpenOptions::default())
 }
 
 /// A single-file `.lz` opens as one entry named after the stripped filename.
@@ -107,14 +122,8 @@ fn truncated_dot_lz_errors() {
     // Keep the 6-byte header so detection still fires, then cut the LZMA
     // payload in half: the end-of-stream marker never arrives.
     let cut = 6 + (full.len() - 6) / 2;
-    let mut tmp = tempfile::Builder::new()
-        .suffix(".lz")
-        .tempfile()
-        .expect("tempfile");
-    tmp.write_all(&full[..cut]).expect("write truncated");
-    tmp.flush().expect("flush");
 
-    let res = open(tmp.path(), &OpenOptions::default());
+    let res = open_bytes(&full[..cut], ".lz");
     assert!(res.is_err(), "truncated .lz must not open successfully");
 }
 
@@ -125,14 +134,7 @@ fn dot_lz_with_a_truncated_second_member_errors() {
     let full = std::fs::read(fixture("multi.txt.lz")).expect("read fixture");
     // The first member is 48 bytes (its trailer says so); keep it whole and
     // leave the second one a stump.
-    let mut tmp = tempfile::Builder::new()
-        .suffix(".lz")
-        .tempfile()
-        .expect("tempfile");
-    tmp.write_all(&full[..48 + 20]).expect("write truncated");
-    tmp.flush().expect("flush");
-
-    let res = open(tmp.path(), &OpenOptions::default());
+    let res = open_bytes(&full[..48 + 20], ".lz");
     assert!(
         res.is_err(),
         "a .lz whose trailing member is truncated must not open successfully"
@@ -147,14 +149,8 @@ fn corrupt_dot_lz_errors() {
     for b in bytes.iter_mut().skip(6) {
         *b = 0xFF;
     }
-    let mut tmp = tempfile::Builder::new()
-        .suffix(".lz")
-        .tempfile()
-        .expect("tempfile");
-    tmp.write_all(&bytes).expect("write corrupt");
-    tmp.flush().expect("flush");
 
-    let res = open(tmp.path(), &OpenOptions::default());
+    let res = open_bytes(&bytes, ".lz");
     assert!(res.is_err(), "corrupt .lz must not open successfully");
 }
 

@@ -14,7 +14,7 @@
 //! (`payload.tar` here is byte-identical to the one behind the other compressor
 //! fixtures — it was recovered with `gzip -dc payload.tar.Z > payload.tar`.)
 
-use newtua_core::archive::{FormatId, OpenOptions};
+use newtua_core::archive::{ArchiveReader, FormatId, OpenOptions};
 use newtua_core::detect::open;
 use std::io::Write;
 use std::path::Path;
@@ -23,6 +23,21 @@ fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name)
+}
+
+/// Write `bytes` to a temp file whose name ends in `suffix`, then open it.
+///
+/// The temp file is deleted as this returns, so it is meant for the inputs
+/// below that are asserted to fail — not for a reader that goes on to read
+/// from its source.
+fn open_bytes(bytes: &[u8], suffix: &str) -> newtua_core::Result<Box<dyn ArchiveReader>> {
+    let mut tmp = tempfile::Builder::new()
+        .suffix(suffix)
+        .tempfile()
+        .expect("tempfile");
+    tmp.write_all(bytes).expect("write");
+    tmp.flush().expect("flush");
+    open(tmp.path(), &OpenOptions::default())
 }
 
 /// A single-file `.lzma` opens as one entry named after the stripped filename.
@@ -85,14 +100,8 @@ fn tar_dot_lzma_lists_members() {
 #[test]
 fn lzma_content_without_the_extension_stays_unknown() {
     let bytes = std::fs::read(fixture("hello.txt.lzma")).expect("read fixture");
-    let mut tmp = tempfile::Builder::new()
-        .suffix(".bin")
-        .tempfile()
-        .expect("tempfile");
-    tmp.write_all(&bytes).expect("write");
-    tmp.flush().expect("flush");
 
-    let res = open(tmp.path(), &OpenOptions::default());
+    let res = open_bytes(&bytes, ".bin");
     assert!(
         res.is_err(),
         "LZMA content without a .lzma extension must not be detected"
@@ -105,14 +114,6 @@ fn truncated_dot_lzma_errors() {
     let full = std::fs::read(fixture("hello.txt.lzma")).expect("read fixture");
     // Keep the 13-byte alone header so the payload starts decoding, then cut:
     // the decoder hits EOF before the end-of-stream marker.
-    let mut tmp = tempfile::Builder::new()
-        .suffix(".lzma")
-        .tempfile()
-        .expect("tempfile");
-    tmp.write_all(&full[..13 + (full.len() - 13) / 2])
-        .expect("write truncated");
-    tmp.flush().expect("flush");
-
-    let res = open(tmp.path(), &OpenOptions::default());
+    let res = open_bytes(&full[..13 + (full.len() - 13) / 2], ".lzma");
     assert!(res.is_err(), "truncated .lzma must not open successfully");
 }

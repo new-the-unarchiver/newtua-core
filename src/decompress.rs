@@ -116,9 +116,8 @@ struct LzipReader<R: Read> {
     /// `inner` returned 0 — no more input will arrive.
     eof: bool,
     /// Synthesized "alone" header for the current member, fed to the decoder
-    /// ahead of `buf`; `pending[pending_pos..]` is what is left of it.
+    /// ahead of `buf`. Drained as the decoder takes it; empty means "spent".
     pending: Vec<u8>,
-    pending_pos: usize,
     state: LzipState,
     /// Bytes the current member has decoded to, checked against its trailer.
     member_out: u64,
@@ -131,8 +130,8 @@ enum LzipState {
     Header,
     /// Decoding one member's LZMA1 stream.
     Body(Box<xz2::stream::Stream>),
-    /// Skipping the member trailer; the payload is how many bytes are left.
-    Trailer(usize),
+    /// Skipping the member trailer; how much is left is `trailer`'s shortfall.
+    Trailer,
     /// Input ended on a member boundary — nothing more to produce.
     Done,
     /// A previous `read` failed. Latched so a caller that keeps reading gets
@@ -140,7 +139,7 @@ enum LzipState {
     Failed,
 }
 
-fn corrupt(msg: &str) -> Error {
+fn corrupt(msg: impl std::fmt::Display) -> Error {
     Error::new(ErrorKind::InvalidData, format!("lzip: {msg}"))
 }
 
@@ -153,7 +152,6 @@ impl<R: Read> LzipReader<R> {
             cap: 0,
             eof: false,
             pending: Vec::new(),
-            pending_pos: 0,
             state: LzipState::Header,
             member_out: 0,
             trailer: Vec::with_capacity(LZIP_TRAILER_LEN),
@@ -164,7 +162,10 @@ impl<R: Read> LzipReader<R> {
     /// Returns how many are available. `n` must not exceed [`LZIP_BUF`].
     fn fill_at_least(&mut self, n: usize) -> Result<usize> {
         debug_assert!(n <= LZIP_BUF);
-        if self.pos > 0 {
+        // Compact only when the buffer cannot already satisfy the request:
+        // `advance_trailer` asks for a single byte on every step, and moving
+        // up to 64 KiB for a byte that is already there is pure waste.
+        if self.cap - self.pos < n && self.pos > 0 {
             self.buf.copy_within(self.pos..self.cap, 0);
             self.cap -= self.pos;
             self.pos = 0;
@@ -193,7 +194,7 @@ impl<R: Read> LzipReader<R> {
             return Err(corrupt("member header magic mismatch"));
         }
         if head[4] != LZIP_VERSION {
-            return Err(corrupt(&format!("unsupported format version {}", head[4])));
+            return Err(corrupt(format!("unsupported format version {}", head[4])));
         }
         // Coded dictionary size: low 5 bits are a base-2 exponent, high 3 bits
         // are how many sixteenths of that base to subtract.
@@ -201,7 +202,7 @@ impl<R: Read> LzipReader<R> {
         let exponent = u32::from(coded & 0x1f);
         let sixteenths = u32::from(coded >> 5);
         if !(12..=29).contains(&exponent) {
-            return Err(corrupt(&format!(
+            return Err(corrupt(format!(
                 "dictionary size exponent {exponent} outside 12..=29"
             )));
         }
@@ -221,17 +222,16 @@ impl<R: Read> LzipReader<R> {
         alone.extend_from_slice(&dict.next_power_of_two().to_le_bytes());
         alone.extend_from_slice(&u64::MAX.to_le_bytes());
         self.pending = alone;
-        self.pending_pos = 0;
 
         let stream = xz2::stream::Stream::new_lzma_decoder(u64::MAX)?;
         self.state = LzipState::Body(Box::new(stream));
-        self.member_out = 0;
         self.trailer.clear();
         Ok(true)
     }
 
     /// Consume trailer bytes; on the last one, check the member's size field.
-    fn advance_trailer(&mut self, left: usize) -> Result<()> {
+    fn advance_trailer(&mut self) -> Result<()> {
+        let left = LZIP_TRAILER_LEN - self.trailer.len();
         let avail = self.fill_at_least(1)?;
         if avail == 0 {
             return Err(corrupt("truncated member trailer"));
@@ -240,9 +240,8 @@ impl<R: Read> LzipReader<R> {
         self.trailer
             .extend_from_slice(&self.buf[self.pos..self.pos + take]);
         self.pos += take;
-        let left = left - take;
-        if left > 0 {
-            self.state = LzipState::Trailer(left);
+        if self.trailer.len() < LZIP_TRAILER_LEN {
+            self.state = LzipState::Trailer;
             return Ok(());
         }
         // CRC32 is left to liblzma's own stream integrity checks; the size
@@ -250,7 +249,7 @@ impl<R: Read> LzipReader<R> {
         // member that still decoded to something.
         let declared = u64::from_le_bytes(self.trailer[4..12].try_into().unwrap());
         if declared != self.member_out {
-            return Err(corrupt(&format!(
+            return Err(corrupt(format!(
                 "member declares {declared} uncompressed bytes, decoded {}",
                 self.member_out
             )));
@@ -265,6 +264,14 @@ impl<R: Read> Read for LzipReader<R> {
         if out.is_empty() {
             return Ok(0);
         }
+        // Terminal states answer before the member loop runs: `Done` is a clean
+        // EOF, `Failed` re-reports the latched error so a caller that keeps
+        // reading gets it again instead of a silent EOF or a restart mid-stream.
+        match self.state {
+            LzipState::Done => return Ok(0),
+            LzipState::Failed => return Err(corrupt("stream already failed")),
+            _ => {}
+        }
         let result = self.read_member_loop(out);
         if result.is_err() {
             self.state = LzipState::Failed;
@@ -276,23 +283,30 @@ impl<R: Read> Read for LzipReader<R> {
 impl<R: Read> LzipReader<R> {
     fn read_member_loop(&mut self, out: &mut [u8]) -> Result<usize> {
         loop {
-            match std::mem::replace(&mut self.state, LzipState::Header) {
-                LzipState::Done => {
-                    self.state = LzipState::Done;
-                    return Ok(0);
-                }
-                LzipState::Failed => return Err(corrupt("stream already failed")),
+            match self.state {
+                // `read` returns on both terminal states before calling us, and
+                // nothing below sets one without returning in the same step —
+                // these arms only keep the match exhaustive.
+                LzipState::Done | LzipState::Failed => return Ok(0),
                 LzipState::Header => {
                     if !self.start_member()? {
                         self.state = LzipState::Done;
                         return Ok(0);
                     }
                 }
-                LzipState::Trailer(left) => self.advance_trailer(left)?,
-                LzipState::Body(mut stream) => {
-                    let from_pending = self.pending_pos < self.pending.len();
+                LzipState::Trailer => self.advance_trailer()?,
+                LzipState::Body(_) => {
+                    // Take the decoder out: `process` needs it by value while
+                    // `self`'s buffers are borrowed. It goes back in below
+                    // unless the member ended.
+                    let LzipState::Body(mut stream) =
+                        std::mem::replace(&mut self.state, LzipState::Header)
+                    else {
+                        unreachable!("just matched Body")
+                    };
+                    let from_pending = !self.pending.is_empty();
                     let input: &[u8] = if from_pending {
-                        &self.pending[self.pending_pos..]
+                        &self.pending
                     } else {
                         if self.pos == self.cap {
                             self.fill_at_least(1)?;
@@ -307,17 +321,20 @@ impl<R: Read> LzipReader<R> {
                     let consumed = (stream.total_in() - in_before) as usize;
                     let produced = (stream.total_out() - out_before) as usize;
                     if from_pending {
-                        self.pending_pos += consumed;
+                        self.pending.drain(..consumed);
                     } else {
                         self.pos += consumed;
                     }
-                    self.member_out += produced as u64;
                     match status {
                         xz2::stream::Status::StreamEnd => {
-                            self.state = LzipState::Trailer(LZIP_TRAILER_LEN);
+                            // The stream is per member, so its own output
+                            // counter is the member's uncompressed size — the
+                            // number the trailer is checked against.
+                            self.member_out = stream.total_out();
+                            self.state = LzipState::Trailer;
                         }
                         xz2::stream::Status::Ok => self.state = LzipState::Body(stream),
-                        other => return Err(corrupt(&format!("decoder returned {other:?}"))),
+                        other => return Err(corrupt(format!("decoder returned {other:?}"))),
                     }
                     if produced > 0 {
                         return Ok(produced);

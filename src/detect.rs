@@ -177,6 +177,37 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
     None
 }
 
+/// Every compressor file-name suffix this crate knows, in scan order.
+///
+/// The single source of truth for two questions that used to keep two lists in
+/// sync: which suffix names a compressor that has **no content magic**
+/// (`Some(_)`, detected by extension alone), and which suffix must be stripped
+/// off to derive the entry name of a plain compressed file (all of them).
+///
+/// A `None` here means "content magic detects this one — the suffix is only
+/// good for naming". Adding a magic-less compressor is one row with `Some(_)`;
+/// `detect_compressor` (the byte-magic detector) stays untouched either way.
+///
+/// **Order matters**: both readers take the first suffix that matches, so a
+/// longer suffix must precede any shorter one it ends with.
+const COMPRESSOR_EXTS: &[(&str, Option<Compressor>)] = &[
+    (".gz", None),
+    (".bz2", None),
+    (".xz", None),
+    (".zst", None),
+    // Uppercase on purpose: `.Z` is compress(1), lowercase `.z` is not.
+    (".Z", None),
+    (".lz4", None),
+    (".br", Some(Compressor::Brotli)),
+    (".sz", None),
+    // Bare LZMA1 ("alone" format), the same decoder deb/rpm already use for
+    // their payloads. Its header is coder properties plus a dictionary size,
+    // with no tag: any file could start that way, so detecting it by content
+    // would claim arbitrary data. Extension only, on purpose.
+    (".lzma", Some(Compressor::Lzma)),
+    (".lz", None),
+];
+
 /// Detect a compressor from the file name's extension, for formats that have
 /// **no content magic** and therefore cannot be recognised by `detect_compressor`.
 ///
@@ -186,21 +217,10 @@ pub fn detect_compressor(header: &[u8]) -> Option<Compressor> {
 ///
 /// - `.br` / `.tar.br` → Brotli
 /// - `.lzma` / `.tar.lzma` → bare LZMA1 (the "alone" container)
-///
-/// Add future extension-only (magic-less) compressors here — one `ends_with`
-/// arm each — and keep `detect_compressor` (the byte-magic detector) untouched.
 fn detect_compressor_by_ext(lower_name: &str) -> Option<Compressor> {
-    if lower_name.ends_with(".br") {
-        return Some(Compressor::Brotli);
-    }
-    if lower_name.ends_with(".lzma") {
-        // Bare LZMA1 ("alone" format), the same decoder deb/rpm already use for
-        // their payloads. Its header is coder properties plus a dictionary size,
-        // with no tag: any file could start that way, so detecting it by content
-        // would claim arbitrary data. Extension only, on purpose.
-        return Some(Compressor::Lzma);
-    }
-    None
+    COMPRESSOR_EXTS
+        .iter()
+        .find_map(|&(ext, comp)| comp.filter(|_| lower_name.ends_with(ext)))
 }
 
 // ── TempBackedReader ──────────────────────────────────────────────────────────
@@ -374,12 +394,12 @@ impl ArchiveReader for SingleFileReader {
 /// - `data.gz`       → `"data"`
 /// - `archive.tar.bz2` → `"archive.tar"`
 /// - `file.xz`       → `"file"`
+///
+/// The suffix list is [`COMPRESSOR_EXTS`] — every compressor, magic-less or not.
 fn stem_without_compressor_ext(path: &Path) -> String {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
 
-    for ext in &[
-        ".gz", ".bz2", ".xz", ".zst", ".Z", ".lz4", ".br", ".sz", ".lzma", ".lz",
-    ] {
+    for (ext, _) in COMPRESSOR_EXTS {
         if let Some(stem) = name.strip_suffix(ext) {
             return stem.to_string();
         }
@@ -388,10 +408,13 @@ fn stem_without_compressor_ext(path: &Path) -> String {
     name.to_string()
 }
 
-/// Check whether the first 263 bytes of a reader contain the tar `ustar` magic
-/// at offset 257. Rewinds the reader to position 0 after the check.
-pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
-    let mut buf = [0u8; 263];
+/// Fill `buf` from the start of `reader`, then rewind the reader to position 0.
+///
+/// Returns how many bytes were actually read: a short read is not an error, it
+/// just means the file is smaller than `buf` (callers decide what that means).
+/// `Interrupted` is retried, as `read_exact` would do; any other error is
+/// propagated and the reader is left where it is.
+fn peek_from_start<R: Read + Seek>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0usize;
     while filled < buf.len() {
         match reader.read(&mut buf[filled..]) {
@@ -402,6 +425,14 @@ pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
         }
     }
     reader.seek(SeekFrom::Start(0))?;
+    Ok(filled)
+}
+
+/// Check whether the first 263 bytes of a reader contain the tar `ustar` magic
+/// at offset 257. Rewinds the reader to position 0 after the check.
+pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
+    let mut buf = [0u8; 263];
+    let filled = peek_from_start(reader, &mut buf)?;
     Ok(filled >= 263 && &buf[257..262] == b"ustar")
 }
 
@@ -417,16 +448,7 @@ pub(crate) fn is_tar<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
 /// implemented and stays a single entry.
 pub(crate) fn is_cpio<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
     let mut buf = [0u8; crate::format::cpio::MAGIC_LEN];
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        match reader.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    reader.seek(SeekFrom::Start(0))?;
+    let filled = peek_from_start(reader, &mut buf)?;
     Ok(filled == buf.len() && crate::format::cpio::is_supported_magic(&buf))
 }
 
@@ -502,19 +524,20 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
         // file. Do not "while we're here" this into a general re-dispatch.
         // Both checks are by content, never by file name.
         tmp.as_file_mut().seek(SeekFrom::Start(0))?;
-        let tar_detected = is_tar(tmp.as_file_mut())?;
-        let cpio_detected = !tar_detected && is_cpio(tmp.as_file_mut())?;
+        let inner_handler: Option<&dyn FormatHandler> = if is_tar(tmp.as_file_mut())? {
+            Some(&TarHandler)
+        } else if is_cpio(tmp.as_file_mut())? {
+            Some(&CpioHandler)
+        } else {
+            None
+        };
 
-        if tar_detected || cpio_detected {
+        if let Some(handler) = inner_handler {
             // Open the temp file as a seekable archive; TempBackedReader keeps
             // the temp file alive for as long as the reader lives.
             let temp_path = tmp.into_temp_path();
             let inner_src = Source::path(&temp_path)?;
-            let inner = if tar_detected {
-                TarHandler.open(inner_src, opts)?
-            } else {
-                CpioHandler.open(inner_src, opts)?
-            };
+            let inner = handler.open(inner_src, opts)?;
             return Ok(Box::new(TempBackedReader::new(inner, temp_path)));
         } else {
             // Plain compressed file — present as one entry.
@@ -881,8 +904,8 @@ mod tests {
             stem_without_compressor_ext(Path::new("hello.txt.lz")),
             "hello.txt"
         );
-        // `.lzma` must keep winning over `.lz` — it is listed first, and the
-        // loop takes the first suffix that matches.
+        // A `.lzma` name keeps its whole suffix: `.lz` is not a suffix of
+        // `.lzma`, so only the `.lzma` row can match it.
         assert_eq!(
             stem_without_compressor_ext(Path::new("hello.txt.lzma")),
             "hello.txt"

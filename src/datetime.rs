@@ -6,6 +6,15 @@
 
 use std::time::{Duration, SystemTime};
 
+/// Convert Unix seconds to `SystemTime`, treating 0 as "not recorded".
+///
+/// Most container formats store an mtime as plain seconds since the epoch and
+/// spell "no timestamp" as a zero field, so the zero check belongs here rather
+/// than in every caller.
+pub(crate) fn unix_secs_to_systime(secs: u64) -> Option<SystemTime> {
+    (secs != 0).then(|| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+}
+
 /// Convert a UTC civil date-time to `SystemTime`.
 ///
 /// Returns `None` for out-of-range fields or pre-epoch dates (so a crafted
@@ -46,6 +55,15 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unix_secs_zero_is_no_time() {
+        assert_eq!(unix_secs_to_systime(0), None);
+        assert_eq!(
+            unix_secs_to_systime(1),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+        );
+    }
 
     #[test]
     fn days_from_civil_epoch_and_known_date() {

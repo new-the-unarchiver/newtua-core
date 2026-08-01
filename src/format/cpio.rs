@@ -12,13 +12,14 @@
 //! cpio is sequential, so `open` makes one streaming pass, concatenating every
 //! regular-file body into a temp file and keeping per-entry offsets (`Scan`).
 
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use crate::archive::{
     ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
 };
+use crate::datetime::unix_secs_to_systime;
 use crate::encoding::decode_names;
 use crate::error::{Error, Result, io_err_to_corrupt};
 
@@ -69,13 +70,18 @@ impl FormatHandler for CpioHandler {
 
     fn open(&self, src: Source, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
         // cpio is a sequential streaming format; we can read from either source.
-        let mut reader: Box<dyn Read> = match src {
+        let raw: Box<dyn Read> = match src {
             Source::Seekable { mut inner, .. } => {
                 inner.seek(SeekFrom::Start(0))?;
                 inner
             }
             Source::Stream { inner, .. } => inner,
         };
+        // Both scanners walk the stream header by header — 110 bytes for newc,
+        // 76 plus the name for odc — and `Source` hands over an unbuffered
+        // file. Without this, a tree of 10 000 files costs tens of thousands of
+        // syscalls; bodies still go through `io::copy` and are unaffected.
+        let mut reader: Box<dyn Read> = Box::new(BufReader::with_capacity(64 * 1024, raw));
 
         // Pick the variant from the leading magic. A `Source::Stream` cannot be
         // rewound, so the magic is chained back in front of the rest.
@@ -83,15 +89,15 @@ impl FormatHandler for CpioHandler {
         reader.read_exact(&mut magic).map_err(io_err_to_corrupt)?;
         let stream: Box<dyn Read> = Box::new(Cursor::new(magic).chain(reader));
 
-        let scan = if &magic == MAGIC_NEWC {
-            scan_newc(stream)?
-        } else if &magic == MAGIC_ODC {
-            scan_odc(stream)?
-        } else {
-            return Err(Error::Corrupt(format!(
-                "unsupported cpio magic {:?}",
-                String::from_utf8_lossy(&magic)
-            )));
+        let scan = match &magic {
+            MAGIC_NEWC => scan_newc(stream)?,
+            MAGIC_ODC => scan_odc(stream)?,
+            _ => {
+                return Err(Error::Corrupt(format!(
+                    "unsupported cpio magic {:?}",
+                    String::from_utf8_lossy(&magic)
+                )));
+            }
         };
 
         finish(scan, opts)
@@ -122,12 +128,10 @@ struct Scan {
     metas: Vec<EntryMeta>,
 }
 
-/// Turn a Unix mtime into a `SystemTime`, treating 0 as "unset".
-fn mtime_to_system_time(mtime: u64) -> Option<SystemTime> {
-    if mtime != 0 {
-        Some(UNIX_EPOCH + Duration::from_secs(mtime))
-    } else {
-        None
+/// Drop the trailing NUL bytes cpio pads names and link targets with.
+fn trim_nuls(bytes: &mut Vec<u8>) {
+    while bytes.last() == Some(&0) {
+        bytes.pop();
     }
 }
 
@@ -155,7 +159,7 @@ fn scan_newc(reader: Box<dyn Read>) -> Result<Scan> {
         let mode = entry.mode();
         let file_size = entry.file_size() as u64;
         let name_str = entry.name().to_owned();
-        let modified = mtime_to_system_time(entry.mtime() as u64);
+        let modified = unix_secs_to_systime(entry.mtime() as u64);
 
         match mode & S_IFMT {
             S_IFREG => {
@@ -198,10 +202,7 @@ fn scan_newc(reader: Box<dyn Read>) -> Result<Scan> {
                         .to_writer(&mut target_bytes)
                         .map_err(io_err_to_corrupt)?,
                 );
-                // Trim trailing NUL if any.
-                while target_bytes.last() == Some(&0) {
-                    target_bytes.pop();
-                }
+                trim_nuls(&mut target_bytes);
                 raw_names.push(name_str.into_bytes());
                 metas.push(EntryMeta {
                     kind: KindRaw::Symlink(target_bytes),
@@ -295,22 +296,27 @@ fn odc_field(header: &[u8], span: (usize, usize), name: &str) -> Result<u64> {
         .ok_or_else(|| Error::Corrupt(format!("cpio odc: bad octal in {name} field")))
 }
 
-/// Read exactly `n` bytes, growing the buffer as they actually arrive.
+/// Move exactly `n` bytes from `reader` to `out`, or fail as truncated.
 ///
-/// `n` comes straight out of the archive, so it must never size an allocation
-/// on its own: the capacity hint is clamped and the `Vec` grows only as far as
-/// the stream really reaches. A short read is a truncated archive, not a
-/// silently short entry.
-fn read_exact_growing(reader: &mut dyn Read, n: u64, what: &str) -> Result<Vec<u8>> {
-    let cap = usize::try_from(n).unwrap_or(usize::MAX).min(64 * 1024);
-    let mut buf = Vec::with_capacity(cap);
-    let read = reader.take(n).read_to_end(&mut buf).map_err(Error::from)?;
-    if read as u64 != n {
+/// The one way this scanner crosses a record: names go to a `Vec`, bodies to
+/// the temp file, skipped records to `io::sink()`. `n` comes straight out of
+/// the archive, so it must never size an allocation on its own — `io::copy`
+/// grows the destination only as far as the stream really reaches, and a short
+/// read is a truncated archive, not a silently short entry. `what` names the
+/// piece in the error and is formatted only when there is an error to report.
+fn take_exact(
+    reader: &mut dyn Read,
+    n: u64,
+    out: &mut dyn Write,
+    what: std::fmt::Arguments<'_>,
+) -> Result<()> {
+    let moved = std::io::copy(&mut reader.take(n), out)?;
+    if moved != n {
         return Err(Error::Corrupt(format!(
-            "cpio odc: truncated {what} ({read} of {n} bytes)"
+            "cpio odc: truncated {what} ({moved} of {n} bytes)"
         )));
     }
-    Ok(buf)
+    Ok(())
 }
 
 /// Stream an odc archive; the counterpart of [`scan_newc`].
@@ -340,31 +346,28 @@ fn scan_odc(reader: Box<dyn Read>) -> Result<Scan> {
         if namesize == 0 {
             return Err(Error::Corrupt("cpio odc: zero-length name".into()));
         }
-        let mut name = read_exact_growing(&mut reader, namesize, "entry name")?;
+        let mut name = Vec::new();
+        take_exact(&mut reader, namesize, &mut name, format_args!("entry name"))?;
         // `namesize` counts the terminating NUL; drop it and any extra padding.
-        while name.last() == Some(&0) {
-            name.pop();
-        }
+        trim_nuls(&mut name);
 
         if name == b"TRAILER!!!" {
             break;
         }
 
-        let modified = mtime_to_system_time(mtime);
+        let modified = unix_secs_to_systime(mtime);
 
         match mode & S_IFMT {
             S_IFREG => {
                 let offset = temp.seek(SeekFrom::End(0))?;
-                // `filesize` is untrusted: stream it through `take` and check
-                // what actually arrived instead of trusting the header or
-                // reserving the claimed size up front.
-                let copied = std::io::copy(&mut (&mut reader).take(filesize), &mut temp)?;
-                if copied != filesize {
-                    return Err(Error::Corrupt(format!(
-                        "cpio odc: truncated body of {} ({copied} of {filesize} bytes)",
-                        String::from_utf8_lossy(&name)
-                    )));
-                }
+                // `filesize` is untrusted: stream it and check what actually
+                // arrived instead of trusting the header.
+                take_exact(
+                    &mut reader,
+                    filesize,
+                    &mut temp,
+                    format_args!("body of {}", String::from_utf8_lossy(&name)),
+                )?;
                 raw_names.push(name);
                 metas.push(EntryMeta {
                     kind: KindRaw::File,
@@ -377,7 +380,12 @@ fn scan_odc(reader: Box<dyn Read>) -> Result<Scan> {
             S_IFDIR => {
                 // Directories carry no body, but skip `filesize` anyway so a
                 // non-conforming writer cannot desynchronise the stream.
-                skip_body(&mut reader, filesize)?;
+                take_exact(
+                    &mut reader,
+                    filesize,
+                    &mut std::io::sink(),
+                    format_args!("record body"),
+                )?;
                 raw_names.push(name);
                 metas.push(EntryMeta {
                     kind: KindRaw::Dir,
@@ -389,10 +397,14 @@ fn scan_odc(reader: Box<dyn Read>) -> Result<Scan> {
             }
             S_IFLNK => {
                 // Symlink: the body is the link target.
-                let mut target = read_exact_growing(&mut reader, filesize, "symlink target")?;
-                while target.last() == Some(&0) {
-                    target.pop();
-                }
+                let mut target = Vec::new();
+                take_exact(
+                    &mut reader,
+                    filesize,
+                    &mut target,
+                    format_args!("symlink target"),
+                )?;
+                trim_nuls(&mut target);
                 raw_names.push(name);
                 metas.push(EntryMeta {
                     kind: KindRaw::Symlink(target),
@@ -405,7 +417,12 @@ fn scan_odc(reader: Box<dyn Read>) -> Result<Scan> {
             _ => {
                 // Special node (char/block device, fifo, socket) — skipped, as
                 // in the newc path.
-                skip_body(&mut reader, filesize)?;
+                take_exact(
+                    &mut reader,
+                    filesize,
+                    &mut std::io::sink(),
+                    format_args!("record body"),
+                )?;
             }
         }
     }
@@ -415,20 +432,6 @@ fn scan_odc(reader: Box<dyn Read>) -> Result<Scan> {
         raw_names,
         metas,
     })
-}
-
-/// Discard `n` bytes of body, failing if the stream ends first.
-fn skip_body(reader: &mut dyn Read, n: u64) -> Result<()> {
-    if n == 0 {
-        return Ok(());
-    }
-    let skipped = std::io::copy(&mut reader.take(n), &mut std::io::sink())?;
-    if skipped != n {
-        return Err(Error::Corrupt(format!(
-            "cpio odc: truncated record body ({skipped} of {n} bytes)"
-        )));
-    }
-    Ok(())
 }
 
 // ── Shared tail: names, kinds, reader ────────────────────────────────────────

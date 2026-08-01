@@ -14,7 +14,7 @@
 //!     snzip -c payload.tar > payload.tar.sz
 //! ```
 
-use newtua_core::archive::{FormatId, OpenOptions};
+use newtua_core::archive::{ArchiveReader, FormatId, OpenOptions};
 use newtua_core::detect::open;
 use std::io::Write;
 use std::path::Path;
@@ -23,6 +23,21 @@ fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name)
+}
+
+/// Write `bytes` to a temp file whose name ends in `suffix`, then open it.
+///
+/// The temp file is deleted as this returns, so it is meant for the damaged
+/// inputs below — the ones asserted to fail — not for a reader that goes on to
+/// read from its source.
+fn open_bytes(bytes: &[u8], suffix: &str) -> newtua_core::Result<Box<dyn ArchiveReader>> {
+    let mut tmp = tempfile::Builder::new()
+        .suffix(suffix)
+        .tempfile()
+        .expect("tempfile");
+    tmp.write_all(bytes).expect("write");
+    tmp.flush().expect("flush");
+    open(tmp.path(), &OpenOptions::default())
 }
 
 /// A single-file `.sz` opens as one entry named after the stripped filename.
@@ -83,14 +98,8 @@ fn truncated_dot_sz_errors() {
     // Keep the stream-identifier chunk (10 bytes) so detection still fires,
     // then cut the body in half: the frame decoder hits EOF mid-chunk.
     let cut = 10 + (full.len() - 10) / 2;
-    let mut tmp = tempfile::Builder::new()
-        .suffix(".sz")
-        .tempfile()
-        .expect("tempfile");
-    tmp.write_all(&full[..cut]).expect("write truncated");
-    tmp.flush().expect("flush");
 
-    let res = open(tmp.path(), &OpenOptions::default());
+    let res = open_bytes(&full[..cut], ".sz");
     assert!(res.is_err(), "truncated .sz must not open successfully");
 }
 
@@ -102,13 +111,7 @@ fn corrupt_dot_sz_errors() {
     for b in bytes.iter_mut().skip(10) {
         *b = 0xFF;
     }
-    let mut tmp = tempfile::Builder::new()
-        .suffix(".sz")
-        .tempfile()
-        .expect("tempfile");
-    tmp.write_all(&bytes).expect("write corrupt");
-    tmp.flush().expect("flush");
 
-    let res = open(tmp.path(), &OpenOptions::default());
+    let res = open_bytes(&bytes, ".sz");
     assert!(res.is_err(), "corrupt .sz must not open successfully");
 }

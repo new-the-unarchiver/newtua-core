@@ -44,14 +44,15 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::archive::{
     ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, ReadSeek,
     Source,
 };
+use crate::datetime::unix_secs_to_systime;
 use crate::encoding::decode_names;
 use crate::error::{Error, Result};
+use crate::path_safety::raw_path_escapes;
 
 // ── Header geometry ──────────────────────────────────────────────────────────
 
@@ -107,8 +108,8 @@ impl FormatHandler for WpressHandler {
 
         let file_len = inner.seek(SeekFrom::End(0))?;
         inner.seek(SeekFrom::Start(0))?;
-        let scan = scan(inner.as_mut(), file_len)?;
-        Ok(Box::new(build_reader(inner, scan, opts)))
+        let (raw_paths, records) = scan(inner.as_mut(), file_len)?;
+        Ok(Box::new(build_reader(inner, raw_paths, records, opts)))
     }
 }
 
@@ -116,9 +117,12 @@ impl FormatHandler for WpressHandler {
 
 /// One record's header, still as raw bytes (names are decoded later, once for
 /// the whole archive).
-struct RawHeader {
-    name: Vec<u8>,
-    prefix: Vec<u8>,
+///
+/// The two text fields borrow the caller's header block: they are only needed
+/// until the record's path has been joined, well before the block is refilled.
+struct RawHeader<'a> {
+    name: &'a [u8],
+    prefix: &'a [u8],
     size: u64,
     mtime: Option<u64>,
 }
@@ -144,8 +148,7 @@ fn text_field(field: &[u8]) -> Option<&[u8]> {
 /// writers pad with them); anything else is a parse failure, not a silent zero.
 /// An empty field yields `None`, which callers read as "unset".
 fn decimal_field(field: &[u8]) -> Option<Option<u64>> {
-    let digits = text_field(field)?;
-    let digits = trim_ascii_end(digits);
+    let digits = text_field(field)?.trim_ascii_end();
     if digits.is_empty() {
         return Some(None);
     }
@@ -161,19 +164,8 @@ fn decimal_field(field: &[u8]) -> Option<Option<u64>> {
         .map(Some)
 }
 
-fn trim_ascii_end(mut b: &[u8]) -> &[u8] {
-    while let Some((last, rest)) = b.split_last() {
-        if last.is_ascii_whitespace() {
-            b = rest;
-        } else {
-            break;
-        }
-    }
-    b
-}
-
 /// Parse a whole header block. `None` means "this is not a wpress header".
-fn parse_header(block: &[u8]) -> Option<RawHeader> {
+fn parse_header(block: &[u8]) -> Option<RawHeader<'_>> {
     debug_assert_eq!(block.len(), HEADER_LEN);
     let name = text_field(&block[NAME_OFF..NAME_OFF + NAME_LEN])?;
     if name.is_empty() || name.contains(&b'/') || name.contains(&b'\\') {
@@ -185,29 +177,34 @@ fn parse_header(block: &[u8]) -> Option<RawHeader> {
     let mtime = decimal_field(&block[MTIME_OFF..MTIME_OFF + MTIME_LEN])?;
     let prefix = text_field(&block[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN])?;
     Some(RawHeader {
-        name: name.to_vec(),
-        prefix: prefix.to_vec(),
+        name,
+        prefix,
         size,
         mtime,
     })
 }
 
 /// Per-entry data collected by the scan: where the body lives in the file.
+///
+/// The entry's raw path is collected alongside, in its own `Vec`, so it can be
+/// handed to `decode_names` by reference and then moved straight into
+/// `Entry::path_raw` without ever being cloned.
 struct Record {
-    raw_path: Vec<u8>,
     offset: u64,
     size: u64,
     mtime: Option<u64>,
 }
 
-/// Walk the record chain from byte 0 to the end marker.
+/// Walk the record chain from byte 0 to the end marker, returning the entries'
+/// raw paths and, parallel to them, where each body lives.
 ///
 /// Every length in this loop comes straight out of the file and is therefore
 /// untrusted: the declared body size is checked against the real file length
 /// **before** it is recorded, and every offset is advanced with `checked_add`.
 /// Nothing here is allocated to the declared size — bodies are never read at
 /// open time, only located.
-fn scan(src: &mut dyn ReadSeek, file_len: u64) -> Result<Vec<Record>> {
+fn scan(src: &mut dyn ReadSeek, file_len: u64) -> Result<(Vec<Vec<u8>>, Vec<Record>)> {
+    let mut raw_paths: Vec<Vec<u8>> = Vec::new();
     let mut records: Vec<Record> = Vec::new();
     let mut pos: u64 = 0;
     let mut block = vec![0u8; HEADER_LEN];
@@ -262,15 +259,15 @@ fn scan(src: &mut dyn ReadSeek, file_len: u64) -> Result<Vec<Record>> {
                 records.is_empty(),
                 format!(
                     "wpress: body of {} claims {} bytes but only {} remain",
-                    String::from_utf8_lossy(&header.name),
+                    String::from_utf8_lossy(header.name),
                     header.size,
                     file_len.saturating_sub(body_off)
                 ),
             );
         }
 
+        raw_paths.push(join_raw(header.prefix, header.name));
         records.push(Record {
-            raw_path: join_raw(&header.prefix, &header.name),
             offset: body_off,
             size: header.size,
             mtime: header.mtime,
@@ -285,7 +282,7 @@ fn scan(src: &mut dyn ReadSeek, file_len: u64) -> Result<Vec<Record>> {
         // magic to lean on there is no evidence this is a wpress archive.
         return Err(Error::UnknownFormat);
     }
-    Ok(records)
+    Ok((raw_paths, records))
 }
 
 /// A failure on the very first record means the `.wpress` guess did not hold up
@@ -324,56 +321,35 @@ fn join_raw(prefix: &[u8], name: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Whether a raw entry path leaves the extraction root.
-///
-/// Judged on the archive's exact bytes, never on the decoded name: decoding
-/// runs the bytes through a detected legacy charset, and a safety verdict must
-/// not depend on that guess. Callers use it to decide how `Entry::path` is
-/// built, so the danger survives into the path the orchestrator checks.
-fn raw_path_escapes(raw: &[u8]) -> bool {
-    if raw.first().is_some_and(|&b| b == b'/' || b == b'\\') {
-        return true;
-    }
-    raw.split(|&b| b == b'/' || b == b'\\')
-        .any(|seg| seg == b"..")
-}
-
-fn mtime_to_system_time(mtime: Option<u64>) -> Option<SystemTime> {
-    match mtime {
-        Some(0) | None => None,
-        Some(secs) => Some(UNIX_EPOCH + Duration::from_secs(secs)),
-    }
-}
-
 /// Turn the scan into a reader: decode all names in one pass (one encoding for
 /// the whole archive, as everywhere else in the crate), then build the entries.
 fn build_reader(
     inner: Box<dyn ReadSeek>,
+    raw_names: Vec<Vec<u8>>,
     records: Vec<Record>,
     opts: &OpenOptions,
 ) -> WpressReader {
-    let raw_names: Vec<Vec<u8>> = records.iter().map(|r| r.raw_path.clone()).collect();
     let names = decode_names(&raw_names, opts.encoding_override.as_deref());
 
     let mut entries = Vec::with_capacity(records.len());
     let mut bodies = Vec::with_capacity(records.len());
-    for (i, rec) in records.into_iter().enumerate() {
+    for (i, (raw_path, rec)) in raw_names.into_iter().zip(records).enumerate() {
         // For an escaping path we do not trust the decoded form: the path is
         // rendered straight from the raw bytes so the `..` components reach
         // `safe_join` verbatim and the entry is refused at extraction time.
-        let path = if raw_path_escapes(&rec.raw_path) {
-            PathBuf::from(String::from_utf8_lossy(&rec.raw_path).into_owned())
+        let path = if raw_path_escapes(&raw_path) {
+            PathBuf::from(String::from_utf8_lossy(&raw_path).into_owned())
         } else {
             PathBuf::from(&names[i])
         };
         entries.push(Entry {
-            path_raw: rec.raw_path,
+            path_raw: raw_path,
             path,
             kind: EntryKind::File,
             size: rec.size,
             mode: None,
             is_encrypted: false,
-            modified: mtime_to_system_time(rec.mtime),
+            modified: rec.mtime.and_then(unix_secs_to_systime),
         });
         bodies.push((rec.offset, rec.size));
     }

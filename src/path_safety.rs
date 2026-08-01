@@ -22,6 +22,21 @@ pub fn safe_join(dest_root: &Path, entry_path: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// Whether a raw entry path leaves the extraction root.
+///
+/// Judged on the archive's exact bytes, never on the decoded name: decoding
+/// runs the bytes through a detected legacy charset, and a safety verdict must
+/// not depend on that guess. Callers use it to decide how `Entry::path` is
+/// built, so the danger survives into the path the orchestrator checks with
+/// [`safe_join`].
+pub(crate) fn raw_path_escapes(raw: &[u8]) -> bool {
+    if raw.first().is_some_and(|&b| b == b'/' || b == b'\\') {
+        return true;
+    }
+    raw.split(|&b| b == b'/' || b == b'\\')
+        .any(|seg| seg == b"..")
+}
+
 /// Validate that a symlink placed at `dest_root/link_rel` and pointing to
 /// `target` resolves (lexically) to a location inside `dest_root`.
 ///
