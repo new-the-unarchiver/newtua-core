@@ -46,6 +46,21 @@ impl FormatHandler for AppImageHandler {
             })?
             .to_path_buf();
 
+        // Type 1 first, before computing anything from the section-header
+        // table: its ELF runtime sits INSIDE the 32 KiB system area of an
+        // ISO 9660 image, so the embedded filesystem starts at offset 0 — the
+        // `e_shoff`-based math below locates the payload appended AFTER the
+        // runtime, which is how Type 2 works, not Type 1. Check the primary
+        // volume descriptor at its fixed absolute address (sector 16, 0x8001)
+        // directly against the file start. No `AI\x01` marker to lean on here:
+        // real-world Type 1 images predate that byte and ship it zeroed.
+        if read_at(&path, ISO_SIG_OFFSET, ISO_SIG.len())?.starts_with(ISO_SIG) {
+            // Filesystem already starts at offset 0 — open the original file
+            // directly, no carve needed.
+            let inner = IsoHandler.open(Source::path(&path)?, opts)?;
+            return Ok(Box::new(AppImageReader { inner }));
+        }
+
         let offset = appimage_fs_offset(&path)?;
 
         // Dispatch on the ACTUAL bytes at the offset — the AI type byte is
@@ -56,10 +71,11 @@ impl FormatHandler for AppImageHandler {
             return Ok(Box::new(AppImageReader { inner }));
         }
         if read_at(&path, offset + ISO_SIG_OFFSET, ISO_SIG.len())?.starts_with(ISO_SIG) {
-            // Type 1: the filesystem is a known ISO 9660 (CD001 confirmed just
-            // above), so carve [offset..EOF] to a temp file and hand it to
-            // IsoHandler directly — no need to re-run format detection.
-            // TempBackedReader keeps the temp alive and reports AppImage.
+            // Type 1, but laid out so the section-header math happens to land
+            // on the filesystem anyway: carve [offset..EOF] to a temp file and
+            // hand it to IsoHandler directly — no need to re-run format
+            // detection. TempBackedReader keeps the temp alive and reports
+            // AppImage.
             let temp_path = carve_to_temp(&path, offset)?;
             let inner = IsoHandler.open(Source::path(&temp_path)?, opts)?;
             return Ok(Box::new(TempBackedReader::with_format(

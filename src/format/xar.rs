@@ -10,6 +10,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use base64::Engine as _;
 use bzip2::read::BzDecoder;
 use flate2::read::ZlibDecoder;
 use xz2::read::XzDecoder;
@@ -84,6 +85,51 @@ fn child_text(node: roxmltree::Node, tag: &str) -> Option<String> {
         .find(|c| c.is_element() && c.has_tag_name(tag))
         .and_then(|c| c.text())
         .map(str::to_string)
+}
+
+/// Decode a base64-encoded file name to a real one.
+///
+/// Строго: без «починки» строки пробелами и без подбора кодовой страницы для
+/// байтов, которые не UTF-8. `xar` кладёт в base64 те самые байты имени в
+/// файловой системе, а живёт он на macOS и Linux, где имена в UTF-8; всё
+/// прочее — повод показать строку оглавления как есть, а не выдумать имя.
+/// `None` означает ровно это: раскодировать не вышло.
+fn decode_base64_name(text: &str) -> Option<String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// File name from `<file>`'s direct-child `<name>`, already decoded.
+///
+/// Системный `xar` кодирует не-ASCII имя в base64 и помечает элемент атрибутом
+/// `enctype="base64"`: `<name enctype="base64">0L/RgNC…</name>`. XADMaster
+/// такое имя не декодирует и показывает суррогат — для нас это нижняя граница,
+/// а не потолок: декодируем и отдаём настоящее имя. Проверка на обход каталогов
+/// у вызывающего идёт **после** этого шага, иначе `../` прошёл бы её насквозь,
+/// спрятанный в base64.
+///
+/// `None` — только когда `<name>` нет или он пуст: такой `<file>` пропускается.
+///
+/// Откат к строке оглавления как есть (то самое поведение XADMaster) в двух
+/// случаях, и ни в одном мы не гадаем:
+/// * base64 не разбирается или даёт не-UTF-8 байты — подставлять «свою»
+///   кодировку было бы гаданием, а ронять из-за одного имени открытие всего
+///   архива несоразмерно: остальные файлы читаются, а суррогатное имя всё
+///   равно проходит и проверку на обход каталогов, и замену разделителя;
+/// * `enctype` со значением, которого мы не знаем: расшифровать его нечем, и
+///   догадка тут хуже честной строки.
+fn file_name(file: roxmltree::Node) -> Option<String> {
+    let node = file
+        .children()
+        .find(|c| c.is_element() && c.has_tag_name("name"))?;
+    let text = node.text()?;
+    let decoded = match node.attribute("enctype") {
+        Some("base64") => decode_base64_name(text),
+        _ => None,
+    };
+    Some(decoded.unwrap_or_else(|| text.to_string()))
 }
 
 /// Parse a XAR mtime string (ISO 8601 like "2025-01-02T03:04:05" or
@@ -222,7 +268,12 @@ fn collect(
     }
 
     while let Some((file, parent)) = stack.pop() {
-        let name = match child_text(file, "name") {
+        // Имя приходит уже раскодированным: `<name enctype="base64">` разбирает
+        // `file_name`. Порядок здесь — суть всей этой ветки: сначала
+        // декодирование, только потом проверка ниже. Проверять до него значило
+        // бы пропустить `../../etc/passwd`, закодированный в base64, — ровно то
+        // «отмывание» обхода каталогов, от которого предостерегает CLAUDE.md.
+        let name = match file_name(file) {
             Some(n) => n,
             // A `<file>` without a `<name>` is malformed; skip it.
             None => continue,
@@ -247,6 +298,17 @@ fn collect(
         }) {
             continue;
         }
+        // Последний рубеж: `/` внутри одного имени. Оглавление даёт по одному
+        // компоненту пути на `<file>`, разделителю взяться неоткуда, — но если
+        // он всё же там, пронести его как есть нельзя: `parent.join(&name)` на
+        // Unix прочтёт его как уровень вложенности и создаст лишний каталог.
+        // Обезвреживаем так же, как XADMaster: `/` → `:`. Достаётся это теперь
+        // в основном откату — строке base64, которую не удалось раскодировать
+        // (её алфавит включает `/`: `0L/RgNC...` → каталог `0L` + файл
+        // `RgNC...`), — и злонамеренному имени. Шаг именно последний, после
+        // декодирования и после проверки на обход каталогов: подмена до
+        // проверки спрятала бы `../` внутри одного компонента.
+        let name = name.replace('/', ":");
         let path = parent.join(&name);
         let kind_str = child_text(file, "type").unwrap_or_else(|| "file".to_string());
         let mode = child_text(file, "mode").and_then(|s| u32::from_str_radix(s.trim(), 8).ok());
@@ -307,6 +369,14 @@ fn collect(
         };
 
         entries.push(Entry {
+            // «Точные байты из архива», на которые по правилу проекта опираются
+            // проверки безопасности, — это байты уже раскодированного имени:
+            // base64 в оглавлении лишь конверт, а записать архив просит то, что
+            // внутри. Разойтись с `path` тут нечему: декодирование принимается,
+            // только когда даёт корректный UTF-8, иначе имя остаётся строкой
+            // оглавления, — поэтому приём `WpressHandler` (рисовать путь из
+            // сырых байтов, когда он убегает за пределы каталога) здесь не
+            // нужен: искажение имени, от которого он спасает, тут невозможно.
             path_raw: path.to_string_lossy().as_bytes().to_vec(),
             path: path.clone(),
             kind,
@@ -689,6 +759,105 @@ mod tests {
         let entries = ar.entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path.to_str(), Some("ok.txt"));
+    }
+
+    // ── base64-encoded names ──────────────────────────────────────────────────
+
+    /// The listed paths of a crafted TOC, in document order.
+    fn paths_of(xml: &str) -> Vec<String> {
+        let mut ar = open_bytes(build_xar(xml)).expect("open should succeed");
+        ar.entries()
+            .unwrap()
+            .iter()
+            .map(|e| e.path.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// `<name enctype="base64">` is decoded to the real name. The vector is the
+    /// one the system `xar` wrote into `tests/fixtures/base64_name.xar`.
+    #[test]
+    fn base64_name_is_decoded() {
+        let xml = "<xar><toc>\
+            <file id=\"1\"><name enctype=\"base64\">0L/RgNC40LLQtdGCLnR4dA==</name>\
+            <type>file</type></file></toc></xar>";
+        assert_eq!(paths_of(xml), vec!["привет.txt".to_string()]);
+    }
+
+    /// The point of decoding *before* the traversal check: an escape hidden in
+    /// base64 must be caught exactly like a plain-text one. If the order were
+    /// reversed, `Li4vZXZpbA==` would sail through the check and only
+    /// `safe_join` would stand between it and `/etc`.
+    #[test]
+    fn base64_hides_no_traversal() {
+        let xml = "<xar><toc>\
+            <file id=\"1\"><name enctype=\"base64\">Li4vZXZpbA==</name><type>file</type></file>\
+            <file id=\"2\"><name enctype=\"base64\">L2V0Yy9wYXNzd2Q=</name><type>file</type></file>\
+            <file id=\"3\"><name enctype=\"base64\">Li4=</name><type>directory</type>\
+            <file id=\"4\"><name>inside.txt</name><type>file</type></file></file>\
+            <file id=\"5\"><name>ok.txt</name><type>file</type></file>\
+            </toc></xar>";
+        // `..`/`/etc/passwd` are skipped, and so is everything under the
+        // rejected `..` directory — only the honest name is listed.
+        assert_eq!(paths_of(xml), vec!["ok.txt".to_string()]);
+    }
+
+    /// A `/` that survives decoding is still not a level separator: the TOC
+    /// gives one path component per `<file>`, so it is neutralized like any
+    /// other, and cannot silently deepen the tree.
+    #[test]
+    fn decoded_separator_is_neutralized() {
+        // base64 of "a/b".
+        let xml = "<xar><toc>\
+            <file id=\"1\"><name enctype=\"base64\">YS9i</name><type>file</type></file>\
+            </toc></xar>";
+        assert_eq!(paths_of(xml), vec!["a:b".to_string()]);
+    }
+
+    /// A name we cannot decode falls back to the TOC string as written (what
+    /// XADMaster shows for *every* encoded name) instead of failing the open:
+    /// one odd name must not cost the caller the whole archive. The fallback
+    /// still goes through the separator replacement, so its base64 `/` cannot
+    /// split off a directory either.
+    #[test]
+    fn undecodable_base64_name_falls_back_to_the_toc_string() {
+        // Not base64 at all.
+        let xml = "<xar><toc>\
+            <file id=\"1\"><name enctype=\"base64\">not base64!!</name><type>file</type></file>\
+            </toc></xar>";
+        assert_eq!(paths_of(xml), vec!["not base64!!".to_string()]);
+
+        // Valid base64, but the bytes are not UTF-8 ("A\xff"): we do not guess
+        // a code page for them.
+        let xml = "<xar><toc>\
+            <file id=\"1\"><name enctype=\"base64\">Qf8=</name><type>file</type></file>\
+            </toc></xar>";
+        assert_eq!(paths_of(xml), vec!["Qf8=".to_string()]);
+
+        // The `/` of an undecodable base64 string is still neutralized.
+        let xml = "<xar><toc>\
+            <file id=\"1\"><name enctype=\"base64\">0L/Rg!</name><type>file</type></file>\
+            </toc></xar>";
+        assert_eq!(paths_of(xml), vec!["0L:Rg!".to_string()]);
+    }
+
+    /// `base64` is the only `enctype` the format uses. An unknown value is
+    /// treated as unknown — the string is shown as written, never decoded on a
+    /// guess.
+    #[test]
+    fn unknown_enctype_is_not_decoded() {
+        let xml = "<xar><toc>\
+            <file id=\"1\"><name enctype=\"rot13\">0L/RgNC40LLQtdGCLnR4dA==</name>\
+            <type>file</type></file></toc></xar>";
+        assert_eq!(paths_of(xml), vec!["0L:RgNC40LLQtdGCLnR4dA==".to_string()]);
+    }
+
+    /// A plain (unencoded) name is untouched — decoding is opt-in per element.
+    #[test]
+    fn plain_name_is_not_base64_decoded() {
+        let xml = "<xar><toc>\
+            <file id=\"1\"><name>0L/RgNC40LLQtdGCLnR4dA==</name><type>file</type></file>\
+            </toc></xar>";
+        assert_eq!(paths_of(xml), vec!["0L:RgNC40LLQtdGCLnR4dA==".to_string()]);
     }
 
     /// A drive letter is an escape only where drives exist. On Unix `C:` is an

@@ -251,6 +251,155 @@ fn multi_entry_on_demand_extraction() {
 // it cleanly. If the guard regresses, this test OOMs/aborts instead of failing.
 const MALFORMED_OOM_FIXTURE: &[u8] = include_bytes!("../fixtures/malformed_oom.7z");
 
+// no_stream_entries.7z: эталон из корпуса, собранный настоящим упаковщиком.
+// Внутри — два каталога (записи БЕЗ потока данных) и четыре файла:
+//   nested/, nested/deep/, hello.txt, привет.txt, nested/deep/tiny.bin, big.txt
+// Именно записи без потока ломали выбор по позиции: `for_each_entries` отдаёт
+// сперва файлы с данными, потом каталоги, а заголовок хранит другой порядок.
+// Регрессия D1: в big.txt попадало содержимое tiny.bin, в hello.txt —
+// содержимое привет.txt, и всё это БЕЗ ошибки.
+const NO_STREAM_FIXTURE: &[u8] = include_bytes!("../fixtures/no_stream_entries.7z");
+
+/// sha256 в виде строки — сверяем содержимое, а не только имена и количество:
+/// проверка «записей столько, ошибок нет» этот дефект и пропустила в релиз.
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// Путь внутри архива, размер, sha256 содержимого.
+const NO_STREAM_EXPECTED: &[(&str, usize, &str)] = &[
+    (
+        "hello.txt",
+        15,
+        "d8bfbcfd8b1bce61f3abbd65de37d13f354e2c73c7a6d5f362353317c2ffce42",
+    ),
+    (
+        "привет.txt",
+        22,
+        "f509c862e2613c56f3b322e4b080e013ece8259a549ffd81113a335b67a840ca",
+    ),
+    (
+        "nested/deep/tiny.bin",
+        256,
+        "1455fb514dcd6af818919b765a99cbebf7d91d7994341cc1d4f350ecc65e0a36",
+    ),
+    (
+        "big.txt",
+        65_529,
+        "df1515a6fad9ce2f8141ff97f1e14ca7873ca48e50a95185efd64a55df216bec",
+    ),
+];
+
+/// Главный тест дефекта D1: содержимое КАЖДОГО файла эталона должно совпасть
+/// побайтно (сверяем sha256), когда в архиве есть записи без потока данных.
+#[test]
+fn no_stream_entries_read_entry_returns_own_content() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), NO_STREAM_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = SevenZHandler.open(src, &OpenOptions::default()).unwrap();
+
+    let entries = ar.entries().unwrap().to_vec();
+    assert_eq!(entries.len(), 6, "ожидались 4 файла и 2 каталога");
+
+    for (path, size, sha) in NO_STREAM_EXPECTED {
+        let idx = entries
+            .iter()
+            .position(|e| e.path == Path::new(path))
+            .unwrap_or_else(|| panic!("запись {path} не найдена"));
+        assert_eq!(entries[idx].size, *size as u64, "{path}: размер в описи");
+
+        let mut out = Vec::new();
+        ar.read_entry(idx, &mut out).unwrap();
+        assert_eq!(out.len(), *size, "{path}: прочитано байт");
+        assert_eq!(
+            sha256_hex(&out),
+            *sha,
+            "{path}: прочитано содержимое ДРУГОЙ записи"
+        );
+    }
+
+    // Каталоги остаются каталогами и не приносят чужих байтов.
+    for dir in ["nested", "nested/deep"] {
+        let e = entries
+            .iter()
+            .find(|e| e.path == Path::new(dir))
+            .unwrap_or_else(|| panic!("каталог {dir} не найден"));
+        assert!(e.is_dir(), "{dir} должен быть каталогом");
+    }
+}
+
+/// То же самое, но через полную распаковку на диск: то, что попадает в файлы,
+/// обязано совпадать с эталоном — именно этот путь и подменял данные молча.
+#[cfg(unix)]
+#[test]
+fn no_stream_entries_extract_all_writes_correct_content() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), NO_STREAM_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = SevenZHandler.open(src, &OpenOptions::default()).unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    extract_all(
+        &mut *ar,
+        &mut ExtractOptions {
+            dest: dest.path().to_path_buf(),
+            wrapper_name: None,
+            strict: true,
+            preserve: false,
+            selection: None,
+            progress: None,
+            keep_macos_metadata: false,
+        },
+    )
+    .unwrap();
+
+    for (path, size, sha) in NO_STREAM_EXPECTED {
+        let on_disk = dest.path().join(path);
+        let data = std::fs::read(&on_disk)
+            .unwrap_or_else(|e| panic!("{path} не распакован: {e} ({on_disk:?})"));
+        assert_eq!(data.len(), *size, "{path}: размер на диске");
+        assert_eq!(sha256_hex(&data), *sha, "{path}: на диск легли чужие байты");
+    }
+    assert!(dest.path().join("nested/deep").is_dir());
+}
+
+/// Символьная ссылка ищется тем же ключом. В symlink.7z записей без потока нет,
+/// поэтому сама по себе она не ломалась, — тест закрепляет, что переход на поиск
+/// по имени её не сломал: цель читается у ссылки, а не у соседней записи.
+#[cfg(unix)]
+#[test]
+fn symlink_target_read_by_name_not_position() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), include_bytes!("../fixtures/symlink.7z")).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = SevenZHandler.open(src, &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap().to_vec();
+
+    let slink = entries
+        .iter()
+        .find(|e| e.path == Path::new("slink"))
+        .expect("slink не найден");
+    assert_eq!(
+        slink.kind,
+        EntryKind::Symlink {
+            target: std::path::PathBuf::from("target.txt"),
+        }
+    );
+
+    // И обычный сосед по архиву читается своим содержимым, а не содержимым ссылки.
+    let idx = entries
+        .iter()
+        .position(|e| e.path == Path::new("target.txt"))
+        .expect("target.txt не найден");
+    let mut out = Vec::new();
+    ar.read_entry(idx, &mut out).unwrap();
+    assert_eq!(out.len() as u64, entries[idx].size);
+    assert_ne!(out, b"target.txt", "прочитано тело ссылки вместо файла");
+}
+
 #[test]
 fn malformed_header_is_rejected_not_oom() {
     use newtua_core::Error;
