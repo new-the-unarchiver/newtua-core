@@ -2,7 +2,7 @@
 name = "newtua-core"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.93"
 license = "LGPL-3.0-or-later"
 description = "Archive extraction engine: lists and extracts over 50 formats entirely in-process, with no subprocess fallbacks. Extract only — never creates archives."
 readme = "README.md"
