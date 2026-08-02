@@ -1,4 +1,4 @@
-//! APFS integration tests (#21c). Two fixtures:
+//! APFS integration tests (#21c). Three fixtures:
 //!
 //! - `apfs_zlib.dmg` — a UDIF DMG wrapping an APFS volume (`hdiutil -fs APFS
 //!   -format UDZO`), holding `hello.txt`/`sub/nested.txt`. Proves the DMG
@@ -10,6 +10,13 @@
 //!   `crates/apfs-core/tests/data/README.md`, fixture `apfs_content.bin`).
 //!   Covers the standalone handler, decmpfs, and symlinks — content already
 //!   cross-checked there against `fls`/`istat`/`shasum`/`readlink`.
+//! - `apfs_decmpfs.img` — a carve of the corpus reference `apfs_decmpfs.dmg`,
+//!   whose every file was compressed by `afsctool` on a real mounted volume.
+//!   It holds both storage forms of the `com.apple.decmpfs` xattr — embedded
+//!   for the two short files, spilled into its own stream for the two long
+//!   ones — which is the pair our own fixtures used to lack entirely. The
+//!   sizes it is checked against are the sizes of the payload files that went
+//!   *into* the image, so the oracle is construction, not our own reader.
 
 use std::path::Path;
 
@@ -121,6 +128,19 @@ fn apfs_bare_opens_standalone_and_lists_known_files() {
 #[test]
 fn apfs_bare_decmpfs_file_reads_full_content() {
     let mut reader = open(&fixture("apfs_bare.img"), &OpenOptions::default()).expect("open");
+
+    // The listed size must be the logical one, not the inode's nothing. Same
+    // ground truth as the hash below: `apfs-core`'s README records the file as
+    // 180 000 bytes.
+    let listed = reader
+        .entries()
+        .expect("entries")
+        .iter()
+        .find(|e| e.path == Path::new("compressed.txt"))
+        .expect("compressed.txt present")
+        .size;
+    assert_eq!(listed, 180_000, "decmpfs file must not list as zero bytes");
+
     let body = body_of(reader.as_mut(), "compressed.txt");
     assert_eq!(body.len(), 180_000, "decmpfs must decode the FULL content");
 
@@ -212,4 +232,62 @@ fn nxsb_magic_but_corrupt_body_is_corrupt_not_panic() {
         .err()
         .expect("must error, not panic");
     assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+}
+
+// ── decmpfs sizes: the listing used to report zero for every compressed file ─
+
+/// Every file in `apfs_decmpfs.img` is decmpfs-compressed, so none of them has
+/// an ordinary data stream and the inode reports no size at all. Until the
+/// logical size was taken from the decmpfs header instead, all four listed as
+/// zero bytes long while extracting correctly — a listing that contradicted the
+/// extraction.
+///
+/// The expected numbers are the sizes of the payload files the corpus fed to
+/// `afsctool`, not numbers this crate produced.
+#[test]
+fn apfs_decmpfs_sizes_match_the_uncompressed_payload() {
+    let mut reader =
+        open(&fixture("apfs_decmpfs.img"), &OpenOptions::default()).expect("open apfs_decmpfs.img");
+    assert_eq!(reader.format(), FormatId::Apfs);
+
+    // (path, size of the file that went into the image)
+    let expected: [(&str, u64); 4] = [
+        ("big.txt", 65_529),
+        ("привет.txt", 22),
+        ("nested/deep/tiny.bin", 256),
+        ("hello.txt", 15),
+    ];
+
+    let entries = reader.entries().expect("entries").to_vec();
+    for (name, want) in expected {
+        let entry = entries
+            .iter()
+            .find(|e| e.path == Path::new(name))
+            .unwrap_or_else(|| panic!("{name} present"));
+        assert_eq!(entry.kind, EntryKind::File);
+        assert_eq!(entry.size, want, "{name}: listed size");
+    }
+
+    // And the listing must agree with what extraction actually writes — that
+    // is the pair the defect broke.
+    for (name, want) in expected {
+        let body = body_of(reader.as_mut(), name);
+        assert_eq!(body.len() as u64, want, "{name}: extracted length");
+    }
+}
+
+/// A directory keeps a zero size even though its inode carries flags of its
+/// own: the size lookup must stay confined to files.
+#[test]
+fn apfs_decmpfs_directories_have_no_size() {
+    let mut reader = open(&fixture("apfs_decmpfs.img"), &OpenOptions::default()).expect("open");
+    let entries = reader.entries().expect("entries").to_vec();
+    for name in ["nested", "nested/deep"] {
+        let dir = entries
+            .iter()
+            .find(|e| e.path == Path::new(name))
+            .unwrap_or_else(|| panic!("{name} present"));
+        assert_eq!(dir.kind, EntryKind::Dir);
+        assert_eq!(dir.size, 0, "{name}");
+    }
 }

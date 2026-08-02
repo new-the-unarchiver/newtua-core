@@ -11,9 +11,10 @@
 //! `com.apple.decmpfs` xattr: APFS keeps the value inside the record while it
 //! is small and spills anything past a couple of hundred bytes into its own
 //! stream, and the older code returned `None` for that form — silently yielding
-//! an empty file. `Entry::size` is a separate matter: a compressed file has no
-//! ordinary data stream, so the inode reports 0 and the logical size must come
-//! from `extent::data_size`.
+//! an empty file. `Entry::size` was a separate defect of the same shape: a
+//! compressed file has no ordinary data stream, so the inode reports nothing and
+//! every such entry listed as zero bytes long. The logical size comes from the
+//! decmpfs header instead (`extent::data_size`, via [`file_size`]).
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -54,6 +55,12 @@ const MAX_APFS_DEPTH: usize = 256;
 /// Cap on the total number of entries collected (allocation-bomb defense
 /// against a directory with a hostile fan-out).
 const MAX_APFS_ENTRIES: usize = 1_000_000;
+
+/// `UF_COMPRESSED` — the BSD file flag macOS sets on a transparently-compressed
+/// file. It is what makes the extra xattr lookup in [`file_size`] conditional:
+/// without it every ordinary file would pay a B-tree search for a
+/// `com.apple.decmpfs` record that is not there.
+const UF_COMPRESSED: u32 = 0x0000_0020;
 
 /// Reads APFS filesystems via the vendored `apfs-core` crate: a bare
 /// container (`.apfs`, as produced by `hdiutil create -layout NONE`) or, via
@@ -188,6 +195,30 @@ fn open_apfs_reader<R: Read + Seek + 'static>(mut reader: R) -> Result<Box<dyn A
     }))
 }
 
+/// The logical size of a file — the number of bytes `read_entry` will write.
+///
+/// For an ordinary file that is the inode's own `size`. A decmpfs file has no
+/// ordinary data stream at all, so its inode reports nothing and the real size
+/// lives in the `com.apple.decmpfs` header; `extent::data_size` reads it there.
+/// Asking unconditionally would be correct but costs an xattr B-tree search per
+/// file, hence the `UF_COMPRESSED` gate — the same flag the kernel itself uses
+/// to decide that a file is compressed.
+///
+/// A malformed decmpfs header fails the listing rather than falling back to the
+/// inode's zero: reporting a size we know to be wrong is the very defect this
+/// exists to close, and `read_entry` would fail on that file anyway.
+fn file_size<R: Read + Seek>(
+    reader: &mut R,
+    volume: &ApfsVolume,
+    inode: &apfs_core::inode::Inode,
+    block_size: usize,
+) -> Result<u64> {
+    if inode.bsd_flags & UF_COMPRESSED == 0 {
+        return Ok(inode.size.unwrap_or(0));
+    }
+    extent::data_size(reader, volume, inode, block_size).map_err(map_apfs_err)
+}
+
 /// Recursively list `parent_oid`'s children into `entries`/`node_ids` (parallel
 /// vectors), descending into subdirectories. Paths are relative (no root
 /// segment), matching hfsplus/squashfs/iso.
@@ -233,7 +264,7 @@ fn walk_tree<R: Read + Seek>(
             EntryKind::File
         };
         let size = if kind == EntryKind::File {
-            inode.size.unwrap_or(0)
+            file_size(reader, volume, &inode, block_size)?
         } else {
             0
         };
