@@ -186,10 +186,10 @@ pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &mut ExtractOptions) -> Res
     let mut dir_mtimes: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
 
     for (idx, entry) in entries.iter().enumerate() {
-        if let Some(set) = &selected {
-            if !set.contains(&idx) {
-                continue;
-            }
+        if let Some(set) = &selected
+            && !set.contains(&idx)
+        {
+            continue;
         }
         if !opts.keep_macos_metadata && crate::is_macos_metadata(&entry.path) {
             continue;

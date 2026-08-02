@@ -164,7 +164,7 @@ const LOOKUP_ENTRY_LEN: usize = 50;
 
 /// Parse a lookup-table resource (already decompressed) into its entries.
 pub(crate) fn parse_lookup_table(bytes: &[u8]) -> Result<Vec<LookupEntry>> {
-    if bytes.len() % LOOKUP_ENTRY_LEN != 0 {
+    if !bytes.len().is_multiple_of(LOOKUP_ENTRY_LEN) {
         return Err(Error::Corrupt(format!(
             "wim: lookup table size {} is not a multiple of {LOOKUP_ENTRY_LEN}",
             bytes.len()
@@ -336,7 +336,7 @@ fn filetime_to_systime(ticks: u64) -> Option<SystemTime> {
 
 /// Decode a raw UTF-16LE byte slice (no terminator included) to a `String`.
 fn decode_utf16le(b: &[u8]) -> Result<String> {
-    if b.len() % 2 != 0 {
+    if !b.len().is_multiple_of(2) {
         return Err(Error::Corrupt("wim: odd-length UTF-16LE name".into()));
     }
     let units: Vec<u16> = b
@@ -1144,7 +1144,7 @@ mod tests {
         if name_nbytes > 0 {
             b.extend_from_slice(&[0, 0]); // NUL terminator
         }
-        while b.len() % 8 != 0 {
+        while !b.len().is_multiple_of(8) {
             b.push(0);
         }
         let length = b.len() as u64;
@@ -1164,7 +1164,7 @@ mod tests {
         let mut b = Vec::new();
         b.extend_from_slice(&total_length.to_le_bytes());
         b.extend_from_slice(&num_entries.to_le_bytes());
-        while b.len() % 8 != 0 {
+        while !b.len().is_multiple_of(8) {
             b.push(0);
         }
         b

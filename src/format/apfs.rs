@@ -7,6 +7,13 @@
 //! feature) — the same navigation sequence as its own `vfs::ApfsFs::open`.
 //! Unlike the HFS+ handler, `extent::read_data` transparently decodes
 //! `decmpfs`-compressed files (zlib/LZVN/LZFSE), so no file reads back empty.
+//! That holds only from the `newtua-apfs` revision that reads a *stream-backed*
+//! `com.apple.decmpfs` xattr: APFS keeps the value inside the record while it
+//! is small and spills anything past a couple of hundred bytes into its own
+//! stream, and the older code returned `None` for that form — silently yielding
+//! an empty file. `Entry::size` is a separate matter: a compressed file has no
+//! ordinary data stream, so the inode reports 0 and the logical size must come
+//! from `extent::data_size`.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
