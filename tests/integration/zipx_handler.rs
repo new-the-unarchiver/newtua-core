@@ -11,7 +11,7 @@
 ///   python3 -c "open('/tmp/d64_payload.txt','wb').write(('deflate64 payload\n'*200).encode())"
 ///   7zz a -tzip -mm=Deflate64 crates/newtua-core/tests/fixtures/deflate64.zipx /tmp/d64_payload.txt
 use newtua_core::archive::FormatId;
-use newtua_core::{Error, OpenOptions, open};
+use newtua_core::{OpenOptions, open};
 use std::path::Path;
 
 fn fixture(name: &str) -> std::path::PathBuf {
@@ -100,24 +100,20 @@ fn deflate64_zipx_extracts_correct_bytes() {
     );
 }
 
-// ── PPMd → must surface as Error::Unsupported, not Corrupt or a panic ────────
+// ── PPMd happy path ───────────────────────────────────────────────────────────
+//
+// PPMd (method 98) decodes via the zip crate's "ppmd" feature (`ppmd-rust`,
+// already in the tree transitively via sevenz-rust2). The expected bytes below
+// were checked independently: `7zz x ppmd.zipx` was extracted out-of-band and
+// compared byte-for-byte against `"ppmd zipx payload\n".repeat(200)` — the
+// literal used here — not derived from our own decoder's output.
 
 #[test]
-fn ppmd_zipx_listing_succeeds() {
-    // Listing (entries()) must work even for PPMd — the header is readable.
+fn ppmd_zipx_lists_entries() {
     assert_lists_single_zip_entry("ppmd.zipx");
 }
 
 #[test]
-fn ppmd_zipx_read_entry_is_unsupported_not_corrupt() {
-    // PPMd (method 98) has no decoder in the zip crate; must return
-    // Error::Unsupported, never Error::Corrupt or a panic.
-    let mut ar = open(&fixture("ppmd.zipx"), &OpenOptions::default()).unwrap();
-    ar.entries().unwrap();
-    let mut out = Vec::new();
-    let err = ar.read_entry(0, &mut out).unwrap_err();
-    assert!(
-        matches!(err, Error::Unsupported { .. }),
-        "expected Error::Unsupported for PPMd, got: {err:?}"
-    );
+fn ppmd_zipx_extracts_correct_bytes() {
+    assert_extracts("ppmd.zipx", &"ppmd zipx payload\n".repeat(200).into_bytes());
 }
