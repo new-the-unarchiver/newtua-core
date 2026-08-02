@@ -29,10 +29,13 @@ xz2 = "0.1"
 # didn't support it at all. `ppmd-rust` is already in the tree transitively via
 # sevenz-rust2 0.21, licensed CC0-1.0 OR MIT-0 — no conflict with our
 # LGPL-3.0-or-later. The bump to 7 built clean with no code changes elsewhere.
-# `legacy-zip` (Shrink/Reduce/Implode — methods 1 and 2–6) stays OFF on
-# purpose: we have not one sample archive using those methods, and shipping a
-# decoder whose output we cannot check against anything is worse than not
-# having it.
+# `legacy-zip` (Shrink/Reduce/Implode — methods 1 and 2–6) stays OFF for now,
+# as a matter of priority rather than of evidence: real PKZIP 1989/1990
+# archives using all three now exist in the reference corpus, and for Shrink
+# and Implode a foreign reader (`unzip`, `7zz`) unpacks them with matching
+# CRCs, so turning the feature on would be measurable. Reduce has no such
+# confirmation yet. Today we open and list these archives and refuse the
+# members with a clean `Unsupported` — never a corrupt read.
 # One thing the changelog does not announce: between 2.4.2 and 7.2.0 the XZ
 # decoder behind this crate changed twice (xz2 → liblzma → lzma_rust2, a pure
 # Rust one). Method 14 (LZMA) we decode ourselves, but XZ we hand over whole,

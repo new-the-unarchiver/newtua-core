@@ -51,6 +51,15 @@ const S_IFLNK: u16 = 0xA000;
 /// protects a single `list_dir`/`load_inode` B-tree descent against a cyclic
 /// *node* graph, but not the *directory* graph our own recursion walks — a
 /// crafted image could still nest `A/B/A/B/…` DIR_RECs forever without this.
+///
+/// The number is measured, not borrowed. Probing the address of a local in
+/// [`walk_tree`] at successive depths of an unoptimised build gives a frame of
+/// exactly 2944 bytes, so the cap costs at most 736 KiB of stack — comfortably
+/// inside the 2 MiB a spawned Rust thread gets by default, let alone the 8 MiB
+/// of a main thread. This is why it is not ISO's 32: `iso.rs` measured a frame
+/// near 12 KiB, where 256 levels would have overflowed long before the cap
+/// fired and the cap would have been decoration. Same reasoning, different
+/// arithmetic — re-measure before changing either.
 const MAX_APFS_DEPTH: usize = 256;
 /// Cap on the total number of entries collected (allocation-bomb defense
 /// against a directory with a hostile fan-out).
