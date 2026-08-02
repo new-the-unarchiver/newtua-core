@@ -16,7 +16,7 @@ use crate::format::{
     SqueezeHandler, StuffIt5Handler, StuffItHandler, StuffItXHandler, TarHandler, WarcHandler,
     WimHandler, WpressHandler, XarHandler, ZipBundleHandler, ZipHandler, ZooHandler, bundle,
 };
-use crate::volume::{ConcatReader, volume_members};
+use crate::volume::{ConcatReader, join_split_zip, split_zip_members, volume_members};
 
 /// Returns the full handler registry in priority order.
 pub fn registry() -> Vec<Box<dyn FormatHandler>> {
@@ -620,7 +620,13 @@ pub(crate) fn open_single(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Arc
 ///    If more than one member exists, concatenate all members into a temp file
 ///    and open the reconstructed archive from the temp path. The temp file is
 ///    kept alive via [`TempBackedReader`] until the reader is dropped.
-/// 2. Otherwise (or when `.001` has no siblings), open the file directly.
+/// 2. If `path` ends with `.zip` and a `.z01` sibling exists, it is a `zip -s`
+///    split archive whose entry point is the LAST volume (the central
+///    directory lives there). The volumes are concatenated into a temp file and
+///    the directory's per-volume offsets are rewritten to absolute ones — the
+///    `zip` crate cannot read a multi-disk archive itself. Kept alive by
+///    [`TempBackedReader`], same as above.
+/// 3. Otherwise (or when `.001` has no siblings), open the file directly.
 ///    Within direct open:
 ///
 ///    - If a compression wrapper is detected (gzip/bzip2/xz), decompress to a
@@ -660,6 +666,23 @@ pub fn open(path: &Path, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
             return Ok(Box::new(TempBackedReader::new(inner, temp_path)));
         }
         // Exactly 1 member (the .001 file itself, no siblings) — open normally.
+    }
+
+    // Тома `zip -s`: `имя.z01`, `имя.z02`, …, и последним `имя.zip`. Точка
+    // входа здесь — последний файл, а не первый: центральный каталог пишется в
+    // конце, то есть в `.zip`. Отдельная ветка именно поэтому, а не
+    // продолжение схемы `.001` выше.
+    if let Some(members) = split_zip_members(path) {
+        // `None` — рядом лежал посторонний `.z01`, а сам архив однотомный;
+        // тогда просто открываем его как обычно.
+        if let Some(temp_path) = join_split_zip(&members)? {
+            // Мимо `open_single` намеренно: формат тут уже известен, а склеенный
+            // файл начинается с четырёхбайтовой метки разбиения `PK\x07\x08`
+            // (по APPNOTE она стоит в начале первого тома, и смещения записей
+            // её уже учитывают), так что по магии его никто бы не опознал.
+            let inner = ZipHandler.open(Source::path(&temp_path)?, opts)?;
+            return Ok(Box::new(TempBackedReader::new(inner, temp_path)));
+        }
     }
 
     open_single(path, opts)
