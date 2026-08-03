@@ -75,19 +75,7 @@ pub(crate) fn mac_date_to_systime(secs: u32) -> Option<SystemTime> {
 /// **local time**: MS-DOS knew nothing of timezones and stored the clock on the
 /// wall, so this reproduces the hour the file's author saw.
 pub(crate) fn dos_date_to_systime(date: u16, time: u16) -> Option<SystemTime> {
-    if date == 0 {
-        return None;
-    }
-    let year = 1980 + i32::from(date >> 9);
-    let month = u32::from((date >> 5) & 0x0F);
-    let day = u32::from(date & 0x1F);
-    let hour = u64::from(time >> 11);
-    let min = u64::from((time >> 5) & 0x3F);
-    let sec = u64::from(time & 0x1F) * 2;
-    if hour > 23 || min > 59 || sec > 59 {
-        return None;
-    }
-    crate::datetime::local_civil_to_systime(year, month, day, hour, min, sec)
+    crate::datetime::dos_words_to_systime(date, time)
 }
 
 /// Convert Zoo's MS-DOS date/time pair using the timezone the packer recorded

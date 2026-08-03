@@ -298,7 +298,14 @@ impl FormatHandler for SevenZHandler {
                     size: file.size(),
                     mode,
                     is_encrypted,
-                    modified: None,
+                    // The flag has to be consulted: in 7z the timestamp is
+                    // optional, and the raw field of an entry that carries none
+                    // reads as the year 1601, not as "unknown". Stamping today's
+                    // date on a file is bad; stamping 1601 is worse.
+                    modified: file
+                        .has_last_modified_date
+                        .then(|| u64::from(file.last_modified_date()))
+                        .and_then(crate::datetime::filetime_to_systime),
                     is_resource_fork: false,
                 }
             })

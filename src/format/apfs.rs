@@ -283,7 +283,11 @@ fn walk_tree<R: Read + Seek>(
             path: PathBuf::from(&rel_path),
             kind,
             size,
-            mode: None,
+            // The inode's mode, whole — the type bits above are read from the
+            // same field, and `extract.rs::apply_mode` masks them off. Without
+            // this a closed directory (0700) came out public and a script lost
+            // its execute bit.
+            mode: Some(u32::from(inode.mode)),
             is_encrypted: false,
             modified: apfs_ns_to_systime(inode.mod_time),
             is_resource_fork: false,

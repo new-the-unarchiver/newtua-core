@@ -291,3 +291,36 @@ fn apfs_decmpfs_directories_have_no_size() {
         assert_eq!(dir.size, 0, "{name}");
     }
 }
+
+// ── POSIX permissions ────────────────────────────────────────────────────────
+
+/// The inode's mode reaches `Entry`. It used to be dropped even though the same
+/// field was already being read one line above, to tell a directory from a
+/// symlink — so a closed directory came out public and a script lost its
+/// execute bit.
+///
+/// The expected values are macOS's own, read from the mounted image:
+///   hdiutil attach -nobrowse -readonly tests/fixtures/apfs_zlib.dmg
+///   stat -f '%Sp %N' /Volumes/TEST/…
+/// which reports `drwxr-xr-x` for `sub` and `-rw-r--r--` for the two files.
+#[test]
+fn apfs_reports_posix_modes() {
+    let mut reader = open(&fixture("apfs_zlib.dmg"), &OpenOptions::default()).expect("open");
+    let entries = reader.entries().expect("entries").to_vec();
+
+    let mode_of = |name: &str| {
+        entries
+            .iter()
+            .find(|e| e.path == Path::new(name))
+            .unwrap_or_else(|| panic!("{name} missing: {entries:#?}"))
+            .mode
+    };
+
+    assert_eq!(mode_of("sub").map(|m| m & 0o7777), Some(0o755));
+    assert_eq!(mode_of("hello.txt").map(|m| m & 0o7777), Some(0o644));
+    assert_eq!(mode_of("sub/nested.txt").map(|m| m & 0o7777), Some(0o644));
+
+    // The type bits ride along, as with cpio, HFS+, ISO and WIM.
+    assert_eq!(mode_of("sub").map(|m| m & 0o170000), Some(0o040000));
+    assert_eq!(mode_of("hello.txt").map(|m| m & 0o170000), Some(0o100000));
+}

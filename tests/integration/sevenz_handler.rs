@@ -412,3 +412,58 @@ fn malformed_header_is_rejected_not_oom() {
         Err(e) => panic!("expected Corrupt, got {e:?}"),
     }
 }
+
+// ── Timestamps ───────────────────────────────────────────────────────────────
+
+const META_FIXTURE: &[u8] = include_bytes!("../fixtures/meta.7z");
+
+fn open_meta() -> Box<dyn newtua_core::ArchiveReader> {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), META_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    SevenZHandler.open(src, &OpenOptions::default()).unwrap()
+}
+
+/// 7z stores the modification time as a Windows FILETIME — an absolute instant,
+/// so this is the same answer in any timezone. `unar` extracts `meta.7z` to a
+/// file stamped 2026-06-21 01:45:04 UTC; we must agree to the second.
+#[test]
+fn sevenz_reports_the_stored_modification_time() {
+    let mut ar = open_meta();
+    let e = &ar.entries().unwrap()[0];
+    let secs = e
+        .modified
+        .expect("meta.7z carries a timestamp")
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("post-epoch")
+        .as_secs();
+    assert_eq!(secs, 1_782_006_304, "2026-06-21T01:45:04Z expected");
+}
+
+/// The flag matters: in 7z the timestamp is optional, and the raw field of an
+/// entry that carries none reads as the year 1601, not as "unknown". A file
+/// stamped 1601 is worse than one with no date at all, so an entry without the
+/// flag must report `None` — never an instant from before the archive format
+/// existed.
+#[test]
+fn sevenz_never_reports_the_filetime_zero_point() {
+    for fixture in [META_FIXTURE, FIXTURE] {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), fixture).unwrap();
+        let src = Source::path(tmp.path()).unwrap();
+        let mut ar = SevenZHandler.open(src, &OpenOptions::default()).unwrap();
+        for e in ar.entries().unwrap() {
+            if let Some(t) = e.modified {
+                let secs = t
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("no entry may predate the Unix epoch")
+                    .as_secs();
+                assert!(
+                    secs > 946_684_800,
+                    "{:?}: {secs} looks like the FILETIME zero point leaking out",
+                    e.path
+                );
+            }
+        }
+    }
+}

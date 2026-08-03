@@ -111,3 +111,46 @@ fn verify_password_with_correct_password_is_ok() {
     let mut ar = RarHandler.open(src, &opts).unwrap();
     assert!(ar.verify_password().is_ok());
 }
+
+// ── Timestamps ───────────────────────────────────────────────────────────────
+
+/// RAR's date reaches the entry, read as local time.
+///
+/// `meta.rar` stores the packed MS-DOS pair `0x5CD538A6` — 2026-06-21 07:05:12
+/// on the wall, with no timezone attached, exactly like zip's identical field.
+/// So the instant depends on the machine running the test, and the assertions
+/// are stated in a way that does not: the wall clock has to land within a
+/// plausible zone offset of its UTC reading, and the seconds have to stay even.
+///
+/// `unar` reports 02:05:13Z for the same file — one second later — because RAR 5
+/// *also* stores an exact instant, which the DOS field cannot express and which
+/// we cannot reach; see the note in `format/rar.rs`.
+#[test]
+fn rar_reports_the_stored_modification_time_as_local() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), META_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let mut ar = RarHandler.open(src, &OpenOptions::default()).unwrap();
+    let e = &ar.entries().unwrap()[0];
+
+    let secs = e
+        .modified
+        .expect("meta.rar carries a timestamp")
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("post-epoch")
+        .as_secs();
+
+    // 2026-06-21T07:05:12Z — the wall clock read as if it were UTC. A real
+    // timezone moves this by at most fourteen hours in either direction.
+    let wall_as_utc: i64 = 1_782_025_512;
+    let offset = wall_as_utc - secs as i64;
+    assert!(
+        offset.abs() <= 14 * 3600,
+        "expected the stored wall clock read locally; off by {offset} s"
+    );
+    assert_eq!(
+        secs % 2,
+        0,
+        "the DOS field resolves to two seconds, so an odd second means a bug"
+    );
+}

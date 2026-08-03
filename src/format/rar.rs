@@ -58,13 +58,17 @@ impl FormatHandler for RarHandler {
 /// archive header reports that this file is the first (or a subsequent) volume
 /// in a multi-part RAR set, as indicated by `VolumeInfo::First` /
 /// `VolumeInfo::Subsequent` from the unrar crate.
+/// What the header walk collects per entry, before names are charset-decoded:
+/// size, is-a-directory, is-encrypted, POSIX mode, modification time.
+type RawMeta = (u64, bool, bool, Option<u32>, Option<std::time::SystemTime>);
+
 fn list_entries(
     path: &Path,
     password: Option<&str>,
     encoding: Option<&str>,
 ) -> Result<(Vec<Entry>, bool)> {
     let mut raw_names: Vec<Vec<u8>> = Vec::new();
-    let mut metas: Vec<(u64, bool, bool, Option<u32>)> = Vec::new();
+    let mut metas: Vec<RawMeta> = Vec::new();
 
     // The Iterator impl on OpenArchive<List, CursorBeforeHeader> yields Result<FileHeader>.
     // We use it for listing (payloads are skipped automatically).
@@ -117,11 +121,29 @@ fn list_entries(
         } else {
             None
         };
+        // `file_time` is the packed MS-DOS word pair — date in the high half,
+        // time in the low one. Wall-clock with no timezone, so it is read as
+        // local time, exactly as zip's identical field is.
+        //
+        // RAR 5 also stores the exact instant as a Windows FILETIME, and
+        // `libunrar` fills `RARHeaderDataEx::MtimeLow/High` with it — but that
+        // is unreachable from here. `unrar_sys`'s binding of the struct does not
+        // match the C layout past `RedirName`: reading `DirTarget` through it
+        // returns `0x656C6966`, the ASCII "file", i.e. a slice of some other
+        // field's memory. Fixing that means forking `unrar_sys` too, which is a
+        // decision of its own. Until then the two-second resolution of the DOS
+        // field is what we have, so an entry written at an odd second reads back
+        // one second earlier than `unar` reports it.
+        let modified = crate::datetime::dos_words_to_systime(
+            (header.file_time >> 16) as u16,
+            header.file_time as u16,
+        );
         metas.push((
             header.unpacked_size,
             header.is_directory(),
             header.is_encrypted(),
             mode,
+            modified,
         ));
     }
 
@@ -130,20 +152,22 @@ fn list_entries(
         .into_iter()
         .zip(metas)
         .enumerate()
-        .map(|(i, (raw, (size, is_dir, is_encrypted, mode)))| Entry {
-            path_raw: raw,
-            path: PathBuf::from(&names[i]),
-            kind: if is_dir {
-                EntryKind::Dir
-            } else {
-                EntryKind::File
+        .map(
+            |(i, (raw, (size, is_dir, is_encrypted, mode, modified)))| Entry {
+                path_raw: raw,
+                path: PathBuf::from(&names[i]),
+                kind: if is_dir {
+                    EntryKind::Dir
+                } else {
+                    EntryKind::File
+                },
+                size,
+                mode,
+                is_encrypted,
+                modified,
+                is_resource_fork: false,
             },
-            size,
-            mode,
-            is_encrypted,
-            modified: None,
-            is_resource_fork: false,
-        })
+        )
         .collect();
 
     Ok((entries, is_multivolume))

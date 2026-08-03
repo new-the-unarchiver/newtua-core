@@ -15,6 +15,33 @@ pub(crate) fn unix_secs_to_systime(secs: u64) -> Option<SystemTime> {
     (secs != 0).then(|| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
 }
 
+/// Convert the two packed MS-DOS timestamp words that zip, ARC, ARJ, Zoo, ALZ
+/// and RAR all store.
+///
+/// Layout: the date word is year-since-1980 in bits 15..9, month in 8..5, day
+/// in 4..0; the time word is hour in 15..11, minute in 10..5, and *half*
+/// seconds in 4..0 — the format only resolves to two seconds.
+///
+/// A zero date means "not recorded" and yields `None`, as does any field a
+/// clock could never show. The fields are read as **local time**: MS-DOS knew
+/// nothing of timezones and stored the clock on the wall, so this reproduces the
+/// hour the file's author saw.
+pub(crate) fn dos_words_to_systime(date: u16, time: u16) -> Option<SystemTime> {
+    if date == 0 {
+        return None;
+    }
+    let year = 1980 + i32::from(date >> 9);
+    let month = u32::from((date >> 5) & 0x0F);
+    let day = u32::from(date & 0x1F);
+    let hour = u64::from(time >> 11);
+    let min = u64::from((time >> 5) & 0x3F);
+    let sec = u64::from(time & 0x1F) * 2;
+    if hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+    local_civil_to_systime(year, month, day, hour, min, sec)
+}
+
 /// Windows `FILETIME` (100 ns intervals since 1601-01-01) → `SystemTime`.
 ///
 /// Unlike the DOS and classic-Mac fields below, a `FILETIME` is an absolute
