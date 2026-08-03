@@ -349,10 +349,57 @@ struct RawDentry {
     is_dir: bool,
     subdir_offset: u64,
     modified: Option<SystemTime>,
+    /// POSIX mode from the `UNIX Data` tagged item, type bits included.
+    /// `None` when the dentry carries no such item — see [`TAG_UNIX_DATA`].
+    mode: Option<u32>,
     /// SHA-1 of the unnamed data stream. All-zero means "no data" (empty
     /// file, or a directory, which never carries a stream).
     hash: [u8; 20],
     name: String,
+}
+
+/// Tag of wimlib's `UNIX Data` item: `uid(4) gid(4) mode(4) rdev(4)`, sixteen
+/// bytes, little-endian.
+///
+/// Tagged items live at the end of a dentry, past the names, each one
+/// `tag(4) length(4) data(length)` padded to eight bytes. `wimlib` writes this
+/// one when it captures a directory on Unix; **an image captured on Windows by
+/// `DISM` does not carry it** — there, permissions are Windows security
+/// descriptors, which have no single right answer in POSIX terms. So a mode is
+/// restored where the image states one, and left to the extractor's own default
+/// where it does not. That is a limit of the format, not a gap here.
+///
+/// The tag value is confirmed against a `wimlib`-captured reference: all five
+/// dentries of `wim_attrs.wim` carry it, and every mode inside matches what
+/// `wimlib-imagex dir --detailed` prints for the same entry — `040755` for the
+/// root, `040700` for `dir`, `0100755` for `run.sh`, `0100600` for
+/// `private.txt`, `0100644` for `dir/plain.txt`.
+const TAG_UNIX_DATA: u32 = 0x337D_D873;
+/// `uid(4) gid(4) mode(4) rdev(4)`.
+const UNIX_DATA_LEN: usize = 16;
+
+/// Scan the tagged items at the tail of a dentry for [`TAG_UNIX_DATA`] and
+/// return its `mode`. `items` starts at the first item and runs to the end of
+/// the dentry.
+///
+/// Every length here comes from the archive, so each step is bounds-checked and
+/// a malformed item ends the scan rather than being trusted: an unknown tag with
+/// a huge length must not send this walking off the end, and a zero-length one
+/// must not spin forever.
+fn unix_mode_from_tagged_items(items: &[u8]) -> Option<u32> {
+    let mut at = 0usize;
+    while at + 8 <= items.len() {
+        let tag = u32::from_le_bytes(items[at..at + 4].try_into().ok()?);
+        let len = u32::from_le_bytes(items[at + 4..at + 8].try_into().ok()?) as usize;
+        let data = items.get(at + 8..at + 8 + len)?;
+        if tag == TAG_UNIX_DATA && len >= UNIX_DATA_LEN {
+            return Some(u32::from_le_bytes(data[8..12].try_into().ok()?));
+        }
+        // Items are padded to an eight-byte boundary; `max(8)` guarantees
+        // forward progress even on a zero-length item.
+        at = at.checked_add((8 + len).next_multiple_of(8).max(8))?;
+    }
+    None
 }
 
 /// Security block length in bytes (rounded up to 8), to skip at the start of
@@ -429,20 +476,27 @@ fn parse_dirent(meta: &[u8], offset: usize) -> Result<Option<(RawDentry, usize)>
         String::new()
     };
     // Short (8.3) name: skipped, only its length matters to locate what
-    // follows (nothing does, in 20a's scope — streams beyond the unnamed one
-    // are ignored).
+    // follows — which, since this dentry's tagged items sit right after the
+    // names, is now something we do read.
     if short_name_nbytes > 0 {
         cursor = cursor
             .checked_add(short_name_nbytes + 2)
             .ok_or_else(|| Error::Corrupt("wim: dirent short name length overflow".into()))?;
     }
-    let _ = cursor; // remaining bytes up to `next` are padding / stream records we skip.
+
+    // Tagged items begin at the next eight-byte boundary and run to the end of
+    // the dentry. A dentry that stops before them simply has none.
+    let items_at = offset + cursor.next_multiple_of(8);
+    let mode = meta
+        .get(items_at..next)
+        .and_then(unix_mode_from_tagged_items);
 
     Ok(Some((
         RawDentry {
             is_dir: attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
             subdir_offset,
             modified: filetime_to_systime(last_write_time),
+            mode,
             hash,
             name,
         },
@@ -486,7 +540,9 @@ fn walk_children(
             path: path.clone(),
             kind,
             size,
-            mode: None,
+            // Whole, type bits included, as cpio, HFS+ and ISO also report it;
+            // `extract.rs::apply_mode` keeps only the permission bits.
+            mode: d.mode,
             is_encrypted: false,
             modified: d.modified,
             is_resource_fork: false,

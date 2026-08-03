@@ -167,3 +167,43 @@ fn wim_none_matches_wimlib_imagex_apply() {
         );
     }
 }
+
+// ── UNIX Data: POSIX permissions from a wimlib-captured image ────────────────
+
+/// `wim_modes.wim` was captured with `wimlib-imagex capture … --unix-data` from
+/// a tree whose modes are 0755 / 0700 / 0644 / 0600, so every dentry carries a
+/// `UNIX Data` tagged item. Before this was parsed, every entry came out with
+/// `mode: None` and an extracted `run.sh` lost its execute bit.
+///
+/// The expected values are `wimlib-imagex dir --detailed`'s own, for the same
+/// image.
+#[test]
+fn wim_reports_unix_modes_where_the_image_carries_them() {
+    let mut reader = open(&fixture("wim_modes.wim"), &OpenOptions::default()).expect("open");
+    let entries = reader.entries().expect("entries").to_vec();
+
+    let mode_of = |name: &str| {
+        entries
+            .iter()
+            .find(|e| e.path == Path::new(name))
+            .unwrap_or_else(|| panic!("{name} missing: {entries:#?}"))
+            .mode
+    };
+
+    assert_eq!(mode_of("dir"), Some(0o040700));
+    assert_eq!(mode_of("dir/plain.txt"), Some(0o100644));
+    assert_eq!(mode_of("private.txt"), Some(0o100600));
+    assert_eq!(mode_of("run.sh"), Some(0o100755), "the execute bit is lost");
+}
+
+/// The other half of the rule: an image captured without `--unix-data` — which
+/// is every image `DISM` writes on Windows — states no permissions, and `None`
+/// is the honest answer. Inventing a mode there would close a file the image
+/// never said was closed.
+#[test]
+fn wim_without_unix_data_reports_no_mode() {
+    let mut reader = open(&fixture("wim_none.wim"), &OpenOptions::default()).expect("open");
+    for e in reader.entries().expect("entries") {
+        assert_eq!(e.mode, None, "{:?}: mode invented out of nothing", e.path);
+    }
+}

@@ -146,7 +146,7 @@ would be new work, not a repair.
 | `Warc` | `.warc`/`.warc.gz` |
 | `Squashfs` | `.squashfs`/`.sfs` |
 | `AppImage` | AppImage (ELF runtime + appended SquashFS or ISO 9660) |
-| `Wim` | `.wim`/`.esd`/`.swm` (Windows imaging format) |
+| `Wim` | `.wim`/`.esd`/`.swm` (Windows imaging format). POSIX permissions are restored from the `UNIX Data` item `wimlib` writes when it captures on Unix; an image captured on Windows by `DISM` carries Windows security descriptors instead, which have no single right answer in POSIX terms, so files from one come out with the extractor's own default mode |
 | `HfsPlus` | `.hfs`/`.hfsplus`/`.hfsx` (HFS+/HFSX volumes, incl. `decmpfs`) |
 | `Dmg` | `.dmg` (Apple Disk Image / UDIF container) |
 | `Apfs` | Apple File System, bare container or embedded in a DMG, incl. `decmpfs` |
