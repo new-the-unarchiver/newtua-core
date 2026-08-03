@@ -19,6 +19,7 @@ fn e(path: &str, is_dir: bool) -> newtua_core::Entry {
         mode: None,
         is_encrypted: false,
         modified: None,
+        is_resource_fork: false,
     }
 }
 

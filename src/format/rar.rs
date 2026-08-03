@@ -142,6 +142,7 @@ fn list_entries(
             mode,
             is_encrypted,
             modified: None,
+            is_resource_fork: false,
         })
         .collect();
 

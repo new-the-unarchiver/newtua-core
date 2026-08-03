@@ -171,6 +171,7 @@ pub(crate) fn open_squashfs(path: &Path, offset: u64) -> Result<Box<dyn ArchiveR
             mode: Some(u32::from(node.header.permissions)),
             is_encrypted: false,
             modified: mtime_to_systime(node.header.mtime),
+            is_resource_fork: false,
         });
         bodies.push(body);
     }

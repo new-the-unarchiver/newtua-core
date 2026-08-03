@@ -278,6 +278,7 @@ fn build_entries(volume: &[u8]) -> Result<(Vec<Entry>, Vec<u32>)> {
             mode: None,
             is_encrypted: false,
             modified: hfs_date_to_systime(st.modified),
+            is_resource_fork: false,
         });
         cnids.push(w.cnid);
     }

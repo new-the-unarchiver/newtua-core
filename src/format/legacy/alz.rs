@@ -21,6 +21,6 @@ legacy_std_handler! {
         None => AlzArchive::open(Cursor::new(b)),
     },
     metas: |a| a.entries().iter()
-        .map(|e| EntryMeta { raw: e.name().to_vec(), is_dir: e.is_dir(), size: e.size(), is_encrypted: e.is_encrypted() })
+        .map(|e| EntryMeta { raw: e.name().to_vec(), is_dir: e.is_dir(), size: e.size(), is_encrypted: e.is_encrypted(), is_resource_fork: false, modified: None })
         .collect(),
 }

@@ -384,6 +384,7 @@ fn collect(
             mode,
             is_encrypted: false,
             modified,
+            is_resource_fork: false,
         });
         items.push(item);
 

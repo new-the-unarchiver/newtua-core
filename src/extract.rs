@@ -5,6 +5,10 @@ use filetime::FileTime;
 
 use crate::archive::{ArchiveReader, Entry, EntryKind};
 use crate::error::Result;
+// Нужен только ветке AppleDouble: на macOS вилка пишется в сам файл, и
+// ограничения на 4 ГиБ там нет.
+#[cfg(not(target_os = "macos"))]
+use crate::error::Error;
 use crate::path_safety::safe_join;
 
 /// Streamed progress notifications during extraction.
@@ -259,6 +263,9 @@ fn extract_one(
     mut ctx: ProgressCtx<'_>,
 ) -> Result<()> {
     let target = safe_join(dest, &entry.path)?;
+    if entry.is_resource_fork {
+        return write_resource_fork(ar, idx, entry, &target, preserve);
+    }
     match &entry.kind {
         EntryKind::Dir => {
             std::fs::create_dir_all(&target)?;
@@ -313,6 +320,99 @@ fn extract_one(
         }
     }
     Ok(())
+}
+
+/// AppleDouble v2 header, as Apple writes it when a Mac file lands on a
+/// filesystem that has no forks: magic, version, sixteen filler bytes, then one
+/// descriptor per stored part. We store exactly one part — the resource fork,
+/// entry id 2 — so the header is a fixed 38 bytes and the fork's bytes follow.
+#[cfg(not(target_os = "macos"))]
+const APPLEDOUBLE_MAGIC: u32 = 0x0005_1607;
+#[cfg(not(target_os = "macos"))]
+const APPLEDOUBLE_VERSION: u32 = 0x0002_0000;
+#[cfg(not(target_os = "macos"))]
+const APPLEDOUBLE_RESOURCE_FORK_ID: u32 = 2;
+#[cfg(not(target_os = "macos"))]
+const APPLEDOUBLE_HEADER_LEN: u32 = 38;
+
+/// Write the resource fork of `target`.
+///
+/// Two destinations, and both of them are Apple's own answer to the same
+/// question — where does the second stream of a file go?
+///
+/// * **macOS** (and anything else with real forks): into the file itself, at
+///   `target/..namedfork/rsrc`. The extracted file is then indistinguishable
+///   from the original: one file, both streams, nothing extra in the folder.
+/// * **Everywhere else**: beside it as `._name`, in the AppleDouble container
+///   macOS itself writes when it copies a Mac file onto a foreign filesystem.
+///   Those `._something` files people see on USB sticks from Mac users *are*
+///   resource forks. Dumping raw fork bytes under that name would be a
+///   different thing wearing its name — a Mac reading the disk back would not
+///   recognise it.
+///
+/// The alternative — dropping the fork — is silent data loss, and for a picture
+/// or an application it loses most of the file.
+///
+/// The data-fork entry may not have been written yet (nothing orders the two),
+/// so on macOS the base file is created empty if it is missing.
+fn write_resource_fork(
+    ar: &mut dyn ArchiveReader,
+    idx: usize,
+    entry: &Entry,
+    target: &Path,
+    preserve: bool,
+) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if !target.exists() {
+            std::fs::File::create(target)?;
+        }
+        let mut out = std::fs::File::create(target.join("..namedfork").join("rsrc"))?;
+        ar.read_entry(idx, &mut out)?;
+        // Times go on the file, not on the fork: the fork is not a file of its
+        // own and has no timestamps to carry.
+        if preserve {
+            apply_mtime(target, entry.modified);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut fork = Vec::new();
+        ar.read_entry(idx, &mut fork)?;
+        let len = u32::try_from(fork.len()).map_err(|_| Error::Unsupported {
+            format: "resource fork".into(),
+            feature: "fork larger than 4 GiB in an AppleDouble sidecar".into(),
+        })?;
+
+        let name = target
+            .file_name()
+            .ok_or_else(|| Error::Corrupt("resource fork entry has no file name".into()))?;
+        let mut sidecar_name = std::ffi::OsString::from("._");
+        sidecar_name.push(name);
+        let sidecar = target.with_file_name(sidecar_name);
+
+        let mut buf = Vec::with_capacity(APPLEDOUBLE_HEADER_LEN as usize + fork.len());
+        buf.extend_from_slice(&APPLEDOUBLE_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&APPLEDOUBLE_VERSION.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 16]);
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        buf.extend_from_slice(&APPLEDOUBLE_RESOURCE_FORK_ID.to_be_bytes());
+        buf.extend_from_slice(&APPLEDOUBLE_HEADER_LEN.to_be_bytes());
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(&fork);
+        std::fs::write(&sidecar, &buf)?;
+
+        if preserve {
+            apply_mtime(&sidecar, entry.modified);
+        }
+        Ok(())
+    }
 }
 
 struct ProgressWriter<'a> {

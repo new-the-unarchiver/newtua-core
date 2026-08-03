@@ -6,14 +6,16 @@
 use crate::archive::{FormatId, OpenOptions};
 use std::io::Cursor;
 
-use super::{EntryMeta, legacy_std_handler};
+use super::{EntryMeta, legacy_std_handler, mac_date_to_systime};
 
 use newtua_stuffit::sit5::StuffIt5Archive;
 use newtua_stuffit::sitx::SitxArchive;
 use newtua_stuffit::stuffit::StuffItArchive;
 
-// All three StuffIt entry types expose the same `name`/`size`/`is_directory`
-// surface, so each `metas:` closure is the same one-liner over `EntryMeta::named`.
+// Classic StuffIt and SIT5 store a file as two streams — data fork and
+// resource fork — under one name, told apart by `is_resource_fork()`. Losing
+// that flag loses the fork, and with it most of a picture or an application;
+// see `Entry::is_resource_fork`. StuffItX has no forks and no dates.
 
 legacy_std_handler! {
     /// StuffIt classic (`.sit`) — the dominant classic-Mac archiver.
@@ -23,7 +25,11 @@ legacy_std_handler! {
     exts: [],
     recognize: StuffItArchive::recognize,
     open: |b, _o| StuffItArchive::open(Cursor::new(b)),
-    metas: |a| a.entries().iter().map(|e| EntryMeta::named(e.name(), e.is_directory(), e.size())).collect(),
+    metas: |a| a.entries().iter()
+        .map(|e| EntryMeta::named(e.name(), e.is_directory(), e.size())
+            .resource_fork(e.is_resource_fork())
+            .at(mac_date_to_systime(e.modification_date())))
+        .collect(),
 }
 
 legacy_std_handler! {
@@ -37,7 +43,11 @@ legacy_std_handler! {
         Some(p) => StuffIt5Archive::open_with_password(Cursor::new(b), p.as_bytes()),
         None => StuffIt5Archive::open(Cursor::new(b)),
     },
-    metas: |a| a.entries().iter().map(|e| EntryMeta::named(e.name(), e.is_directory(), e.size())).collect(),
+    metas: |a| a.entries().iter()
+        .map(|e| EntryMeta::named(e.name(), e.is_directory(), e.size())
+            .resource_fork(e.is_resource_fork())
+            .at(mac_date_to_systime(e.modification_date())))
+        .collect(),
 }
 
 legacy_std_handler! {

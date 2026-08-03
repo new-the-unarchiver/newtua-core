@@ -355,6 +355,7 @@ impl SingleFileReader {
             mode: None,
             is_encrypted: false,
             modified,
+            is_resource_fork: false,
         };
         SingleFileReader {
             entries: vec![entry],

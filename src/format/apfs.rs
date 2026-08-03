@@ -286,6 +286,7 @@ fn walk_tree<R: Read + Seek>(
             mode: None,
             is_encrypted: false,
             modified: apfs_ns_to_systime(inode.mod_time),
+            is_resource_fork: false,
         });
         node_ids.push(de.file_id);
 
@@ -557,6 +558,7 @@ mod tests {
             mode: None,
             is_encrypted: false,
             modified: None,
+            is_resource_fork: false,
         };
         let mut entries = vec![filler; MAX_APFS_ENTRIES];
         let mut node_ids = vec![0u64; MAX_APFS_ENTRIES];

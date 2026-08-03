@@ -147,6 +147,25 @@ pub struct Entry {
     pub mode: Option<u32>,
     pub is_encrypted: bool,
     pub modified: Option<SystemTime>,
+    /// This entry is the *resource fork* of the file named by `path`, not the
+    /// file itself.
+    ///
+    /// A file on classic Mac OS held two independent byte streams: the data
+    /// fork and the resource fork. The second one carried the icon, the fonts,
+    /// the dialogs — for a picture or an application it is most of the file, and
+    /// for some files the data fork is empty and the resource fork is all there
+    /// is. The archive formats of that era (StuffIt, BinHex, MacBinary,
+    /// AppleSingle, PackIt, Compact Pro) store both, and report them as two
+    /// entries **sharing one name**, told apart only by this flag.
+    ///
+    /// Dropping it is silent data loss: the file appears, opens as garbage or
+    /// as nothing, and no error is ever raised. `extract_all` therefore writes a
+    /// fork the way Apple itself does — into the file's own resource fork where
+    /// the filesystem has one, and beside it as `._name` (AppleDouble) where it
+    /// does not.
+    ///
+    /// Always `false` outside the legacy Mac formats.
+    pub is_resource_fork: bool,
 }
 
 impl Entry {
@@ -278,6 +297,7 @@ mod tests {
             mode: None,
             is_encrypted: false,
             modified: None,
+            is_resource_fork: false,
         };
         assert_eq!(e.size, 5);
         assert!(!e.is_dir());

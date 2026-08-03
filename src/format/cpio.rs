@@ -841,6 +841,7 @@ fn build_entries(
             mode: Some(meta.mode),
             is_encrypted: false,
             modified: meta.modified,
+            is_resource_fork: false,
         });
         offsets.push(body);
     }

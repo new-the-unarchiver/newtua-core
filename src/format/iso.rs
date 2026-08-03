@@ -184,6 +184,7 @@ where
                     mode: None,
                     is_encrypted: false,
                     modified,
+                    is_resource_fork: false,
                 });
                 iso_files.push(Some(f));
             }
@@ -200,6 +201,7 @@ where
                     mode: None,
                     is_encrypted: false,
                     modified: None,
+                    is_resource_fork: false,
                 });
                 iso_files.push(None); // no file body for directories
                 if first_visit {
@@ -217,6 +219,7 @@ where
                     mode: None,
                     is_encrypted: false,
                     modified: None,
+                    is_resource_fork: false,
                 });
                 iso_files.push(None); // no body
             }

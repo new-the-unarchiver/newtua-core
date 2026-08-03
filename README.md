@@ -98,10 +98,27 @@ refuse its members with a clean `Unsupported`; we never mis-read them. Other
 readers do decompress them, so this is a missing capability rather than a
 defect, and it is deliberately deferred: these archives are from 1989–1990.
 
-**XADMaster is the floor, not the ceiling.** Two places where we already read
-what it cannot: a zip member compressed with zstd — `unar` exits non-zero and
-leaves a zero-length file, while our output is confirmed by `7zz` — and
-AppImage, which it does not recognise at all.
+### XADMaster is the floor, not the ceiling
+
+We follow The Unarchiver and extract what it extracts. That is a promise about
+the *minimum*, and it is worth writing down where we already read what it
+cannot — otherwise the next person to describe this engine copies XAD's
+capabilities and understates ours.
+
+Each row says how it was checked. Nothing here is claimed on reasoning alone;
+every one was run against a real archive with a third tool as the judge, since
+"we disagree with XAD" is exactly the claim most likely to be us being wrong.
+
+| Where we do more | What XAD does | How it was checked |
+| --- | --- | --- |
+| **zip member compressed with zstd** | `unar` exits non-zero and leaves a zero-length file | our bytes confirmed by `7zz` on the same archive |
+| **AppImage**, both Type 1 (ISO 9660) and Type 2 (SquashFS) | not recognised at all | contents cross-checked against `unsquashfs` and `7zz` |
+| **Timestamps of the DOS/classic-Mac era**: we apply the timezone rules *of the date stored*, so an archive from 1991 and one from 1993 each come out at the hour they were written | applies today's rules, so the date lands an hour off whenever summer time differed | Compact Pro reference: our value matched the stored wall clock in both directions, `unar`'s drifted one way in winter 1991 and the other in summer 1993 |
+
+The list is deliberately short. Two dozen other formats agree with `unar`
+byte-for-byte, and where we and XAD both fail — an LZMA-coded `.xar`, StuffItX,
+a Mach-O self-extracting `.exe`, a `.dmg` in ADC — that is parity and closing it
+would be new work, not a repair.
 
 ### Modern
 
