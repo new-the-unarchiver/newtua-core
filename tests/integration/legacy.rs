@@ -232,3 +232,126 @@ fn content_sniffed_formats_reject_garbage() {
     assert_eq!(LbrHandler.probe(garbage, Some("x.lbr")), Confidence::NONE);
     assert_eq!(CrunchHandler.probe(garbage, None), Confidence::NONE);
 }
+
+// ── Ресурсные вилки ───────────────────────────────────────────────────────
+
+/// Собрать AppleSingle из секций `(id, байты)`. Раскладка та же, что у
+/// upstream: магия, версия, шестнадцать нулей, число секций, таблица
+/// дескрипторов, тела подряд. Идентификаторы: 1 — вилка данных, 2 — вилка
+/// ресурсов, 3 — настоящее имя.
+fn build_applesingle(sections: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let n = sections.len();
+    let table = 26 + 12 * n;
+    let mut out = vec![0u8; table];
+    out[0..4].copy_from_slice(&0x0005_1600u32.to_be_bytes());
+    out[4..8].copy_from_slice(&0x0002_0000u32.to_be_bytes());
+    out[24..26].copy_from_slice(&(n as u16).to_be_bytes());
+    let mut off = table;
+    let mut body = Vec::new();
+    for (i, (id, sec)) in sections.iter().enumerate() {
+        let d = 26 + i * 12;
+        out[d..d + 4].copy_from_slice(&id.to_be_bytes());
+        out[d + 4..d + 8].copy_from_slice(&(off as u32).to_be_bytes());
+        out[d + 8..d + 12].copy_from_slice(&(sec.len() as u32).to_be_bytes());
+        body.extend_from_slice(sec);
+        off += sec.len();
+    }
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Ресурсная вилка должна доехать до диска, а не потеряться по дороге.
+///
+/// У файла классического Mac два независимых содержимого: вилка данных и
+/// вилка ресурсов. У картинки или программы в ресурсной вилке лежит почти
+/// весь файл, а иногда и весь целиком. Форматы того времени отдают их двумя
+/// записями с **одним именем**, и если признак вилки потерять, до диска
+/// доедет только одна из двух — молча.
+///
+/// Здесь вилка ресурсов вчетверо больше вилки данных: если правка отвалится,
+/// эти байты просто исчезнут.
+#[test]
+fn resource_fork_reaches_the_disk() {
+    let data = b"the data fork".to_vec();
+    let rsrc: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let file = build_applesingle(&[
+        (3, b"picture.pct".to_vec()),
+        (1, data.clone()),
+        (2, rsrc.clone()),
+    ]);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("carrier.bin");
+    std::fs::write(&src, &file).expect("write fixture");
+
+    let mut ar = newtua_core::open(&src, &OpenOptions::default()).expect("open applesingle");
+
+    // Обе вилки видны в листинге как две записи с одним именем, и различает их
+    // только признак.
+    let entries = ar.entries().expect("entries").to_vec();
+    let forks: Vec<_> = entries.iter().filter(|e| e.is_resource_fork).collect();
+    assert_eq!(forks.len(), 1, "ровно одна запись — ресурсная вилка");
+    assert_eq!(forks[0].size, rsrc.len() as u64);
+    let plain: Vec<_> = entries.iter().filter(|e| !e.is_resource_fork).collect();
+    assert_eq!(plain.len(), 1, "и ровно одна — сам файл");
+    assert_eq!(plain[0].path, forks[0].path, "имя у них общее");
+
+    let dest = tmp.path().join("out");
+    let mut xo = newtua_core::ExtractOptions {
+        dest: dest.clone(),
+        wrapper_name: None,
+        strict: false,
+        preserve: true,
+        selection: None,
+        progress: None,
+        keep_macos_metadata: false,
+    };
+    let rep = newtua_core::extract_all(ar.as_mut(), &mut xo).expect("extract");
+    assert!(
+        rep.failed.is_empty(),
+        "ничего не должно отказать: {:?}",
+        rep.failed
+    );
+
+    let written = dest.join("picture.pct");
+    assert_eq!(std::fs::read(&written).expect("данные на месте"), data);
+
+    #[cfg(target_os = "macos")]
+    {
+        // На macOS вилка ложится внутрь самого файла — как её и клал упаковщик.
+        let fork_path = written.join("..namedfork").join("rsrc");
+        assert_eq!(
+            std::fs::read(&fork_path).expect("вилка внутри файла"),
+            rsrc,
+            "ресурсная вилка должна дойти целиком"
+        );
+        assert!(
+            !dest.join("._picture.pct").exists(),
+            "рядом ничего лишнего появляться не должно"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Там, где вилок нет, — контейнер AppleDouble, как его пишет сама
+        // macOS: 38 байт заголовка, дальше байты вилки.
+        let sidecar = std::fs::read(dest.join("._picture.pct")).expect("файл рядом");
+        assert_eq!(
+            &sidecar[0..4],
+            &0x0005_1607u32.to_be_bytes(),
+            "магия AppleDouble"
+        );
+        assert_eq!(&sidecar[4..8], &0x0002_0000u32.to_be_bytes(), "версия 2");
+        assert_eq!(&sidecar[24..26], &1u16.to_be_bytes(), "одна секция");
+        assert_eq!(
+            &sidecar[26..30],
+            &2u32.to_be_bytes(),
+            "и это ресурсная вилка"
+        );
+        assert_eq!(
+            &sidecar[38..],
+            &rsrc[..],
+            "байты вилки следом за заголовком"
+        );
+    }
+}

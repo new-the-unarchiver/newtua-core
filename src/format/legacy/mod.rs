@@ -15,6 +15,7 @@ use crate::archive::{ArchiveReader, Confidence, Entry, EntryKind, FormatId, Open
 use crate::encoding::decode_names;
 use crate::error::{Error, Result};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod dos;
 pub use dos::{ArcHandler, ArjHandler, CrunchHandler, LbrHandler, SqueezeHandler, ZooHandler};
@@ -36,6 +37,42 @@ pub use nsis::NsisHandler;
 pub mod amiga;
 pub use amiga::{DmsHandler, LzxHandler, PowerPackerHandler};
 
+/// Seconds between the classic Mac epoch (1904-01-01 GMT) and the Unix epoch.
+/// MacBinary, Compact Pro, PackIt, StuffIt and StuffIt 5 all date their entries
+/// from it.
+const MAC_EPOCH_TO_UNIX: u64 = 2_082_844_800;
+/// Seconds between the AppleSingle epoch (2000-01-01 GMT) and the Unix epoch.
+/// AppleSingle is the odd one out: its dates count from 2000, and they are
+/// *signed*, so a file older than that is a negative number.
+const APPLESINGLE_EPOCH_TO_UNIX: i64 = 946_684_800;
+
+/// Convert a classic Mac timestamp (seconds since 1904-01-01) to `SystemTime`.
+///
+/// `0` means "no date recorded" in every one of these formats, and a value
+/// below the Unix epoch is a date before 1970 that `SystemTime` on some targets
+/// cannot express — both become `None` rather than a wrong instant. Reporting a
+/// date we are unsure of is worse than reporting none: the caller writes it to
+/// the file and the user sees a confident lie.
+pub(crate) fn mac_date_to_systime(secs: u32) -> Option<SystemTime> {
+    let secs = u64::from(secs);
+    if secs == 0 || secs < MAC_EPOCH_TO_UNIX {
+        return None;
+    }
+    Some(UNIX_EPOCH + Duration::from_secs(secs - MAC_EPOCH_TO_UNIX))
+}
+
+/// Convert an AppleSingle timestamp (signed seconds since 2000-01-01).
+/// Dates before 1970 are representable here and are returned as such.
+pub(crate) fn applesingle_date_to_systime(secs: Option<u32>) -> Option<SystemTime> {
+    let secs = secs? as i32 as i64;
+    let unix = secs.checked_add(APPLESINGLE_EPOCH_TO_UNIX)?;
+    if unix >= 0 {
+        Some(UNIX_EPOCH + Duration::from_secs(unix as u64))
+    } else {
+        UNIX_EPOCH.checked_sub(Duration::from_secs(unix.unsigned_abs()))
+    }
+}
+
 /// One entry's raw metadata as reported by an upstream legacy archive, before
 /// charset decoding of the name.
 pub(crate) struct EntryMeta {
@@ -43,23 +80,45 @@ pub(crate) struct EntryMeta {
     pub is_dir: bool,
     pub size: u64,
     pub is_encrypted: bool,
+    /// The resource fork of the file named by `raw`, rather than the file.
+    /// See [`Entry::is_resource_fork`] — the Mac formats report the two forks
+    /// as two entries sharing one name, and losing this flag loses the fork.
+    pub is_resource_fork: bool,
+    /// Modification time as the archive recorded it. `None` when the format
+    /// stores none, or when the upstream crate does not surface it yet.
+    pub modified: Option<SystemTime>,
 }
 
 impl EntryMeta {
-    /// An entry with a raw name, kind, and known size — not encrypted (the
-    /// common case; encrypted entries build the struct literally).
+    /// An entry with a raw name, kind, and known size — not encrypted, not a
+    /// fork, no timestamp (the common case; the rest build the struct
+    /// literally or adjust with the builders below).
     pub(crate) fn named(raw: &[u8], is_dir: bool, size: u64) -> Self {
         Self {
             raw: raw.to_vec(),
             is_dir,
             size,
             is_encrypted: false,
+            is_resource_fork: false,
+            modified: None,
         }
     }
 
     /// A plain file entry (never a directory).
     pub(crate) fn file(raw: &[u8], size: u64) -> Self {
         Self::named(raw, false, size)
+    }
+
+    /// Mark this entry as the resource fork of its name.
+    pub(crate) fn resource_fork(mut self, yes: bool) -> Self {
+        self.is_resource_fork = yes;
+        self
+    }
+
+    /// Attach the archive's recorded modification time.
+    pub(crate) fn at(mut self, modified: Option<SystemTime>) -> Self {
+        self.modified = modified;
+        self
     }
 }
 
@@ -104,7 +163,8 @@ impl LegacyReader {
                 size: m.size,
                 mode: None,
                 is_encrypted: m.is_encrypted,
-                modified: None,
+                modified: m.modified,
+                is_resource_fork: m.is_resource_fork,
             })
             .collect();
         Self {

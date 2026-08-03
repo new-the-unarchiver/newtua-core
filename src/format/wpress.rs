@@ -350,6 +350,7 @@ fn build_reader(
             mode: None,
             is_encrypted: false,
             modified: rec.mtime.and_then(unix_secs_to_systime),
+            is_resource_fork: false,
         });
         bodies.push((rec.offset, rec.size));
     }

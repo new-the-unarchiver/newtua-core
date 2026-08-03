@@ -140,6 +140,7 @@ pub(crate) fn open_zip(
             mode,
             is_encrypted,
             modified,
+            is_resource_fork: false,
         });
     }
     Ok(Box::new(ZipReader {

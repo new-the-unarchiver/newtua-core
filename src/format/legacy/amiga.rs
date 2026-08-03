@@ -126,6 +126,9 @@ impl LegacyBackend for DmsBackend {
                     is_dir: false,
                     size: u64::from(f.size),
                     is_encrypted: f.is_crypted,
+                    // Амига-форматы вилок не знают, дат наружу не отдают.
+                    is_resource_fork: false,
+                    modified: None,
                 })
                 .collect()
         }

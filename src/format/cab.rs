@@ -60,6 +60,7 @@ impl FormatHandler for CabHandler {
                     mode: None,
                     is_encrypted: false,
                     modified,
+                    is_resource_fork: false,
                 });
                 quantum.push(is_quantum);
             }

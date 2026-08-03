@@ -127,6 +127,7 @@ impl FormatHandler for WarcHandler {
                 mode: None,
                 is_encrypted: false,
                 modified,
+                is_resource_fork: false,
             });
             offsets.push((offset, size));
         }

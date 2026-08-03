@@ -502,6 +502,7 @@ fn walk_children(
             mode: None,
             is_encrypted: false,
             modified: d.modified,
+            is_resource_fork: false,
         });
         bodies.push(body);
 
