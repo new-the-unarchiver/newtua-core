@@ -217,6 +217,31 @@ pub(crate) fn open_hfsplus(path: &Path, offset: u64) -> Result<Box<dyn ArchiveRe
 /// index. Called only after the caller has confirmed the H+/HX signature, so
 /// a `None` from the crate here means a structurally broken catalog, not an
 /// unrecognised format — `Corrupt`, not `UnknownFormat`.
+/// The two directories HFS+ keeps at the volume root for its own bookkeeping,
+/// named exactly as Apple's TN1150 specifies. Hard links are implemented by
+/// storing the real inode inside one of these and leaving a stub in the visible
+/// tree; the volume's own driver hides both, and so does every extractor worth
+/// the name — mounting the same image on macOS shows neither.
+///
+/// Emitting them is not merely untidy. `HFS+ Private Data` begins with four NUL
+/// bytes, which no filesystem will accept in a name, so every extraction of
+/// every HFS+ volume and every HFS+-backed DMG produced one hard error; and
+/// `.HFS+ Private Directory Data\r`, ending in a carriage return, *did* get
+/// created, littering the output with a directory the user never had.
+const HFS_PRIVATE_DIRS: [&str; 2] = [
+    "\0\0\0\0HFS+ Private Data",
+    ".HFS+ Private Directory Data\r",
+];
+
+/// True for a private directory or anything beneath it. Anchored at the root
+/// and compared whole: a user file that merely *contains* one of these names
+/// deeper in the tree is real content and stays.
+fn is_hfs_private(path: &str) -> bool {
+    HFS_PRIVATE_DIRS
+        .iter()
+        .any(|d| path == *d || path.strip_prefix(d).is_some_and(|r| r.starts_with('/')))
+}
+
 fn build_entries(volume: &[u8]) -> Result<(Vec<Entry>, Vec<u32>)> {
     let walked = hfsplus_forensic::walk(volume)
         .ok_or_else(|| Error::Corrupt("hfsplus: catalog B-tree unreadable".into()))?;
@@ -224,6 +249,9 @@ fn build_entries(volume: &[u8]) -> Result<(Vec<Entry>, Vec<u32>)> {
     let mut entries = Vec::with_capacity(walked.len());
     let mut cnids = Vec::with_capacity(walked.len());
     for w in walked {
+        if is_hfs_private(&w.path) {
+            continue;
+        }
         let st = hfsplus_forensic::stat(volume, w.cnid).ok_or_else(|| {
             Error::Corrupt(format!("hfsplus: no catalog record for cnid {}", w.cnid))
         })?;

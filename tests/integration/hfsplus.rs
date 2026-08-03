@@ -302,3 +302,59 @@ fn hfs_ci_matches_7zz_oracle() {
     let mut reader = open(&fixture("hfs_ci.hfs"), &OpenOptions::default()).expect("open hfs_ci");
     assert_eq!(body_of(reader.as_mut(), "hello.txt"), expected);
 }
+
+// ── HFS+ private directories must never reach the caller ──────────────────
+
+/// HFS+ keeps two bookkeeping directories at the volume root (TN1150): the
+/// hard-link store `\0\0\0\0HFS+ Private Data` and the directory-hard-link
+/// store `.HFS+ Private Directory Data\r`. The volume's own driver hides both
+/// — mounting the same image on macOS shows neither — and listing them was a
+/// defect with two distinct effects: the first name carries NUL bytes, which no
+/// filesystem accepts, so extraction reported a hard error on every HFS+ volume
+/// and every HFS+-backed DMG; the second ends in a carriage return and was
+/// created for real, littering the output.
+///
+/// This went unnoticed because the corpus harness compared files only and
+/// ignored directories.
+#[test]
+fn hfs_private_directories_are_not_listed() {
+    for name in ["hfs_ci.hfs", "hfs_cs.hfs", "hfs_decmpfs.hfs"] {
+        let mut reader = open(&fixture(name), &OpenOptions::default())
+            .unwrap_or_else(|e| panic!("open {name}: {e:?}"));
+        for e in reader.entries().expect("entries") {
+            let p = e.path.to_string_lossy();
+            assert!(
+                !p.contains("HFS+ Private"),
+                "{name}: private directory leaked into the listing: {p:?}"
+            );
+            assert!(
+                !e.path_raw.contains(&0),
+                "{name}: NUL byte in a listed name: {:?}",
+                e.path_raw
+            );
+        }
+    }
+}
+
+/// Same guarantee through the DMG path, which is where it actually bit: the
+/// HFS+ volume lives inside the image, so every `.dmg` in the corpus reported
+/// the same failed entry.
+#[test]
+fn dmg_backed_hfs_private_directories_are_not_listed() {
+    let mut reader = open(&fixture("dmg_zlib.dmg"), &OpenOptions::default()).expect("open");
+    let paths: Vec<String> = reader
+        .entries()
+        .expect("entries")
+        .iter()
+        .map(|e| e.path.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !paths.iter().any(|p| p.contains("HFS+ Private")),
+        "private directories in a DMG listing: {paths:?}"
+    );
+    // And the payload itself is still all there — the filter is anchored at the
+    // root, not a substring sweep.
+    for want in ["hello.txt", "sub", "sub/nested.txt"] {
+        assert!(paths.iter().any(|p| p == want), "{want} missing: {paths:?}");
+    }
+}
