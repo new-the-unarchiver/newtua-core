@@ -486,3 +486,40 @@ fn extract_encrypted_zip_with_correct_password_succeeds() {
         b"inside"
     );
 }
+
+/// A member the reader cannot decode must leave nothing behind. The output file
+/// is created before any content is known, so before the fix a refused entry
+/// left a zero-length file with the right name — which reads as success and is
+/// worse than the entry plainly not being there.
+///
+/// `unsupported_method.zip` is a hand-built one-member zip whose compression
+/// method is 96 (JPEG); no reader decodes it, so the refusal is guaranteed
+/// rather than incidental.
+#[test]
+fn a_refused_entry_leaves_no_empty_file() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/unsupported_method.zip");
+    let dest = tempfile::tempdir().unwrap();
+    let mut ar = open(&path, &OpenOptions::default()).unwrap();
+    let mut opts = ExtractOptions {
+        dest: dest.path().to_path_buf(),
+        wrapper_name: None,
+        strict: false,
+        preserve: false,
+        selection: None,
+        progress: None,
+        keep_macos_metadata: false,
+    };
+    // Non-strict: the failure is reported, not fatal.
+    let report = extract_all(&mut *ar, &mut opts).unwrap();
+    assert_eq!(report.extracted, 0);
+    assert!(!report.failed.is_empty(), "the refusal must be reported");
+    assert!(
+        !dest.path().join("jpeg.bin").exists(),
+        "a refused entry must not be left on disk: {:?}",
+        std::fs::read_dir(dest.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect::<Vec<_>>()
+    );
+}

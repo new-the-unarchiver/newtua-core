@@ -291,7 +291,12 @@ fn extract_one(
                 std::fs::create_dir_all(parent)?;
             }
             let out = std::fs::File::create(&target)?;
-            match ctx.progress.as_mut() {
+            // The file exists from this line on, before a single byte of content
+            // is known. Whatever happens next, an unfinished one must not be left
+            // behind: a zero-length file with the right name reads as success,
+            // and that is worse than the entry plainly not being there. The two
+            // ways out below therefore both delete it — see the note on `aborted`.
+            let outcome = match ctx.progress.as_mut() {
                 Some(p) => {
                     let mut w = ProgressWriter {
                         idx,
@@ -299,19 +304,26 @@ fn extract_one(
                         progress: p,
                         aborted: ctx.aborted,
                     };
-                    // On cooperative abort, ProgressWriter returns an io error and
-                    // sets *aborted; swallow that specific stop here.
-                    if let Err(e) = ar.read_entry(idx, &mut w) {
-                        if *ctx.aborted {
-                            return Ok(());
-                        }
-                        return Err(e);
-                    }
+                    ar.read_entry(idx, &mut w)
                 }
                 None => {
                     let mut out = out;
-                    ar.read_entry(idx, &mut out)?;
+                    ar.read_entry(idx, &mut out)
                 }
+            };
+            if let Err(e) = outcome {
+                // The write handle is gone by now (both arms dropped it with the
+                // match), so the file can be removed on Windows too.
+                let _ = std::fs::remove_file(&target);
+                // On cooperative abort, ProgressWriter returns an io error and
+                // sets *aborted; that stop is swallowed here. The half-written
+                // file still goes: cancelling means the person does not want this
+                // entry, and a truncated file looks exactly like a whole one.
+                // Entries already written in full stay — they are finished work.
+                if *ctx.aborted {
+                    return Ok(());
+                }
+                return Err(e);
             }
             if preserve {
                 apply_mode(&target, entry.mode);
