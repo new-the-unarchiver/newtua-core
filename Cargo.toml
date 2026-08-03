@@ -102,7 +102,7 @@ memmap2 = "0.9"
 lzfse_rust = "0.2.1"
 # APFS filesystem inside DMG images / bare containers (#21c): vendored reader,
 # see the newtua-apfs fork's README and format/apfs.rs.
-apfs-core = { package = "newtua-apfs", version = "0.2.0-newtua.1" }
+apfs-core = { package = "newtua-apfs", version = "0.2.0-newtua.2" }
 # Already resolved transitively (via rpm); used directly to decode the plist
 # `Data` base64 field. See format/dmg.rs.
 base64 = "0.22"
