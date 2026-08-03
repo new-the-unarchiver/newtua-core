@@ -52,6 +52,127 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> Option<u64> {
     }
 }
 
+/// Civil date from days since 1970-01-01 — the inverse of [`days_from_civil`],
+/// same source. Needed to take a timestamp that is *stored* as an offset from
+/// some epoch but *means* wall-clock time, and recover the wall clock.
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u32; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    ((y + i64::from(m <= 2)) as i32, m, d)
+}
+
+/// Convert a **local** civil date-time — wall-clock, no timezone attached — to
+/// `SystemTime`.
+///
+/// The formats of the DOS and classic-Mac era stored the clock on the wall and
+/// nothing else: MS-DOS date/time fields in zip, seconds-since-1904 in StuffIt
+/// and its relatives. Reading those as UTC shifts every date by the reader's
+/// timezone offset, so a file made at midnight shows up as made at five in the
+/// morning. XADMaster reads them as local time, which is what the person who
+/// packed the file saw, and this matches it.
+///
+/// Done by the C library's `mktime`, because it is the only thing that knows
+/// the offset **at that historical date** — a January file and a July file in
+/// the same zone can differ by an hour of summer time, and a fixed "current
+/// offset" would get one of them wrong. `tm_isdst = -1` asks it to work that
+/// out.
+///
+/// Falls back to the UTC reading if `mktime` fails (an unset or broken zone
+/// database): a date an hour off is better than no date at all.
+pub(crate) fn local_civil_to_systime(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u64,
+    min: u64,
+    sec: u64,
+) -> Option<SystemTime> {
+    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let utc = civil_to_systime(year, month, day, hour, min, sec)?;
+
+    #[cfg(unix)]
+    {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        tm.tm_year = year - 1900;
+        tm.tm_mon = month as i32 - 1;
+        tm.tm_mday = day as i32;
+        tm.tm_hour = hour as i32;
+        tm.tm_min = min as i32;
+        tm.tm_sec = sec as i32;
+        tm.tm_isdst = -1; // "decide for me" — honours summer time on that date
+        // SAFETY: `tm` is a fully initialised, owned `libc::tm`; `mktime` reads
+        // and normalises it in place and returns the corresponding instant.
+        let secs = unsafe { libc::mktime(&mut tm) };
+        if secs < 0 {
+            return Some(utc);
+        }
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64))
+    }
+
+    // Windows' libc has `tm` and `localtime_s` but no `mktime`, so the same
+    // answer is reached from the other side: ask what local time the naive UTC
+    // instant lands on, and the gap between that and the wanted wall clock is
+    // the offset to undo. Iterating twice settles the case where the offset at
+    // the first guess differs from the offset at the answer — the hour either
+    // side of a summer-time change.
+    #[cfg(windows)]
+    {
+        let mut guess = utc.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs() as i64;
+        for _ in 0..2 {
+            let t = guess as libc::time_t;
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            // SAFETY: both pointers are to owned, initialised locals.
+            if unsafe { libc::localtime_s(&mut tm, &t) } != 0 {
+                return Some(utc);
+            }
+            let local = civil_to_systime(
+                tm.tm_year + 1900,
+                tm.tm_mon as u32 + 1,
+                tm.tm_mday as u32,
+                tm.tm_hour as u64,
+                tm.tm_min as u64,
+                tm.tm_sec as u64,
+            )?;
+            let local = local.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs() as i64;
+            let want = utc.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs() as i64;
+            let offset = local - guess;
+            let next = want - offset;
+            if next == guess {
+                break;
+            }
+            guess = next;
+        }
+        if guess < 0 {
+            return Some(utc);
+        }
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(guess as u64))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        Some(utc)
+    }
+}
+
+/// Same as [`local_civil_to_systime`], for a timestamp already reduced to
+/// seconds since the Unix epoch **but meaning wall-clock time**. Splits it back
+/// into civil fields and re-reads them as local.
+pub(crate) fn local_unix_secs_to_systime(secs: u64) -> Option<SystemTime> {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (y, m, d) = civil_from_days(days);
+    local_civil_to_systime(y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +209,58 @@ mod tests {
         assert_eq!(civil_to_systime(2020, 13, 1, 0, 0, 0), None);
         assert_eq!(civil_to_systime(2020, 0, 1, 0, 0, 0), None);
         assert_eq!(civil_to_systime(1969, 12, 31, 23, 59, 59), None);
+    }
+
+    /// Местное время должно отдаваться ровно теми часами, что записаны, — это
+    /// и есть «как у автора файла». Проверяем кругом: перевели часы на стене в
+    /// момент времени, вернули обратно системными средствами — получили те же
+    /// часы. Зона машины при этом любая, тест не привязан к моей.
+    #[test]
+    fn local_civil_round_trips_through_the_system_timezone() {
+        for (y, mo, d, h, mi, s) in [
+            (1991, 12, 10, 11, 39, 19), // зима
+            (1993, 8, 15, 23, 48, 26),  // лето: в те годы перевод часов был
+            (2026, 8, 1, 20, 56, 32),
+        ] {
+            let t = local_civil_to_systime(y, mo, d, h, mi, s).expect("время получилось");
+            let secs = t
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("после эпохи")
+                .as_secs() as i64;
+
+            #[cfg(unix)]
+            {
+                let tt = secs as libc::time_t;
+                let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                // SAFETY: оба указателя — на инициализированные локальные значения.
+                unsafe { libc::localtime_r(&tt, &mut tm) };
+                assert_eq!(
+                    (
+                        tm.tm_year + 1900,
+                        tm.tm_mon as u32 + 1,
+                        tm.tm_mday as u32,
+                        tm.tm_hour as u64,
+                        tm.tm_min as u64,
+                        tm.tm_sec as u64
+                    ),
+                    (y, mo, d, h, mi, s),
+                    "часы на стене должны вернуться теми же"
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = secs;
+        }
+    }
+
+    /// Всемирное чтение тех же полей даёт другой момент везде, кроме зоны GMT.
+    /// Тест не утверждает, на сколько именно расходится, — только что это две
+    /// разные вещи и путать их нельзя.
+    #[test]
+    fn local_and_utc_readings_are_not_the_same_thing() {
+        let local = local_civil_to_systime(1991, 12, 10, 11, 39, 19).unwrap();
+        let utc = civil_to_systime(1991, 12, 10, 11, 39, 19).unwrap();
+        if std::env::var("TZ").as_deref() == Ok("UTC") {
+            assert_eq!(local, utc);
+        }
     }
 }

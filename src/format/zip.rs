@@ -153,8 +153,13 @@ pub(crate) fn open_zip(
 }
 
 /// Convert a `zip::DateTime` (MS-DOS civil fields) to `SystemTime`.
+///
+/// MS-DOS stored the clock on the wall and no timezone, so these fields are
+/// **local time** — the packer's local time, which every other unzip likewise
+/// reproduces as the extractor's local time. Reading them as UTC shifted every
+/// date in every zip by the reader's offset.
 fn zip_dt_to_systime(dt: zip::DateTime) -> Option<std::time::SystemTime> {
-    crate::datetime::civil_to_systime(
+    crate::datetime::local_civil_to_systime(
         dt.year() as i32,
         dt.month() as u32,
         dt.day() as u32,

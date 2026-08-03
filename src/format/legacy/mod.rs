@@ -58,7 +58,10 @@ pub(crate) fn mac_date_to_systime(secs: u32) -> Option<SystemTime> {
     if secs == 0 || secs < MAC_EPOCH_TO_UNIX {
         return None;
     }
-    Some(UNIX_EPOCH + Duration::from_secs(secs - MAC_EPOCH_TO_UNIX))
+    // Classic Mac OS had no notion of a timezone: the number is the clock on
+    // the wall where the file was made. Read as UTC it shifts by the reader's
+    // offset — `unar` reads it as local time and so do we.
+    crate::datetime::local_unix_secs_to_systime(secs - MAC_EPOCH_TO_UNIX)
 }
 
 /// Convert an AppleSingle timestamp (signed seconds since 2000-01-01).
