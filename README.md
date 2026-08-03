@@ -92,11 +92,12 @@ be new work rather than a repair: a `.xar` whose members are LZMA-coded, a
 StuffItX archive, a Mach-O self-extracting `.exe`, and a `.dmg` using the old
 ADC compression. `unar` fails every one of them too.
 
-One gap that is ours alone: the three compression methods PKZIP used before
-Deflate — Shrink, Reduce and Implode. We open and list such an archive and then
-refuse its members with a clean `Unsupported`; we never mis-read them. Other
-readers do decompress them, so this is a missing capability rather than a
-defect, and it is deliberately deferred: these archives are from 1989–1990.
+The three compression methods PKZIP used before Deflate — Shrink, Reduce and
+Implode — used to be a gap of ours alone; they are decoded now. Shrink and
+Implode are confirmed against `unzip` on real 1989–1990 archives, byte for byte.
+Reduce has no second reader to confirm it against — `unzip`, `7zz` and `unar`
+all decline the method — so it is checked against the files the reference
+archives were built from instead.
 
 ### XADMaster is the floor, not the ceiling
 
@@ -114,6 +115,7 @@ every one was run against a real archive with a third tool as the judge, since
 | **zip member compressed with zstd** | `unar` exits non-zero and leaves a zero-length file | our bytes confirmed by `7zz` on the same archive |
 | **AppImage**, both Type 1 (ISO 9660) and Type 2 (SquashFS) | not recognised at all | contents cross-checked against `unsquashfs` and `7zz` |
 | **Timestamps of the DOS/classic-Mac era**: we apply the timezone rules *of the date stored*, so an archive from 1991 and one from 1993 each come out at the hour they were written | applies today's rules, so the date lands an hour off whenever summer time differed | Compact Pro reference: our value matched the stored wall clock in both directions, `unar`'s drifted one way in winter 1991 and the other in summer 1993 |
+| **zip member compressed with Reduce** (PKZIP 1989, methods 2–5) | `unar` reports "File is not fully supported" and leaves a zero-length file | `unzip` and `7zz` decline the method too, so the judge is the payload the reference archives were built from: all three reduction factors came out byte-identical |
 
 The list is deliberately short. Two dozen other formats agree with `unar`
 byte-for-byte, and where we and XAD both fail — an LZMA-coded `.xar`, StuffItX,

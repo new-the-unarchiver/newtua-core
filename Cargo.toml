@@ -29,19 +29,23 @@ xz2 = "0.1"
 # didn't support it at all. `ppmd-rust` is already in the tree transitively via
 # sevenz-rust2 0.21, licensed CC0-1.0 OR MIT-0 — no conflict with our
 # LGPL-3.0-or-later. The bump to 7 built clean with no code changes elsewhere.
-# `legacy-zip` (Shrink/Reduce/Implode — methods 1 and 2–6) stays OFF for now,
-# as a matter of priority rather than of evidence: real PKZIP 1989/1990
-# archives using all three now exist in the reference corpus, and for Shrink
-# and Implode a foreign reader (`unzip`, `7zz`) unpacks them with matching
-# CRCs, so turning the feature on would be measurable. Reduce has no such
-# confirmation yet. Today we open and list these archives and refuse the
-# members with a clean `Unsupported` — never a corrupt read.
+# `legacy-zip` (Shrink/Reduce/Implode — methods 1 and 2–6) is ON. Real PKZIP
+# 1989/1990 archives using all three sit in the reference corpus, and until this
+# was turned on they opened, listed their members and then refused every one of
+# them: an archive that "opened but gives nothing". Shrink and Implode are
+# confirmed against foreign readers (`unzip`, `7zz`) with matching CRCs; Reduce
+# has no such second reader — `unzip`, `7zz` and `unar` all decline it — so its
+# corpus cells are checked against the payload they were built from instead.
+# There is no fixture here that would notice the feature being switched back
+# off: the archives live in the reference corpus, not in this repo. Six of its
+# cells drop from OK/LISTED to PARTIAL if it goes, which is what the pre-release
+# run is for.
 # One thing the changelog does not announce: between 2.4.2 and 7.2.0 the XZ
 # decoder behind this crate changed twice (xz2 → liblzma → lzma_rust2, a pure
 # Rust one). Method 14 (LZMA) we decode ourselves, but XZ we hand over whole,
 # so the `xz_zipx_*` integration tests are the only thing standing between us
 # and a silent divergence there.
-zip = { version = "7", features = ["lzma", "bzip2", "zstd", "deflate64", "xz", "ppmd"] }
+zip = { version = "7", features = ["lzma", "bzip2", "zstd", "deflate64", "xz", "ppmd", "legacy-zip"] }
 zstd = "0.13"
 lz4_flex = "0.11"
 brotli-decompressor = "5"
@@ -134,9 +138,9 @@ default = []
 tar = "0.4"
 tempfile = "3"
 # Kept in lockstep with the [dependencies] entry above (same version, same
-# rationale for "ppmd" and for leaving "legacy-zip" off) so the resolver only
-# ever settles on one `zip` version for the whole build.
-zip = { version = "7", features = ["lzma", "bzip2", "zstd", "deflate64", "xz", "ppmd"] }
+# feature set) so the resolver only ever settles on one `zip` version for the
+# whole build.
+zip = { version = "7", features = ["lzma", "bzip2", "zstd", "deflate64", "xz", "ppmd", "legacy-zip"] }
 cab = "0.6"
 flate2 = "1"
 sha2 = "0.10"
