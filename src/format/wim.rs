@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use crate::archive::{
     ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, ReadSeek,
@@ -319,20 +319,7 @@ fn decode_lzms_chunk(compressed: &[u8], uncompressed_len: usize) -> Result<Vec<u
 
 // ── Metadata resource: directory tree ───────────────────────────────────
 
-/// Windows `FILETIME` (100 ns intervals since 1601-01-01) → `SystemTime`.
-/// `0` conventionally means "no timestamp".
-fn filetime_to_systime(ticks: u64) -> Option<SystemTime> {
-    // 100 ns intervals between the FILETIME epoch (1601-01-01) and the Unix
-    // epoch (1970-01-01).
-    const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
-    if ticks == 0 {
-        return None;
-    }
-    let unix_100ns = ticks.checked_sub(EPOCH_DIFF_100NS)?;
-    let secs = unix_100ns / 10_000_000;
-    let nanos = (unix_100ns % 10_000_000) * 100;
-    Some(UNIX_EPOCH + Duration::new(secs, nanos as u32))
-}
+use crate::datetime::filetime_to_systime;
 
 /// Decode a raw UTF-16LE byte slice (no terminator included) to a `String`.
 fn decode_utf16le(b: &[u8]) -> Result<String> {
@@ -679,6 +666,7 @@ impl ArchiveReader for WimReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
 
     /// Build a syntactically valid 208-byte header with the given flags/
     /// chunk size/part fields; the two embedded resource headers are zeroed.

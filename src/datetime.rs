@@ -15,6 +15,28 @@ pub(crate) fn unix_secs_to_systime(secs: u64) -> Option<SystemTime> {
     (secs != 0).then(|| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
 }
 
+/// Windows `FILETIME` (100 ns intervals since 1601-01-01) → `SystemTime`.
+///
+/// Unlike the DOS and classic-Mac fields below, a `FILETIME` is an absolute
+/// instant in UTC, not a wall-clock reading — so it converts by arithmetic
+/// alone, with no timezone to guess. `0` conventionally means "no timestamp",
+/// and a value before the Unix epoch yields `None` rather than wrapping.
+///
+/// Used by WIM (`.wim`/`.esd`) and by NSIS installers, which store the same
+/// field.
+pub(crate) fn filetime_to_systime(ticks: u64) -> Option<SystemTime> {
+    // 100 ns intervals between the FILETIME epoch (1601-01-01) and the Unix
+    // epoch (1970-01-01).
+    const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
+    if ticks == 0 {
+        return None;
+    }
+    let unix_100ns = ticks.checked_sub(EPOCH_DIFF_100NS)?;
+    let secs = unix_100ns / 10_000_000;
+    let nanos = (unix_100ns % 10_000_000) * 100;
+    Some(SystemTime::UNIX_EPOCH + Duration::new(secs, nanos as u32))
+}
+
 /// Convert a UTC civil date-time to `SystemTime`.
 ///
 /// Returns `None` for out-of-range fields or pre-epoch dates (so a crafted

@@ -8,6 +8,7 @@
 //! bytes to [`NsisHandler::open_bytes`].
 
 use crate::archive::{ArchiveReader, Confidence, FormatHandler, FormatId, OpenOptions, Source};
+use crate::datetime::filetime_to_systime;
 use crate::error::{Error, Result, io_err_to_corrupt};
 use std::io::{Cursor, Write};
 
@@ -25,7 +26,15 @@ impl LegacyBackend for NsisBackend {
         self.0
             .entries()
             .iter()
-            .map(|e| EntryMeta::named(e.name(), e.is_dir(), e.size().unwrap_or(0)))
+            .map(|e| {
+                // NSIS records a Windows FILETIME per extracted file — an
+                // absolute instant in UTC, so unlike the DOS and classic-Mac
+                // fields it needs no local-time reasoning. Directories carry
+                // none: the installer script only ever sets the output path for
+                // them, it never restores a directory's date.
+                EntryMeta::named(e.name(), e.is_dir(), e.size().unwrap_or(0))
+                    .at(e.filetime().and_then(filetime_to_systime))
+            })
             .collect()
     }
     fn read(&self, idx: usize, out: &mut dyn Write) -> Result<()> {

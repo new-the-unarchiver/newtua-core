@@ -90,6 +90,32 @@ pub(crate) fn dos_date_to_systime(date: u16, time: u16) -> Option<SystemTime> {
     crate::datetime::local_civil_to_systime(year, month, day, hour, min, sec)
 }
 
+/// Convert the CP/M date/time word pair an LBR directory stores.
+///
+/// The date word counts **days since 1978-12-31**, so day 1 is 1979-01-01; the
+/// time word is packed exactly like the MS-DOS one (hour in 15..11, minute in
+/// 10..5, half-seconds in 4..0). A zero date means the member carries no
+/// timestamp.
+///
+/// Read as local time, for the same reason as [`dos_date_to_systime`]: CP/M had
+/// no timezone either.
+pub(crate) fn cpm_date_to_systime(date: u16, time: u16) -> Option<SystemTime> {
+    if date == 0 {
+        return None;
+    }
+    /// Seconds from the Unix epoch to 1978-12-31, the day the CP/M count is
+    /// relative to (`SecondsFrom1970ToLastDayOf1978` in XADMaster).
+    const CPM_EPOCH: u64 = 283_910_400;
+    let hour = u64::from(time >> 11);
+    let min = u64::from((time >> 5) & 0x3F);
+    let sec = u64::from(time & 0x1F) * 2;
+    if hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+    let secs = CPM_EPOCH + u64::from(date) * 86_400 + hour * 3600 + min * 60 + sec;
+    crate::datetime::local_unix_secs_to_systime(secs)
+}
+
 /// Convert an AppleSingle timestamp (signed seconds since 2000-01-01).
 /// Dates before 1970 are representable here and are returned as such.
 pub(crate) fn applesingle_date_to_systime(secs: Option<u32>) -> Option<SystemTime> {
@@ -334,3 +360,46 @@ macro_rules! legacy_std_handler {
     };
 }
 pub(crate) use legacy_std_handler;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datetime::local_civil_to_systime;
+
+    /// The CP/M day count is relative to 1978-12-31, so day 1 is New Year's Day
+    /// 1979. Stated against `local_civil_to_systime` rather than against a fixed
+    /// number of seconds, because both sides are wall-clock readings and the
+    /// answer therefore depends on the machine's timezone — which is the point.
+    #[test]
+    fn cpm_day_one_is_the_first_of_january_1979() {
+        assert_eq!(
+            cpm_date_to_systime(1, 0),
+            local_civil_to_systime(1979, 1, 1, 0, 0, 0)
+        );
+    }
+
+    /// A real record: `EGA.DOC` in `EGA.LBR` (sembiance corpus) carries creation
+    /// date word 2829 and time word 0xBBCF, and `unar` unpacks its siblings with
+    /// dates that match ours to the second.
+    #[test]
+    fn cpm_date_matches_a_real_lbr_record() {
+        assert_eq!(
+            cpm_date_to_systime(2829, 0xBBCF),
+            local_civil_to_systime(1986, 9, 29, 23, 30, 30)
+        );
+    }
+
+    /// Zero is how the directory spells "no date", and the two-second resolution
+    /// of the time word must not turn that into an instant.
+    #[test]
+    fn cpm_zero_date_is_no_date() {
+        assert_eq!(cpm_date_to_systime(0, 0xBBCF), None);
+    }
+
+    /// A time word can hold values no clock ever shows (hour 31); those are
+    /// rejected rather than silently wrapped into the next day.
+    #[test]
+    fn cpm_out_of_range_time_is_rejected() {
+        assert_eq!(cpm_date_to_systime(2829, 0xF800), None);
+    }
+}

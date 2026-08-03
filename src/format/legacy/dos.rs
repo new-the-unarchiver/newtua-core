@@ -6,8 +6,8 @@ use crate::error::{Result, io_err_to_corrupt};
 use std::io::{Cursor, Write};
 
 use super::{
-    EntryMeta, LegacyBackend, LegacyReader, dos_date_to_systime, legacy_probe, legacy_std_handler,
-    read_all,
+    EntryMeta, LegacyBackend, LegacyReader, cpm_date_to_systime, dos_date_to_systime, legacy_probe,
+    legacy_std_handler, read_all,
 };
 
 use newtua_dos::arc::ArcArchive;
@@ -54,8 +54,13 @@ legacy_std_handler! {
     exts: [],
     recognize: LbrArchive::recognize,
     open: |b, _o| LbrArchive::open(Cursor::new(b)),
+    // A member with no modification date falls back to its creation date, the
+    // way XADLBRParser does: CP/M utilities often stamped only one of the two,
+    // and preferring the creation date over nothing keeps a real date on disk.
     metas: |a| a.entries().iter()
-        .map(|e| EntryMeta::file(e.name(), e.size()))
+        .map(|e| EntryMeta::file(e.name(), e.size())
+            .at(cpm_date_to_systime(e.modification_date(), e.modification_time())
+                .or_else(|| cpm_date_to_systime(e.creation_date(), e.creation_time()))))
         .collect(),
 }
 
