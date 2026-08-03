@@ -7,7 +7,7 @@ use std::io::{Cursor, Write};
 
 use super::{
     EntryMeta, LegacyBackend, LegacyReader, cpm_date_to_systime, dos_date_to_systime, legacy_probe,
-    legacy_std_handler, read_all,
+    legacy_std_handler, read_all, zoo_date_to_systime,
 };
 
 use newtua_dos::arc::ArcArchive;
@@ -40,9 +40,11 @@ legacy_std_handler! {
     exts: [],
     recognize: ZooArchive::recognize,
     open: |b, _o| ZooArchive::open(Cursor::new(b)),
+    // Zoo records the packer's timezone next to the date, so unlike its DOS-era
+    // neighbours its dates convert to a real instant — see `zoo_date_to_systime`.
     metas: |a| a.entries().iter()
         .map(|e| EntryMeta::named(e.name(), e.is_dir(), e.size())
-            .at(dos_date_to_systime(e.modification_date(), e.modification_time())))
+            .at(zoo_date_to_systime(e.modification_date(), e.modification_time(), e.timezone())))
         .collect(),
 }
 

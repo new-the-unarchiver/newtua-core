@@ -90,6 +90,54 @@ pub(crate) fn dos_date_to_systime(date: u16, time: u16) -> Option<SystemTime> {
     crate::datetime::local_civil_to_systime(year, month, day, hour, min, sec)
 }
 
+/// Convert Zoo's MS-DOS date/time pair using the timezone the packer recorded
+/// alongside them.
+///
+/// Zoo is the only format here that writes that zone down, so its dates are a
+/// real instant rather than a bare wall-clock reading: `tz` counts quarter
+/// hours **west of GMT**, hence `UTC = wall clock + tz × 15 minutes`. The
+/// direction is from zoo 2.1's own source — `zoolist.c::printtz` subtracts
+/// `gettz() / 3600` from `file_tz / 4`, and `gettz()` returns seconds *west* of
+/// GMT in both shipped implementations (`bsd.c`: `tz_minuteswest * 60`;
+/// `sysv.c`: the SysV `timezone` global). Both sides of that subtraction are
+/// therefore westward, so the stored field is too.
+///
+/// **This disagrees with `unar`**, which reads the same byte as an *eastward*
+/// offset (`XADZooParser`: `timeZoneForSecondsFromGMT: tzoffs * 15 * 60`) and
+/// so places every Zoo file twice its zone offset away. On the reference
+/// `24mhzhck.zoo` — a US bulletin-board text from May 1992 — the stored `tz` of
+/// 16 means four hours west, which is exactly US Eastern summer time; read
+/// eastward it would claim the file came from the Gulf.
+///
+/// `None` for the zone means the archive recorded none (`NO_TZ`, or an old
+/// type-1 entry). Then there is nothing to convert with, and the wall clock is
+/// read as local time — the same fallback as every other DOS-era format.
+pub(crate) fn zoo_date_to_systime(date: u16, time: u16, tz: Option<i8>) -> Option<SystemTime> {
+    let Some(tz) = tz else {
+        return dos_date_to_systime(date, time);
+    };
+    if date == 0 {
+        return None;
+    }
+    let year = 1980 + i32::from(date >> 9);
+    let month = u32::from((date >> 5) & 0x0F);
+    let day = u32::from(date & 0x1F);
+    let hour = u64::from(time >> 11);
+    let min = u64::from((time >> 5) & 0x3F);
+    let sec = u64::from(time & 0x1F) * 2;
+    if hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+    // The wall clock as if it were UTC, then shifted by the recorded zone.
+    let utc = crate::datetime::civil_to_systime(year, month, day, hour, min, sec)?;
+    let shift = Duration::from_secs(u64::from(tz.unsigned_abs()) * 15 * 60);
+    if tz >= 0 {
+        utc.checked_add(shift)
+    } else {
+        utc.checked_sub(shift)
+    }
+}
+
 /// Convert the CP/M date/time word pair an LBR directory stores.
 ///
 /// The date word counts **days since 1978-12-31**, so day 1 is 1979-01-01; the
@@ -414,6 +462,7 @@ pub(crate) use legacy_std_handler;
 mod tests {
     use super::*;
     use crate::datetime::local_civil_to_systime;
+    use std::time::UNIX_EPOCH;
 
     /// The CP/M day count is relative to 1978-12-31, so day 1 is New Year's Day
     /// 1979. Stated against `local_civil_to_systime` rather than against a fixed
@@ -435,6 +484,47 @@ mod tests {
         assert_eq!(
             cpm_date_to_systime(2829, 0xBBCF),
             local_civil_to_systime(1986, 9, 29, 23, 30, 30)
+        );
+    }
+
+    /// Zoo's `24mhzhck.zoo`, the one reference we have: stored wall clock
+    /// 1992-05-20 16:57:26 with `tz` = 16, i.e. four hours west of GMT, so the
+    /// instant is 20:57:26 UTC. `unar` reports 12:57:26 for the same file —
+    /// four hours the other way — because it reads the field as an eastward
+    /// offset. The direction here is the one zoo's own source uses.
+    #[test]
+    fn zoo_date_shifts_west_by_the_recorded_zone() {
+        let date = ((1992 - 1980) << 9) | (5 << 5) | 20;
+        let time = (16 << 11) | (57 << 5) | 13; // 26 seconds / 2
+        let t = zoo_date_to_systime(date, time, Some(16)).expect("an instant");
+        let secs = t.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        // 1992-05-20T20:57:26Z
+        assert_eq!(secs, 706_395_446);
+    }
+
+    /// A zone east of GMT shifts the other way, and the sign has to survive the
+    /// byte being stored unsigned.
+    #[test]
+    fn zoo_date_shifts_east_for_a_negative_zone() {
+        let date = ((1992 - 1980) << 9) | (5 << 5) | 20;
+        let time = (16 << 11) | (57 << 5) | 13;
+        let west = zoo_date_to_systime(date, time, Some(16)).unwrap();
+        let east = zoo_date_to_systime(date, time, Some(-16)).unwrap();
+        assert_eq!(
+            west.duration_since(east).unwrap(),
+            Duration::from_secs(2 * 4 * 3600)
+        );
+    }
+
+    /// No recorded zone means no instant to compute: the wall clock is read
+    /// locally, exactly as for every other DOS-era format.
+    #[test]
+    fn zoo_without_a_zone_falls_back_to_local_time() {
+        let date = ((1992 - 1980) << 9) | (5 << 5) | 20;
+        let time = (16 << 11) | (57 << 5) | 13;
+        assert_eq!(
+            zoo_date_to_systime(date, time, None),
+            dos_date_to_systime(date, time)
         );
     }
 
