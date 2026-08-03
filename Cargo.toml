@@ -118,7 +118,9 @@ base64 = "0.22"
 # Legacy-format decoders ported from XADMaster (the newtua-formats family).
 # Thin FormatHandler/ArchiveReader adapters live in src/format/legacy/. Each
 # crate exposes a uniform recognize/open/entries/read_entry API over &[u8].
-newtua-dos = "0.1"
+# 0.1.2 — не "0.1": даты ARC, ARJ и Zoo (modification_date/_time) появились
+# именно в ней, и на 0.1.1 наш код не соберётся.
+newtua-dos = "0.1.2"
 newtua-mac = "0.1"
 newtua-stuffit = "0.1"
 newtua-amiga = "0.1"
