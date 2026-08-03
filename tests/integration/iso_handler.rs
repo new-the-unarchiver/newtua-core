@@ -228,6 +228,81 @@ fn read_entry_twice_returns_identical_complete_bytes() {
     );
 }
 
+// ── Rock Ridge permissions and per-record dates ──────────────────────────────
+
+/// Seconds since the Unix epoch of an entry's `modified`, for comparing against
+/// what an external reader reports.
+fn mtime_secs(e: &newtua_core::archive::Entry) -> u64 {
+    e.modified
+        .expect("entry carries no mtime")
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("mtime is post-epoch")
+        .as_secs()
+}
+
+/// `appimage_type1.AppImage` is an ISO 9660 image with Rock Ridge, so every
+/// record carries a `PX` mode and a `TF` timestamp of its own. Files and
+/// directories alike used to come out with `mode: None` and directories with no
+/// date at all — an extracted `AppRun` lost its execute bit and every directory
+/// was stamped with the moment of extraction.
+///
+/// The expected values are `xorriso`'s, not ours. Obtained with:
+///   xorriso -osirrox on -indev <image> -extract / ref
+///   TZ=UTC stat -f '%Sp %Sm %N' -t '%Y-%m-%d %H:%M:%S' ref/…
+/// which restores `rwxrwxr-x` (files and directories) and dates that differ
+/// between records: 03:39:02 for `.DirIcon`, 03:39:25 for `usr/`, 03:39:26 for
+/// `AppRun`, all on 2016-01-09 UTC. That spread is the point — a single shared
+/// date would pass a laxer assertion while proving nothing.
+#[test]
+fn rock_ridge_iso_reports_mode_and_per_record_dates() {
+    let (_d, r) = open_renamed("appimage_type1.AppImage", "appimage.iso");
+    let mut reader = r.expect("type-1 AppImage must open as an ISO");
+    let entries = reader.entries().expect("entries");
+
+    let by_path = |p: &str| {
+        entries
+            .iter()
+            .find(|e| e.path == Path::new(p))
+            .unwrap_or_else(|| panic!("{p} missing from the listing"))
+    };
+
+    for (path, mtime) in [
+        (".DirIcon", 1_452_310_742),
+        ("AppRun", 1_452_310_766),
+        ("usr", 1_452_310_765),
+        ("usr/bin", 1_452_310_765),
+        ("usr/bin/xorriso", 1_452_310_766),
+    ] {
+        let e = by_path(path);
+        assert_eq!(
+            e.mode.map(|m| m & 0o7777),
+            Some(0o775),
+            "{path}: wrong permissions"
+        );
+        assert_eq!(mtime_secs(e), mtime, "{path}: wrong mtime");
+    }
+
+    // The type bits ride along with the permissions, the way cpio and HFS+ also
+    // report them; `extract.rs::apply_mode` masks them off before use.
+    assert_eq!(by_path("usr").mode.map(|m| m & 0o170000), Some(0o040000));
+    assert_eq!(by_path("AppRun").mode.map(|m| m & 0o170000), Some(0o100000));
+}
+
+/// The other half of the same rule: `sample.iso` is Joliet-only, with no Rock
+/// Ridge at all, so the image states no permissions. `None` is the honest
+/// answer — inventing `0644` here would close a file the disc never said was
+/// closed. Dates still come out, from the ISO 9660 recording timestamp, which is
+/// all such an image has.
+#[test]
+fn iso_without_rock_ridge_reports_no_mode_but_still_reports_dates() {
+    let opts = OpenOptions::default();
+    let mut reader = detect::open(&fixture("sample.iso"), &opts).expect("open sample.iso");
+    for e in reader.entries().expect("entries") {
+        assert_eq!(e.mode, None, "{:?}: mode invented out of nothing", e.path);
+        assert!(e.modified.is_some(), "{:?}: no recording date", e.path);
+    }
+}
+
 // ── Runaway directory walks (D2) ─────────────────────────────────────────────
 //
 // The walk in `iso.rs` used to recurse with no depth cap and no memory of the

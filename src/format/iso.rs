@@ -174,6 +174,7 @@ where
         match item {
             DirectoryEntry::File(f) => {
                 let modified = offset_datetime_to_systime(f.modify_time());
+                let mode = posix_mode(&f);
                 let size = u64::from(f.size());
                 let path = PathBuf::from(&full_path);
                 entries.push(Entry {
@@ -181,7 +182,7 @@ where
                     path,
                     kind: EntryKind::File,
                     size,
-                    mode: None,
+                    mode,
                     is_encrypted: false,
                     modified,
                     is_resource_fork: false,
@@ -193,14 +194,16 @@ where
                 // loops. List the record (the name is real) but do not descend
                 // again — descending is what never returns.
                 let first_visit = visited.insert(d.header().extent_loc);
+                let modified = offset_datetime_to_systime(d.modify_time());
+                let mode = posix_mode(&d);
                 entries.push(Entry {
                     path_raw: full_path.as_bytes().to_vec(),
                     path: PathBuf::from(&full_path),
                     kind: EntryKind::Dir,
                     size: 0,
-                    mode: None,
+                    mode,
                     is_encrypted: false,
-                    modified: None,
+                    modified,
                     is_resource_fork: false,
                 });
                 iso_files.push(None); // no file body for directories
@@ -210,15 +213,17 @@ where
             }
             DirectoryEntry::Symlink(s) => {
                 let target = s.target().map(PathBuf::from).unwrap_or_default();
+                let modified = offset_datetime_to_systime(s.modify_time());
+                let mode = posix_mode(&s);
                 let path = PathBuf::from(&full_path);
                 entries.push(Entry {
                     path_raw: full_path.into_bytes(),
                     path,
                     kind: EntryKind::Symlink { target },
                     size: 0,
-                    mode: None,
+                    mode,
                     is_encrypted: false,
-                    modified: None,
+                    modified,
                     is_resource_fork: false,
                 });
                 iso_files.push(None); // no body
@@ -288,6 +293,23 @@ fn map_iso_err(e: cdfs::ISOError) -> Error {
         cdfs::ISOError::InvalidFs(msg) => Error::Corrupt(msg.to_string()),
         _ => Error::Corrupt(e.to_string()),
     }
+}
+
+/// The Rock Ridge `PX` mode of a record, whole — the type bits included, the
+/// way cpio and HFS+ also report it; `extract.rs::apply_mode` keeps only the
+/// permission bits.
+///
+/// `None` when the record carries no `PX` entry, and that is not the same as
+/// `0`: a plain ISO 9660 disc without Rock Ridge says nothing about
+/// permissions at all, so there is nothing to restore and the extractor's own
+/// default must stand. Handing out a made-up `0644` there would close a script
+/// the disc never said was closed.
+///
+/// Directories and symlinks go through this too — the `PX` entry is the same
+/// structure for every record kind, and a directory its owner had closed
+/// (`0700`) is otherwise indistinguishable from a public one.
+fn posix_mode(item: &impl ExtraAttributes) -> Option<u32> {
+    item.mode().map(|m| m.bits())
 }
 
 /// Convert a `time::OffsetDateTime` to `SystemTime`.
