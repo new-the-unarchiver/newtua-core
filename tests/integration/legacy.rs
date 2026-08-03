@@ -442,3 +442,66 @@ fn encrypted_stuffit5_with_the_right_password_extracts() {
         b"classified payload\n"
     );
 }
+
+// ---- Envelopes: BinHex and MacBinary open what they carry -------------------
+//
+// `nested.sit.hqx` / `nested.sit.bin` wrap a real StuffIt 5 archive under the
+// inner name `inner.sit`; `plain.hqx` wraps an ordinary `notes.txt`. All three
+// were built by the mirror encoders in `newtua-mac`'s own oracle tests — the
+// ones whose output `unar` reads — so the envelopes are not merely
+// self-consistent.
+
+#[test]
+fn binhex_envelope_opens_the_archive_inside() {
+    // Before this, a person opening `x.sit.hqx` got one entry named `x.sit` and
+    // had to unpack a second time to reach anything.
+    let mut ar = open_detected("nested.sit.hqx");
+    assert_eq!(
+        ar.format(),
+        FormatId::StuffIt5,
+        "envelope was not unwrapped"
+    );
+    let names: Vec<String> = ar
+        .entries()
+        .unwrap()
+        .iter()
+        .map(|e| e.path.to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().any(|n| n == "docs/readme"), "got {names:?}");
+    assert!(names.iter().any(|n| n == "top"), "got {names:?}");
+    // The envelope's own resource fork is not part of the payload and must not
+    // show up beside the archive's members.
+    assert!(!names.iter().any(|n| n == "inner.sit"), "got {names:?}");
+}
+
+#[test]
+fn macbinary_envelope_opens_the_archive_inside() {
+    let mut ar = open_detected("nested.sit.bin");
+    assert_eq!(
+        ar.format(),
+        FormatId::StuffIt5,
+        "envelope was not unwrapped"
+    );
+    assert!(
+        ar.entries().unwrap().len() > 1,
+        "an unwrapped archive has more than the envelope's one entry"
+    );
+}
+
+#[test]
+fn an_envelope_around_an_ordinary_file_stays_an_envelope() {
+    // The rule is keyed on the inner name's suffix, not on "unwrap everything":
+    // a `.txt` inside BinHex is a file, and both of its forks are what the
+    // caller asked for.
+    let mut ar = open_detected("plain.hqx");
+    assert_eq!(ar.format(), FormatId::BinHex);
+    let entries = ar.entries().unwrap();
+    assert!(
+        entries.iter().all(|e| e.path.to_str() == Some("notes.txt")),
+        "got {entries:#?}"
+    );
+    assert!(
+        entries.iter().any(|e| e.is_resource_fork),
+        "the resource fork of a plain file must survive"
+    );
+}
