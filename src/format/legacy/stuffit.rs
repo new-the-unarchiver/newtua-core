@@ -4,11 +4,12 @@
 //! to classic or SIT5 by `recognize` with no extension tie-break needed.
 
 use crate::archive::{FormatId, OpenOptions};
+use crate::error::Error;
 use std::io::Cursor;
 
 use super::{EntryMeta, legacy_std_handler, mac_date_to_systime};
 
-use newtua_stuffit::sit5::StuffIt5Archive;
+use newtua_stuffit::sit5::{PasswordStatus, StuffIt5Archive};
 use newtua_stuffit::sitx::SitxArchive;
 use newtua_stuffit::stuffit::StuffItArchive;
 
@@ -43,11 +44,22 @@ legacy_std_handler! {
         Some(p) => StuffIt5Archive::open_with_password(Cursor::new(b), p.as_bytes()),
         None => StuffIt5Archive::open(Cursor::new(b)),
     },
+    // The encryption flag has to reach `Entry`, or `extract_all` never calls
+    // `verify_password` and the whole "fail before the first byte hits disk"
+    // guarantee quietly does not apply to this format.
     metas: |a| a.entries().iter()
         .map(|e| EntryMeta::named(e.name(), e.is_directory(), e.size())
             .resource_fork(e.is_resource_fork())
+            .encrypted(e.is_encrypted())
             .at(mac_date_to_systime(e.modification_date())))
         .collect(),
+    // Judged from the header hash alone — no fork is decoded, so a missing or
+    // wrong password is reported before anything is written.
+    verify: |a| match a.password_status() {
+        PasswordStatus::NotEncrypted | PasswordStatus::Correct => Ok(()),
+        PasswordStatus::Missing => Err(Error::Encrypted),
+        PasswordStatus::Wrong => Err(Error::WrongPassword),
+    },
 }
 
 legacy_std_handler! {

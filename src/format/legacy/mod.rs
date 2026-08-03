@@ -175,6 +175,14 @@ impl EntryMeta {
         self.modified = modified;
         self
     }
+
+    /// Mark this entry's data as encrypted. `extract_all` reads the flag to
+    /// decide whether to call `verify_password` at all, so an unset flag means
+    /// a wrong password is discovered mid-extraction rather than before it.
+    pub(crate) fn encrypted(mut self, yes: bool) -> Self {
+        self.is_encrypted = yes;
+        self
+    }
 }
 
 /// The list-and-extract surface every legacy archive shares, made object-safe
@@ -184,6 +192,13 @@ impl EntryMeta {
 pub(crate) trait LegacyBackend {
     fn metas(&self) -> Vec<EntryMeta>;
     fn read(&self, idx: usize, out: &mut dyn Write) -> Result<()>;
+
+    /// See [`ArchiveReader::verify_password`] for the contract. Defaults to
+    /// `Ok(())`, which is right for every legacy format that has no encryption
+    /// at all — most of them.
+    fn verify_password(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A generic [`ArchiveReader`] over any [`LegacyBackend`]: entry names are
@@ -244,6 +259,10 @@ impl ArchiveReader for LegacyReader {
             return Err(Error::InvalidIndex(idx));
         }
         self.backend.read(idx, out)
+    }
+
+    fn verify_password(&mut self) -> Result<()> {
+        self.backend.verify_password()
     }
 }
 
@@ -309,6 +328,9 @@ pub(crate) fn file_stem_bytes(src: &Source, fallback: &str) -> Vec<u8> {
 /// - `exts`: extension fallbacks (empty = content-only detection).
 /// - `open`: `fn(Vec<u8>, &OpenOptions) -> io::Result<Archive>`.
 /// - `metas`: `fn(&Archive) -> Vec<EntryMeta>`.
+/// - `verify` (optional): `fn(&Archive) -> Result<()>` implementing
+///   [`ArchiveReader::verify_password`]. Omit it for a format with no
+///   encryption, which is most of them.
 macro_rules! legacy_std_handler {
     (
         $(#[$hmeta:meta])*
@@ -319,6 +341,29 @@ macro_rules! legacy_std_handler {
         recognize: $recog:expr,
         open: $open:expr,
         metas: $metas:expr $(,)?
+    ) => {
+        $crate::format::legacy::legacy_std_handler! {
+            $(#[$hmeta])*
+            $Handler, $Backend,
+            id: $id,
+            archive: $Archive,
+            exts: [$($ext),*],
+            recognize: $recog,
+            open: $open,
+            metas: $metas,
+            verify: |_| Ok(()),
+        }
+    };
+    (
+        $(#[$hmeta:meta])*
+        $Handler:ident, $Backend:ident,
+        id: $id:expr,
+        archive: $Archive:ty,
+        exts: [$($ext:literal),* $(,)?],
+        recognize: $recog:expr,
+        open: $open:expr,
+        metas: $metas:expr,
+        verify: $verify:expr $(,)?
     ) => {
         $(#[$hmeta])*
         pub struct $Handler;
@@ -332,6 +377,10 @@ macro_rules! legacy_std_handler {
             }
             fn read(&self, idx: usize, out: &mut dyn ::std::io::Write) -> $crate::error::Result<()> {
                 self.0.read_entry(idx, out).map_err($crate::error::io_err_to_corrupt)
+            }
+            fn verify_password(&self) -> $crate::error::Result<()> {
+                let f: fn(&$Archive) -> $crate::error::Result<()> = $verify;
+                f(&self.0)
             }
         }
 

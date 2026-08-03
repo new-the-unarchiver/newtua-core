@@ -355,3 +355,90 @@ fn resource_fork_reaches_the_disk() {
         );
     }
 }
+
+// ---- StuffIt 5: encryption is announced, and checked before any writing -----
+//
+// `encrypted.sit` is a one-file StuffIt 5 archive (`secret.txt`, RC4 + MD5,
+// password `opensesame`), built by the mirror builder in `newtua-stuffit`'s own
+// `sit5_oracle` test — the same builder whose output `unar` extracts correctly,
+// so the container is not merely self-consistent.
+
+const SIT5_PASSWORD: &str = "opensesame";
+
+fn extract_opts(dest: &std::path::Path) -> newtua_core::ExtractOptions {
+    newtua_core::ExtractOptions {
+        dest: dest.to_path_buf(),
+        wrapper_name: Some("out".into()),
+        strict: false,
+        preserve: false,
+        selection: None,
+        progress: None,
+        keep_macos_metadata: false,
+    }
+}
+
+#[test]
+fn encrypted_stuffit5_entries_are_marked_encrypted() {
+    // Without this flag `extract_all` never calls `verify_password` at all, and
+    // every guarantee below is silently inert.
+    let mut ar = open_detected("encrypted.sit");
+    assert_eq!(ar.format(), FormatId::StuffIt5);
+    let entries = ar.entries().unwrap();
+    assert!(
+        entries.iter().any(|e| e.is_encrypted),
+        "no entry reports encryption: {entries:#?}"
+    );
+}
+
+#[test]
+fn encrypted_stuffit5_without_password_writes_nothing() {
+    let dest = tempfile::tempdir().unwrap();
+    let mut ar = open_detected("encrypted.sit");
+    let err = newtua_core::extract_all(&mut *ar, &mut extract_opts(dest.path())).unwrap_err();
+    assert!(
+        matches!(err, newtua_core::Error::Encrypted),
+        "expected Encrypted, got {err:?}"
+    );
+    assert!(
+        std::fs::read_dir(dest.path()).unwrap().next().is_none(),
+        "a failed password check must leave the destination untouched"
+    );
+}
+
+#[test]
+fn encrypted_stuffit5_with_wrong_password_writes_nothing() {
+    let dest = tempfile::tempdir().unwrap();
+    let opts = OpenOptions {
+        password: Some("WRONG".into()),
+        encoding_override: None,
+    };
+    let mut ar = newtua_core::open(&fixture("encrypted.sit"), &opts).unwrap();
+    let err = newtua_core::extract_all(&mut *ar, &mut extract_opts(dest.path())).unwrap_err();
+    assert!(
+        matches!(err, newtua_core::Error::WrongPassword),
+        "expected WrongPassword, got {err:?}"
+    );
+    assert!(
+        std::fs::read_dir(dest.path()).unwrap().next().is_none(),
+        "a wrong password must leave the destination untouched"
+    );
+}
+
+#[test]
+fn encrypted_stuffit5_with_the_right_password_extracts() {
+    // The control: without it, "writes nothing" could be satisfied by an
+    // extractor that never writes anything at all.
+    let dest = tempfile::tempdir().unwrap();
+    let opts = OpenOptions {
+        password: Some(SIT5_PASSWORD.into()),
+        encoding_override: None,
+    };
+    let mut ar = newtua_core::open(&fixture("encrypted.sit"), &opts).unwrap();
+    newtua_core::extract_all(&mut *ar, &mut extract_opts(dest.path())).unwrap();
+    // The archive holds one loose entry, so `extract_all` wraps it in a folder
+    // named after `wrapper_name`.
+    assert_eq!(
+        std::fs::read(dest.path().join("out/secret.txt")).unwrap(),
+        b"classified payload\n"
+    );
+}
