@@ -69,7 +69,19 @@ impl LegacyBackend for LzxBackend {
         self.0
             .entries()
             .iter()
-            .map(|e| EntryMeta::file(&e.name, e.size))
+            .map(|e| {
+                // LZX уже отдаёт дату разобранной по полям, вместе с двумя
+                // поправками на год, которые накопили разные версии формата.
+                // Часового пояса Amiga не знала — это часы на стене.
+                EntryMeta::file(&e.name, e.size).at(crate::datetime::local_civil_to_systime(
+                    e.date.year,
+                    e.date.month,
+                    e.date.day,
+                    u64::from(e.date.hour),
+                    u64::from(e.date.minute),
+                    u64::from(e.date.second),
+                ))
+            })
             .collect()
     }
     fn read(&self, idx: usize, out: &mut dyn Write) -> Result<()> {

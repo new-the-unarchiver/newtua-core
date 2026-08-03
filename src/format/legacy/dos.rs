@@ -5,7 +5,10 @@ use crate::archive::{ArchiveReader, Confidence, FormatHandler, FormatId, OpenOpt
 use crate::error::{Result, io_err_to_corrupt};
 use std::io::{Cursor, Write};
 
-use super::{EntryMeta, LegacyBackend, LegacyReader, legacy_probe, legacy_std_handler, read_all};
+use super::{
+    EntryMeta, LegacyBackend, LegacyReader, dos_date_to_systime, legacy_probe, legacy_std_handler,
+    read_all,
+};
 
 use newtua_dos::arc::ArcArchive;
 use newtua_dos::arj::ArjArchive;
@@ -24,7 +27,8 @@ legacy_std_handler! {
     recognize: ArjArchive::recognize,
     open: |b, _o| ArjArchive::open(Cursor::new(b)),
     metas: |a| a.entries().iter()
-        .map(|e| EntryMeta::named(e.name(), e.is_dir(), e.size()))
+        .map(|e| EntryMeta::named(e.name(), e.is_dir(), e.size())
+            .at(dos_date_to_systime(e.modification_date(), e.modification_time())))
         .collect(),
 }
 
@@ -37,7 +41,8 @@ legacy_std_handler! {
     recognize: ZooArchive::recognize,
     open: |b, _o| ZooArchive::open(Cursor::new(b)),
     metas: |a| a.entries().iter()
-        .map(|e| EntryMeta::named(e.name(), e.is_dir(), e.size()))
+        .map(|e| EntryMeta::named(e.name(), e.is_dir(), e.size())
+            .at(dos_date_to_systime(e.modification_date(), e.modification_time())))
         .collect(),
 }
 
@@ -77,7 +82,8 @@ legacy_std_handler! {
     recognize: |_| false,
     open: |b, _o| ArcArchive::open(Cursor::new(b)),
     metas: |a| a.entries().iter()
-        .map(|e| EntryMeta::named(e.name(), e.is_dir(), u64::from(e.size())))
+        .map(|e| EntryMeta::named(e.name(), e.is_dir(), u64::from(e.size()))
+            .at(dos_date_to_systime(e.modification_date(), e.modification_time())))
         .collect(),
 }
 
