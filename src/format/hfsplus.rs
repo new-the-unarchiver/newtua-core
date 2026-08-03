@@ -269,13 +269,19 @@ fn build_entries(volume: &[u8]) -> Result<(Vec<Entry>, Vec<u32>)> {
             EntryKind::File
         };
         let size = if kind == EntryKind::File { st.size } else { 0 };
+        // `HFSPlusBSDInfo.fileMode`, whole — type bits included, as cpio also
+        // reports it; `extract.rs::apply_mode` masks off everything but the
+        // permission bits. `0` means the record carried no BSD info at all, and
+        // that is not a mode: handing it on would strip read access from a file
+        // the archive said nothing about.
+        let mode = (st.mode != 0).then(|| u32::from(st.mode));
 
         entries.push(Entry {
             path_raw: w.path.as_bytes().to_vec(),
             path: PathBuf::from(&w.path),
             kind,
             size,
-            mode: None,
+            mode,
             is_encrypted: false,
             modified: hfs_date_to_systime(st.modified),
             is_resource_fork: false,
