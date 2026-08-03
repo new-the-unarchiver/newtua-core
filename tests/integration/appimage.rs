@@ -131,6 +131,25 @@ fn detected_by_extension_when_ai_marker_zeroed() {
 }
 
 #[test]
+fn real_type1_appimage_opens_with_nonempty_entries() {
+    // Real Type 1 AppImage (`AppImageExtract`, AppImageKit release 5, MIT
+    // licensed), unlike `type1_iso_lists_and_extracts` above: there the ISO is
+    // *appended after* a synthetic ELF prefix, so the old `e_shoff`-based
+    // offset math happens to land on it. Here the ELF runtime lives INSIDE
+    // the 32 KiB system area of the ISO 9660 image itself, so the embedded
+    // filesystem starts at offset 0 — CD001 is only reachable at the fixed
+    // absolute address 0x8001, never at an offset computed from the section
+    // header table. The file also predates the `AI\x01`/`AI\x02` marker
+    // entirely, so detection falls back to the `.AppImage` extension.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/appimage_type1.AppImage");
+    let mut reader = open(&path, &OpenOptions::default()).expect("open real type1 appimage");
+    assert_eq!(reader.format(), FormatId::AppImage);
+
+    let entries = reader.entries().expect("entries");
+    assert!(!entries.is_empty(), "expected a non-empty entry list");
+}
+
+#[test]
 fn garbage_filesystem_is_corrupt() {
     // Valid ELF prefix, but the payload is neither squashfs nor iso.
     let app = build_appimage(&[0x5Au8; 64], 2);

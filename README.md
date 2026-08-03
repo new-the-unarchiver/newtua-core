@@ -66,11 +66,48 @@ reports.
 
 Every variant below is a `FormatId` from [`src/archive.rs`](src/archive.rs).
 
+### What "supported" means here
+
+The word carries three different strengths in the three tables, and it is worth
+saying which is which rather than letting one table borrow the other's
+credibility.
+
+**Modern formats are proven.** Each has at least one reference archive that we
+extract and compare byte-for-byte against a source that is not this crate:
+either the payload the archive was built from by a real packer, or a foreign
+reader — `unar`, `7zz`, `unsquashfs`, `msiinfo`, `zipfile`. The reference set is
+118 archives and it runs before a release, not once.
+
+**Zip-based containers inherit that**, since they are the same engine with a
+different `FormatId`.
+
+**Legacy formats are held to XADMaster and to nothing more.** They open and
+list, and where a sample exists we extract it — but their content is not
+independently proven, because for most of these formats no second implementation
+exists to prove it against. Treat them as "what The Unarchiver does", not as a
+byte guarantee.
+
+Four gaps we know of, all of them shared with XADMaster, so closing them would
+be new work rather than a repair: a `.xar` whose members are LZMA-coded, a
+StuffItX archive, a Mach-O self-extracting `.exe`, and a `.dmg` using the old
+ADC compression. `unar` fails every one of them too.
+
+One gap that is ours alone: the three compression methods PKZIP used before
+Deflate — Shrink, Reduce and Implode. We open and list such an archive and then
+refuse its members with a clean `Unsupported`; we never mis-read them. Other
+readers do decompress them, so this is a missing capability rather than a
+defect, and it is deliberately deferred: these archives are from 1989–1990.
+
+**XADMaster is the floor, not the ceiling.** Two places where we already read
+what it cannot: a zip member compressed with zstd — `unar` exits non-zero and
+leaves a zero-length file, while our output is confirmed by `7zz` — and
+AppImage, which it does not recognise at all.
+
 ### Modern
 
 | Format | Notes |
 | --- | --- |
-| `Zip` | `.zip`, incl. ZipCrypto/AES encryption, LZMA/Deflate64 members |
+| `Zip` | `.zip`, incl. ZipCrypto/AES encryption, LZMA/Deflate64/zstd/PPMd members, and `zip -s` split archives (`.z01`…) |
 | `Tar` | `.tar`, bare or inside any supported compressor (`.tar.gz`, `.tar.xz`, `.tar.sz`, `.tar.lz`, `.tar.lzma`, …) |
 | `Gzip` | `.gz` (single compressed file, no container) |
 | `Bzip2` | `.bz2` (single compressed file, no container) |
@@ -93,7 +130,7 @@ Every variant below is a `FormatId` from [`src/archive.rs`](src/archive.rs).
 | `Wim` | `.wim`/`.esd`/`.swm` (Windows imaging format) |
 | `HfsPlus` | `.hfs`/`.hfsplus`/`.hfsx` (HFS+/HFSX volumes, incl. `decmpfs`) |
 | `Dmg` | `.dmg` (Apple Disk Image / UDIF container) |
-| `Apfs` | Apple File System, bare container or embedded in a DMG |
+| `Apfs` | Apple File System, bare container or embedded in a DMG, incl. `decmpfs` |
 | `Wpress` | `.wpress` (WordPress site dump: All-in-One WP Migration) |
 
 ### Zip-based containers
@@ -120,7 +157,9 @@ All open through the shared zip engine; only the reported `FormatId` differs.
 
 ### Legacy
 
-Ports from XADMaster, backed by the `newtua-formats` crate family.
+Ports from XADMaster, backed by the `newtua-formats` crate family. These are the
+rows the paragraph above applies to: they match XADMaster, without a byte-level
+promise of their own.
 
 | Format | Notes |
 | --- | --- |
@@ -163,7 +202,7 @@ the test files embed at compile time with `include_bytes!`. Shipping them would
 blow past the 10 MiB package limit, and shipping the tests without them would
 hand you a suite that cannot compile at all.
 
-Nothing is hidden. All 656 tests and every fixture live in the
+Nothing is hidden. All 750 tests and every fixture live in the
 [repository on GitHub](https://github.com/new-the-unarchiver/newtua-core) and
 run in CI on Linux, macOS and Windows. To run them yourself:
 

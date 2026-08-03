@@ -21,3 +21,17 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: tests
         run: cargo nextest run
+
+  # Отдельный джоб: `rust-version` в Cargo.toml — публичное обещание, и без
+  # проверки оно расходится с правдой молча. Так и вышло: объявленная 1.85 была
+  # неверна больше одного релиза, потому что здесь стояла только `stable`.
+  # Версия пишется буквально — так расхождение видно в диффе, а не прячется за
+  # чтением манифеста.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: Swatinem/rust-cache@v2
+      - name: build on the declared MSRV
+        run: cargo build --all-targets

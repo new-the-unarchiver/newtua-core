@@ -58,6 +58,109 @@ fn validate_7z_header(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Как найти запись при обходе архива.
+///
+/// По позиции искать нельзя: `for_each_entries` отдаёт сперва записи с потоком
+/// данных, и только потом каталоги и пустые файлы, а `archive.files` хранит
+/// порядок из заголовка. Поэтому запись ищется по имени; имя само по себе не
+/// уникально (архив — вход злоумышленника, одинаковые имена в нём законны),
+/// поэтому к имени добавлены класс записи и номер повтора.
+///
+/// Имя не дублируем: оно уже лежит в `Entry::path_raw` с тем же индексом.
+struct EntryKey {
+    /// Есть ли у записи поток данных. Записи с потоком и без него идут при
+    /// обходе двумя отдельными группами, внутри группы порядок заголовка
+    /// сохраняется — значит, считать повторы надо внутри своей группы.
+    has_stream: bool,
+    /// Сколько записей с тем же именем и тем же `has_stream` лежат раньше.
+    occurrence: usize,
+}
+
+/// Ограничение на длину цели символьной ссылки. Длину задаёт архив, поэтому
+/// доверять ей нельзя: без предела «ссылка» с телом на гигабайты съела бы
+/// память прямо в `open()`. 4096 — предел пути в Linux (в macOS он вчетверо
+/// меньше), настоящая цель в него укладывается всегда.
+const MAX_SYMLINK_TARGET: usize = 4096;
+
+/// Приёмник для цели символьной ссылки: копит байты в памяти, но обрывается
+/// ошибкой, как только превышен лимит.
+struct CappedBuf {
+    buf: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for CappedBuf {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if data.len() > self.limit - self.buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "7z: symlink target too long",
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Копирует содержимое одной записи архива в `out`, отыскав её по `name` и
+/// `key` — то есть по имени, классу и номеру повтора, а не по позиции обхода.
+///
+/// Открывает архив заново: `ArchiveReader::new` перечитывает только заголовок,
+/// тела распаковываются по ходу обхода. Обход прекращается на нужной записи.
+fn read_entry_by_key(
+    file_path: &Path,
+    password: sevenz_rust2::Password,
+    name: &[u8],
+    key: &EntryKey,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let file = File::open(file_path).map_err(Error::Io)?;
+    let mut seven = sevenz_rust2::ArchiveReader::new(file, password).map_err(map_7z_err)?;
+
+    let mut seen: usize = 0;
+    let mut found = false;
+    let mut extract_err: Option<Error> = None;
+
+    seven
+        .for_each_entries(|entry, reader| {
+            if !found && entry.has_stream == key.has_stream && entry.name().as_bytes() == name {
+                if seen == key.occurrence {
+                    found = true;
+                    // Копируем только тело этой записи; `false` прекращает обход,
+                    // дальше ничего не распаковывается.
+                    if let Err(e) = std::io::copy(reader, out) {
+                        extract_err = Some(Error::Io(e));
+                    }
+                    return Ok(false);
+                }
+                seen += 1;
+            }
+            // Не наша запись: пропускаем. В сплошном (solid) архиве это всё
+            // равно распаковывает данные — иначе до нужного тела не добраться, —
+            // но в памяти мы их не держим.
+            std::io::copy(reader, &mut std::io::sink())?;
+            Ok(true)
+        })
+        .map_err(map_7z_err)?;
+
+    if let Some(e) = extract_err {
+        return Err(e);
+    }
+    if !found {
+        // Заголовок обещал запись, которой обход не выдал: архив противоречит
+        // сам себе. Отдать чужие байты вместо неё нельзя.
+        return Err(Error::Corrupt(format!(
+            "7z: entry not found while extracting: {}",
+            String::from_utf8_lossy(name)
+        )));
+    }
+    Ok(())
+}
+
 impl FormatHandler for SevenZHandler {
     fn id(&self) -> FormatId {
         FormatId::SevenZ
@@ -200,12 +303,32 @@ impl FormatHandler for SevenZHandler {
             })
             .collect();
 
+        // Ключи поиска — по одному на запись, в том же порядке, что и entries.
+        // Считаем повторы имени внутри своего класса (с потоком / без).
+        let mut seen_names: std::collections::HashMap<(&[u8], bool), usize> =
+            std::collections::HashMap::new();
+        let keys: Vec<EntryKey> = archive
+            .files
+            .iter()
+            .map(|f| {
+                let has_stream = f.has_stream;
+                let counter = seen_names
+                    .entry((f.name().as_bytes(), has_stream))
+                    .or_insert(0);
+                let occurrence = *counter;
+                *counter += 1;
+                EntryKey {
+                    has_stream,
+                    occurrence,
+                }
+            })
+            .collect();
+
         // Second pass: populate symlink targets.
         // Symlink content (the link target path) is stored as the entry's payload.
-        // For each symlink we open a SEPARATE ArchiveReader, iterate to that entry,
-        // verify the name, read its content, then stop immediately.
-        // This avoids decompressing the full archive and avoids assuming iteration order
-        // — we verify entry.name() matches our expected path_raw before reading.
+        // Каждая ссылка читается отдельным проходом по архиву, и запись ищется
+        // по имени и номеру повтора (см. `EntryKey`): позиция обхода не совпадает
+        // с позицией в заголовке, как только в архиве есть хоть один каталог.
         let symlink_indices: Vec<usize> = entries
             .iter()
             .enumerate()
@@ -218,32 +341,20 @@ impl FormatHandler for SevenZHandler {
             // best-effort: ignore errors — open() must not fail due to symlink target reads.
             // Returns the decoded, non-empty target if one was successfully read.
             let target: Option<PathBuf> = (|| -> Option<PathBuf> {
-                let sym_file = File::open(&file_path).ok()?;
-                let mut seven =
-                    sevenz_rust2::ArchiveReader::new(sym_file, password.clone()).ok()?;
-                let mut counter: usize = 0;
-                let mut target_bytes: Option<Vec<u8>> = None;
-
-                let _ = seven.for_each_entries(|entry, reader| {
-                    if counter == sym_idx {
-                        // Verify name matches — defense against ordering assumptions.
-                        if entry.name().as_bytes() == expected_name.as_slice() {
-                            let mut buf = Vec::new();
-                            if std::io::copy(reader, &mut buf).is_ok() {
-                                target_bytes = Some(buf);
-                            }
-                        }
-                        Ok(false) // stop after this entry
-                    } else {
-                        // Skip preceding entries; for solid archives this still decompresses
-                        // them (unavoidable), but we do not retain the data.
-                        std::io::copy(reader, &mut std::io::sink())?;
-                        counter += 1;
-                        Ok(true)
-                    }
-                });
-
-                let buf = target_bytes?;
+                // Длина цели ограничена: размер из заголовка — вход злоумышленника.
+                let mut sink = CappedBuf {
+                    buf: Vec::new(),
+                    limit: MAX_SYMLINK_TARGET,
+                };
+                read_entry_by_key(
+                    &file_path,
+                    password.clone(),
+                    &expected_name,
+                    &keys[sym_idx],
+                    &mut sink,
+                )
+                .ok()?;
+                let buf = sink.buf;
                 // Trim any trailing null bytes, then decode the target with the
                 // SAME charset as entry names (honoring opts.encoding_override),
                 // matching how tar/zip decode their symlink targets.
@@ -274,6 +385,7 @@ impl FormatHandler for SevenZHandler {
             file_path,
             password: opts.password.clone(),
             entries,
+            keys,
         }))
     }
 }
@@ -300,6 +412,8 @@ struct SevenZReader {
     password: Option<String>,
     /// Entry metadata populated at open time (headers only, no payloads).
     entries: Vec<Entry>,
+    /// Чем искать запись при обходе — по одному ключу на запись `entries`.
+    keys: Vec<EntryKey>,
 }
 
 impl ArchiveReader for SevenZReader {
@@ -329,58 +443,24 @@ impl ArchiveReader for SevenZReader {
 
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
         // Validate index before doing any I/O.
-        if idx >= self.entries.len() {
+        // `entries` и `keys` строятся из одного и того же `archive.files`, так
+        // что одной проверки хватает на оба обращения по индексу.
+        let (Some(entry), Some(key)) = (self.entries.get(idx), self.keys.get(idx)) else {
             return Err(Error::InvalidIndex(idx));
-        }
+        };
 
         let password: sevenz_rust2::Password = match self.password.as_deref() {
             Some(pw) => pw.into(),
             None => sevenz_rust2::Password::empty(),
         };
 
-        // Re-open the archive file for this extraction.  ArchiveReader::new()
-        // re-reads only the header; the actual payload is decompressed lazily
-        // by for_each_entries as we iterate.
-        let file = File::open(&self.file_path).map_err(Error::Io)?;
-        let mut seven = sevenz_rust2::ArchiveReader::new(file, password).map_err(map_7z_err)?;
-
-        // Select by POSITION: for_each_entries yields entries in the same order
-        // as archive.files (the same Vec open() built entries from), so a running
-        // counter matches the caller's idx reliably even when two entries share a name.
-        let mut counter: usize = 0;
-        let mut found = false;
-        let mut extract_err: Option<Error> = None;
-
-        seven
-            .for_each_entries(|_entry, reader| {
-                if counter == idx {
-                    found = true;
-                    // Copy only this entry's payload to out; return false to
-                    // stop iteration early (no further decompression occurs).
-                    if let Err(e) = std::io::copy(reader, out) {
-                        extract_err = Some(Error::Io(e));
-                    }
-                    Ok(false)
-                } else {
-                    // Skip entries before the target.  For solid archives this
-                    // still decompresses preceding data (unavoidable for solid
-                    // streams), but we do NOT retain it in memory.
-                    std::io::copy(reader, &mut std::io::sink())?;
-                    counter += 1;
-                    Ok(true)
-                }
-            })
-            .map_err(map_7z_err)?;
-
-        if let Some(e) = extract_err {
-            return Err(e);
-        }
-
-        if !found {
-            return Err(Error::InvalidIndex(idx));
-        }
-
-        Ok(())
+        // Ищем запись ПО ИМЕНИ, а не по позиции обхода: `for_each_entries`
+        // выдаёт сперва записи с потоком данных и лишь затем каталоги и пустые
+        // файлы, тогда как `archive.files` (из него собран `entries`) хранит
+        // порядок заголовка. Счётчик обхода поэтому указывает на чужую запись
+        // в любом архиве, где есть хотя бы один каталог, — и подменял бы
+        // содержимое молча, без ошибки.
+        read_entry_by_key(&self.file_path, password, &entry.path_raw, key, out)
     }
 }
 

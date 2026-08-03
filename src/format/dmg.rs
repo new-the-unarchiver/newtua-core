@@ -211,10 +211,10 @@ fn sweep_for_volume<const N: usize>(
     let mut s = 0u64;
     let mut sig = [0u8; N];
     while reader.read_exact(&mut sig).is_ok() {
-        if matches(&sig) {
-            if let Ok(inner) = open(raw_path, s) {
-                return Ok(Some(inner));
-            }
+        if matches(&sig)
+            && let Ok(inner) = open(raw_path, s)
+        {
+            return Ok(Some(inner));
         }
         // Advance to the next sector's header: we already consumed N bytes.
         reader.seek_relative((SECTOR_SIZE - N as u64) as i64)?;

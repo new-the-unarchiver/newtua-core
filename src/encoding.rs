@@ -22,10 +22,10 @@ pub fn detect_encoding(raw: &[Vec<u8>], override_label: Option<&str>) -> String 
 }
 
 fn resolve_encoding(raw: &[Vec<u8>], override_label: Option<&str>) -> &'static Encoding {
-    if let Some(label) = override_label {
-        if let Some(enc) = Encoding::for_label(label.as_bytes()) {
-            return enc;
-        }
+    if let Some(label) = override_label
+        && let Some(enc) = Encoding::for_label(label.as_bytes())
+    {
+        return enc;
     }
     // Если всё валидный UTF-8 — берём UTF-8.
     if raw.iter().all(|b| std::str::from_utf8(b).is_ok()) {

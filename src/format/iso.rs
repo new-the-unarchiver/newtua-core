@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{Seek, SeekFrom, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,25 @@ use crate::archive::{
 use crate::error::{Error, Result};
 
 // ── Handler ──────────────────────────────────────────────────────────────────
+
+/// Depth cap on the directory-tree walk, guarding the same thing as
+/// `MAX_APFS_DEPTH` in `apfs.rs`: a crafted image must not be able to drive our
+/// own recursion off the end of the stack. It matters more here than there,
+/// because a stack overflow is an *abort*, not a panic — `catch_iso_panic` is
+/// powerless against it and the whole process dies.
+///
+/// The number is far below apfs's 256 on purpose, and it was measured rather
+/// than guessed. One level of `walk_dir` costs roughly 12 KB of stack in a debug
+/// build (each `ISODirectoryIterator` carries a 2048-byte block inline, and
+/// `read_entry_at` allocates another on the frame), so a debug test binary
+/// overflows somewhere between 160 and 170 levels. 32 keeps the worst case near
+/// 400 KB — comfortable even for a caller whose thread has a 1 MiB stack.
+///
+/// 32 is also generous against real images: ISO 9660 § 6.8.2.1 caps the
+/// hierarchy at 8 levels, and Rock Ridge's deep-directory relocation exists
+/// precisely because of that cap. If some genuine image ever trips this, the
+/// answer is to rewrite the walk with an explicit queue, not to raise the number.
+const MAX_ISO_DEPTH: usize = 32;
 
 pub struct IsoHandler;
 
@@ -67,7 +87,18 @@ impl FormatHandler for IsoHandler {
             let iso = ISO9660::new(inner).map_err(map_iso_err)?;
             let mut entries: Vec<Entry> = Vec::new();
             let mut iso_files: Vec<Option<ISOFile<Box<dyn ReadSeek>>>> = Vec::new();
-            walk_dir(iso.root(), "", &mut entries, &mut iso_files)?;
+            // Seed the visited set with the root's own extent, so a child record
+            // pointing back at the root is caught on the very first descent.
+            let mut visited: HashSet<u32> = HashSet::new();
+            visited.insert(iso.root().header().extent_loc);
+            walk_dir(
+                iso.root(),
+                "",
+                0,
+                &mut visited,
+                &mut entries,
+                &mut iso_files,
+            )?;
             Ok(IsoReader { entries, iso_files })
         })?;
         Ok(Box::new(reader))
@@ -97,21 +128,40 @@ pub(crate) fn has_iso_signature(path: &Path) -> bool {
 
 /// Recursively walk an `ISODirectory`, appending to `entries` and `iso_files`.
 /// `prefix` is the slash-joined path from the root (empty for root entries).
+/// `depth` counts levels below the root; `visited` holds the extent LBA of every
+/// directory already entered, including the root's.
+///
+/// Both guards exist because the directory graph is attacker input: a record may
+/// name itself as its own child, or a chain of records may close into a cycle,
+/// and either drives this recursion until the stack gives out. A stack overflow
+/// aborts the process — `catch_iso_panic` does not catch it — so the walk has to
+/// refuse to go there rather than be rescued afterwards.
 fn walk_dir<T>(
     dir: &cdfs::ISODirectory<T>,
     prefix: &str,
+    depth: usize,
+    visited: &mut HashSet<u32>,
     entries: &mut Vec<Entry>,
     iso_files: &mut Vec<Option<ISOFile<T>>>,
 ) -> Result<()>
 where
     T: cdfs::ISO9660Reader,
 {
+    if depth > MAX_ISO_DEPTH {
+        return Err(Error::Corrupt("iso: directory tree too deep".into()));
+    }
+
     for item in dir.contents() {
         let item = item.map_err(map_iso_err)?;
         let name = item.identifier();
 
-        // Skip the `.` and `..` self/parent entries.
-        if name == "." || name == ".." {
+        // Skip the `.` and `..` self/parent entries. An empty identifier counts
+        // as one of them: cdfs turns the single bytes 0x00 / 0x01 into "." / ".."
+        // only when it decodes them as such — a Joliet (UTF-16BE) directory, or
+        // one whose records carry no identifier at all, hands us "" for both, and
+        // an empty name walked straight back into the root. That is what killed
+        // the process on a type-1 AppImage.
+        if name.is_empty() || name == "." || name == ".." {
             continue;
         }
 
@@ -138,6 +188,10 @@ where
                 iso_files.push(Some(f));
             }
             DirectoryEntry::Directory(d) => {
+                // A directory extent we have already entered means the graph
+                // loops. List the record (the name is real) but do not descend
+                // again — descending is what never returns.
+                let first_visit = visited.insert(d.header().extent_loc);
                 entries.push(Entry {
                     path_raw: full_path.as_bytes().to_vec(),
                     path: PathBuf::from(&full_path),
@@ -148,7 +202,9 @@ where
                     modified: None,
                 });
                 iso_files.push(None); // no file body for directories
-                walk_dir(&d, &full_path, entries, iso_files)?;
+                if first_visit {
+                    walk_dir(&d, &full_path, depth + 1, visited, entries, iso_files)?;
+                }
             }
             DirectoryEntry::Symlink(s) => {
                 let target = s.target().map(PathBuf::from).unwrap_or_default();

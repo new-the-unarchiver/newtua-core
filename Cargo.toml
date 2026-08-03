@@ -2,7 +2,7 @@
 name = "newtua-core"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.93"
 license = "LGPL-3.0-or-later"
 description = "Archive extraction engine: lists and extracts over 50 formats entirely in-process, with no subprocess fallbacks. Extract only — never creates archives."
 readme = "README.md"
@@ -25,7 +25,23 @@ flate2 = "1"
 bzip2 = "0.5"
 cab = "0.6"
 xz2 = "0.1"
-zip = { version = "2", features = ["lzma", "bzip2", "zstd", "deflate64", "xz"] }
+# zip 7 adds the PPMd method (feature "ppmd", backed by `ppmd-rust`); zip 2.x
+# didn't support it at all. `ppmd-rust` is already in the tree transitively via
+# sevenz-rust2 0.21, licensed CC0-1.0 OR MIT-0 — no conflict with our
+# LGPL-3.0-or-later. The bump to 7 built clean with no code changes elsewhere.
+# `legacy-zip` (Shrink/Reduce/Implode — methods 1 and 2–6) stays OFF for now,
+# as a matter of priority rather than of evidence: real PKZIP 1989/1990
+# archives using all three now exist in the reference corpus, and for Shrink
+# and Implode a foreign reader (`unzip`, `7zz`) unpacks them with matching
+# CRCs, so turning the feature on would be measurable. Reduce has no such
+# confirmation yet. Today we open and list these archives and refuse the
+# members with a clean `Unsupported` — never a corrupt read.
+# One thing the changelog does not announce: between 2.4.2 and 7.2.0 the XZ
+# decoder behind this crate changed twice (xz2 → liblzma → lzma_rust2, a pure
+# Rust one). Method 14 (LZMA) we decode ourselves, but XZ we hand over whole,
+# so the `xz_zipx_*` integration tests are the only thing standing between us
+# and a silent divergence there.
+zip = { version = "7", features = ["lzma", "bzip2", "zstd", "deflate64", "xz", "ppmd"] }
 zstd = "0.13"
 lz4_flex = "0.11"
 brotli-decompressor = "5"
@@ -86,7 +102,7 @@ memmap2 = "0.9"
 lzfse_rust = "0.2.1"
 # APFS filesystem inside DMG images / bare containers (#21c): vendored reader,
 # see the newtua-apfs fork's README and format/apfs.rs.
-apfs-core = { package = "newtua-apfs", version = "0.2.0-newtua.1" }
+apfs-core = { package = "newtua-apfs", version = "0.2.0-newtua.2" }
 # Already resolved transitively (via rpm); used directly to decode the plist
 # `Data` base64 field. See format/dmg.rs.
 base64 = "0.22"
@@ -106,7 +122,10 @@ default = []
 [dev-dependencies]
 tar = "0.4"
 tempfile = "3"
-zip = { version = "2", features = ["lzma", "bzip2", "zstd", "deflate64", "xz"] }
+# Kept in lockstep with the [dependencies] entry above (same version, same
+# rationale for "ppmd" and for leaving "legacy-zip" off) so the resolver only
+# ever settles on one `zip` version for the whole build.
+zip = { version = "7", features = ["lzma", "bzip2", "zstd", "deflate64", "xz", "ppmd"] }
 cab = "0.6"
 flate2 = "1"
 sha2 = "0.10"
