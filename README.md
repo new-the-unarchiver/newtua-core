@@ -5,6 +5,8 @@
 entirely in-process, with no subprocess fallbacks, and it never creates
 archives.
 
+What changed between releases is in [CHANGELOG.md](CHANGELOG.md).
+
 ## Install
 
 ```bash
