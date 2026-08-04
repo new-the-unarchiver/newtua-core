@@ -92,7 +92,11 @@ msi = "0.10"
 # system libfuse3 package for a mounting feature we never use. Upstream already
 # split the binary off; the fix is unreleased. Lib name stays `cdfs`.
 cdfs = { package = "newtua-cdfs", version = "0.2.4-newtua.1" }
-goblin = { version = "0.10", default-features = false, features = ["pe32", "pe64", "std", "endian_fd"] }
+# Used by format/sfx.rs to find where the executable stub ends and the appended
+# archive begins. `pe32`/`pe64` for Windows self-extractors, `mach32`/`mach64`
+# for the macOS ones 7-Zip builds (`7zz a -sfx`, stub shipped by Homebrew). ELF
+# is deliberately absent: AppImage has its own handler.
+goblin = { version = "0.10", default-features = false, features = ["pe32", "pe64", "mach32", "mach64", "std", "endian_fd"] }
 warc = "0.4"
 # SquashFS (.squashfs/.sfs): pure-Rust reader. Explicit gzip/zstd/lz4/lzo +
 # parallel; backhand's `xz` feature stays OFF (its liblzma collides with our

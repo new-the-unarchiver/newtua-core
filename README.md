@@ -87,10 +87,10 @@ independently proven, because for most of these formats no second implementation
 exists to prove it against. Treat them as "what The Unarchiver does", not as a
 byte guarantee.
 
-Four gaps we know of, all of them shared with XADMaster, so closing them would
+Three gaps we know of, all of them shared with XADMaster, so closing them would
 be new work rather than a repair: a `.xar` whose members are LZMA-coded, a
-StuffItX archive, a Mach-O self-extracting `.exe`, and a `.dmg` using the old
-ADC compression. `unar` fails every one of them too.
+StuffItX archive, and a `.dmg` using the old ADC compression. `unar` fails every
+one of them too.
 
 The three compression methods PKZIP used before Deflate — Shrink, Reduce and
 Implode — used to be a gap of ours alone; they are decoded now. Shrink and
@@ -117,11 +117,11 @@ every one was run against a real archive with a third tool as the judge, since
 | **Timestamps of the DOS/classic-Mac era**: we apply the timezone rules *of the date stored*, so an archive from 1991 and one from 1993 each come out at the hour they were written | applies today's rules, so the date lands an hour off whenever summer time differed | Compact Pro reference: our value matched the stored wall clock in both directions, `unar`'s drifted one way in winter 1991 and the other in summer 1993 |
 | **zip member compressed with Reduce** (PKZIP 1989, methods 2–5) | `unar` reports "File is not fully supported" and leaves a zero-length file | `unzip` and `7zz` decline the method too, so the judge is the payload the reference archives were built from: all three reduction factors came out byte-identical |
 | **Zoo timestamps**: the entry records the packer's timezone in quarter hours *west* of GMT, and we shift by it in that direction | reads the same byte as an *eastward* offset, so every Zoo file lands twice its zone offset away | zoo 2.1's own source: `zoolist.c::printtz` computes `(file_tz / 4) - (gettz() / 3600)`, and `gettz()` returns seconds west of GMT in both shipped implementations. The reference `24mhzhck.zoo`, a US bulletin-board text from May 1992, stores `tz` = 16 — four hours west, exactly US Eastern summer time; read eastward it would claim the file came from the Gulf |
+| **macOS self-extracting archives** — a Mach-O executable with the archive appended, which is what `7zz a -sfx` builds on a Mac | not recognised at all; `unar` reports an unknown format | built with the stub 7-Zip itself ships (`default.sfx`, Homebrew), then extracted and diffed against `7zz x` on the same file: identical trees, identical bytes, modes and timestamps matching the originals. The universal (fat) form was checked the same way |
 
 The list is deliberately short. Two dozen other formats agree with `unar`
 byte-for-byte, and where we and XAD both fail — an LZMA-coded `.xar`, StuffItX,
-a Mach-O self-extracting `.exe`, a `.dmg` in ADC — that is parity and closing it
-would be new work, not a repair.
+a `.dmg` in ADC — that is parity and closing it would be new work, not a repair.
 
 ### Modern
 
@@ -143,7 +143,7 @@ would be new work, not a repair.
 | `Xar` | `.xar`/`.pkg` |
 | `Msi` | `.msi` (Windows Installer, CFB + embedded CAB) |
 | `Iso` | `.iso` (ISO 9660) |
-| `Sfx` | self-extracting `.exe` wrapper (reports the inner format) |
+| `Sfx` | self-extracting executable wrapper — Windows PE and macOS Mach-O, including the universal (fat) form; reports the inner format |
 | `Warc` | `.warc`/`.warc.gz` |
 | `Squashfs` | `.squashfs`/`.sfs` |
 | `AppImage` | AppImage (ELF runtime + appended SquashFS or ISO 9660) |

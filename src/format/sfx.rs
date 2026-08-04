@@ -13,6 +13,35 @@ const MAGICS: &[&[u8]] = &[
     b"MSCF",
 ];
 
+/// Mach-O magics as they appear at byte 0 of a macOS self-extractor.
+///
+/// A self-extractor built by 7-Zip on macOS (`7zz a -sfx`, stub shipped by
+/// Homebrew as `default.sfx`) is an ordinary Mach-O executable with the archive
+/// appended, exactly like the Windows PE case — only the wrapper differs. All
+/// four single-architecture spellings are listed because the magic doubles as
+/// the byte-order marker: `feedface`/`feedfacf` stored the other way round is
+/// what a reader on the opposite endianness sees.
+///
+/// `cafebabe` is the universal ("fat") container, which is always big-endian on
+/// disk. It is also the Java class-file magic — a collision we can afford:
+/// a `.class` is not an archive, so it ends at `Error::UnknownFormat` either
+/// way, only now via this handler instead of the registry.
+///
+/// The 64-bit fat variant `cafebabf` is deliberately absent: goblin 0.10 does
+/// not parse it, so claiming it would only mean falling back to scanning the
+/// whole executable for archive magic — worse than not claiming it at all.
+const MACHO_MAGICS: &[[u8; 4]] = &[
+    [0xCF, 0xFA, 0xED, 0xFE], // 64-bit, little-endian (the ordinary macOS one)
+    [0xCE, 0xFA, 0xED, 0xFE], // 32-bit, little-endian
+    [0xFE, 0xED, 0xFA, 0xCF], // 64-bit, big-endian
+    [0xFE, 0xED, 0xFA, 0xCE], // 32-bit, big-endian
+    [0xCA, 0xFE, 0xBA, 0xBE], // universal (fat), 32-bit offsets
+];
+
+fn is_macho(header: &[u8]) -> bool {
+    MACHO_MAGICS.iter().any(|m| header.starts_with(m))
+}
+
 /// Compute the PE overlay offset — the byte position immediately after the last
 /// raw section in the PE image. Returns `0` on any parse error so the caller
 /// falls back to scanning the whole file.
@@ -24,6 +53,39 @@ fn pe_overlay_offset(bytes: &[u8]) -> usize {
             .map(|s| (s.pointer_to_raw_data as usize).saturating_add(s.size_of_raw_data as usize))
             .max()
             .unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+/// The Mach-O counterpart: the byte position immediately after the last byte any
+/// load command claims in the file. Same contract as `pe_overlay_offset` —
+/// `0` on any parse error, so the caller scans the whole file.
+///
+/// Segments are what bounds the image: a signed binary keeps its signature
+/// inside `__LINKEDIT`, so taking the furthest `fileoff + filesize` covers it
+/// without having to walk `LC_CODE_SIGNATURE` separately. For a universal file
+/// the bound is the furthest end of any architecture slice instead — the slices
+/// are laid out one after another and the appended archive follows all of them.
+fn macho_overlay_offset(bytes: &[u8]) -> usize {
+    fn image_end(macho: &goblin::mach::MachO) -> usize {
+        macho
+            .segments
+            .iter()
+            .map(|s| usize::try_from(s.fileoff.saturating_add(s.filesize)).unwrap_or(usize::MAX))
+            .max()
+            .unwrap_or(0)
+    }
+
+    match goblin::mach::Mach::parse(bytes) {
+        Ok(goblin::mach::Mach::Binary(macho)) => image_end(&macho),
+        Ok(goblin::mach::Mach::Fat(multi)) => match multi.arches() {
+            Ok(arches) => arches
+                .iter()
+                .map(|a| (a.offset as usize).saturating_add(a.size as usize))
+                .max()
+                .unwrap_or(0),
+            Err(_) => 0,
+        },
         Err(_) => 0,
     }
 }
@@ -45,7 +107,7 @@ impl FormatHandler for SfxHandler {
     }
 
     fn probe(&self, header: &[u8], _name: Option<&str>) -> Confidence {
-        if header.starts_with(b"MZ") {
+        if header.starts_with(b"MZ") || is_macho(header) {
             // Below MAGIC (100) so real zip/7z/rar/cab archives always win when
             // their magic appears at the very start of the file.
             Confidence(50)
@@ -77,10 +139,15 @@ impl FormatHandler for SfxHandler {
         // a few hundred KB and the embedded archive is what the user actually wants.
         let bytes = std::fs::read(&path)?;
 
-        // Compute the floor past which we scan for embedded archive magics.
-        // goblin parses the PE headers and sections to find the overlay start.
-        // If parsing fails, floor = 0 (scan the whole file).
-        let floor = pe_overlay_offset(&bytes);
+        // Compute the floor past which we scan for embedded archive magics —
+        // goblin parses the executable's own headers to find where its image
+        // ends. Which parser to use is decided by the same magic `probe` matched
+        // on. If parsing fails, floor = 0 (scan the whole file).
+        let floor = if is_macho(&bytes) {
+            macho_overlay_offset(&bytes)
+        } else {
+            pe_overlay_offset(&bytes)
+        };
 
         // Clamp the floor: a crafted PE could report a section past EOF; an empty
         // slice just yields no match.
@@ -128,6 +195,38 @@ mod tests {
         let header = b"PK\x03\x04";
         let c = SfxHandler.probe(header, None);
         assert_eq!(c, Confidence::NONE);
+    }
+
+    #[test]
+    fn probe_every_macho_flavour_returns_fifty() {
+        // Same confidence as MZ: a macOS self-extractor is the same shape of
+        // file, and a real archive's own magic must still outrank it.
+        for magic in MACHO_MAGICS {
+            let mut header = magic.to_vec();
+            header.extend_from_slice(&[0u8; 28]);
+            assert_eq!(
+                SfxHandler.probe(&header, None),
+                Confidence(50),
+                "magic {magic:02X?} should be claimed as an executable wrapper"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_fat64_magic_is_not_claimed() {
+        // `cafebabf` is the 64-bit universal container. goblin 0.10 cannot parse
+        // it, so claiming it would mean scanning the whole executable for
+        // archive magic — see the note on MACHO_MAGICS.
+        let header = [0xCA, 0xFE, 0xBA, 0xBF, 0, 0, 0, 1];
+        assert_eq!(SfxHandler.probe(&header, None), Confidence::NONE);
+    }
+
+    #[test]
+    fn macho_overlay_offset_of_garbage_is_zero() {
+        // The documented fallback: unparseable input means "scan from the
+        // start", never a bogus non-zero floor that would skip real data.
+        assert_eq!(macho_overlay_offset(&[0xCF, 0xFA, 0xED, 0xFE, 0, 0, 0]), 0);
+        assert_eq!(macho_overlay_offset(b""), 0);
     }
 
     #[test]
