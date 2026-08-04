@@ -127,13 +127,24 @@ fn list_entries(
         //
         // RAR 5 also stores the exact instant as a Windows FILETIME, and
         // `libunrar` fills `RARHeaderDataEx::MtimeLow/High` with it — but that
-        // is unreachable from here. `unrar_sys`'s binding of the struct does not
-        // match the C layout past `RedirName`: reading `DirTarget` through it
-        // returns `0x656C6966`, the ASCII "file", i.e. a slice of some other
-        // field's memory. Fixing that means forking `unrar_sys` too, which is a
-        // decision of its own. Until then the two-second resolution of the DOS
-        // field is what we have, so an entry written at an odd second reads back
-        // one second earlier than `unar` reports it.
+        // is unreachable from here, and everything else past `FileAttr` with it.
+        //
+        // The vendored `dll.hpp` opens with `#pragma pack(push, 1)`: the C
+        // struct is packed solid. `unrar_sys` 0.5.8 declares it plain
+        // `#[repr(C)]`, so Rust inserts alignment padding before the first
+        // pointer and every later field sits exactly 4 bytes too far. Measured
+        // with `offsetof` against `offset_of!`: `FileAttr` 10280 = 10280, then
+        // `CmtBuf` 10284 vs 10288, `MtimeLow` 10364 vs 10368, whole struct
+        // 14340 vs 14344.
+        //
+        // Nothing here reads a field past `file_attr`, so no wrong value
+        // reaches a caller today — but `redir_name` is a *pointer* read at the
+        // shifted offset, so the first code that dereferences it walks off into
+        // nowhere. See `.claude/issues/15-*` for the way out (a maintained
+        // `unrar-ng-sys` already fixes this with `packed(1)`); until then the
+        // two-second resolution of the DOS field is what we have, so an entry
+        // written at an odd second reads back one second earlier than `unar`
+        // reports it.
         let modified = crate::datetime::dos_words_to_systime(
             (header.file_time >> 16) as u16,
             header.file_time as u16,
