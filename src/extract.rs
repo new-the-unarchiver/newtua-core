@@ -44,9 +44,20 @@ fn apply_mtime(path: &Path, modified: Option<SystemTime>) {
 #[cfg(unix)]
 fn apply_mode(path: &Path, mode: Option<u32>) {
     use std::os::unix::fs::PermissionsExt;
-    if let Some(m) = mode {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(m & 0o7777));
+    let Some(m) = mode else { return };
+    let want = m & 0o7777;
+    // Сперва посмотреть, а надо ли. Чаще всего не надо: только что созданный
+    // файл уже имеет ровно те права, что записаны в архиве (`rw-r--r--` и там,
+    // и там), и `chmod` тогда — работа вхолостую. На этой машине он стоит
+    // 10 мкс на файл против 1,4 мкс у чтения прав, то есть на архиве из
+    // семнадцати тысяч значков разница почти в секунду
+    // (замеры: `.claude/issues/22-lishniy-chmod-i-odin-potok.md`).
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.permissions().mode() & 0o7777 == want
+    {
+        return;
     }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(want));
 }
 
 #[cfg(not(unix))]
