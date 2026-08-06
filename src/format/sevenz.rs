@@ -3,7 +3,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::archive::{
-    ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
+    ArchiveReader, Confidence, Entry, EntryKind, EntrySink, FormatHandler, FormatId, OpenOptions,
+    SinkStep, SinkWriter, Source,
 };
 use crate::encoding::decode_names;
 use crate::error::{Error, Result};
@@ -20,10 +21,12 @@ const SEVENZ_MAGIC: &[u8] = &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 /// a genuine 7z has a correct StartHeaderCRC and a next-header region that fits
 /// inside the file.
 ///
-/// LIMITATION: this does not fully close the hole. A crafted 7z with a valid
-/// start header but huge internal varint counts (file/block/coder counts) can
-/// still drive a large allocation inside the dependency. A complete fix belongs
-/// upstream in `sevenz-rust2` (validate every count against the remaining input).
+/// The internal counts are no longer our problem: since 0.21.3/0.21.4 the
+/// dependency bounds every varint count (files, blocks, pack streams, coders,
+/// name bytes) against the remaining header input — `bounded_count` in its
+/// `reader.rs` — and caps eager pre-allocation. That is exactly the upstream fix
+/// this comment used to ask for, so what is left here is the cheap up-front
+/// check: a bad start header never reaches the tail-scan recovery at all.
 ///
 /// 7z signature header layout (32 bytes):
 ///   0..6  magic · 6..8 version · 8..12 StartHeaderCRC (u32 LE)
@@ -58,107 +61,162 @@ fn validate_7z_header(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Как найти запись при обходе архива.
-///
-/// По позиции искать нельзя: `for_each_entries` отдаёт сперва записи с потоком
-/// данных, и только потом каталоги и пустые файлы, а `archive.files` хранит
-/// порядок из заголовка. Поэтому запись ищется по имени; имя само по себе не
-/// уникально (архив — вход злоумышленника, одинаковые имена в нём законны),
-/// поэтому к имени добавлены класс записи и номер повтора.
-///
-/// Имя не дублируем: оно уже лежит в `Entry::path_raw` с тем же индексом.
-struct EntryKey {
-    /// Есть ли у записи поток данных. Записи с потоком и без него идут при
-    /// обходе двумя отдельными группами, внутри группы порядок заголовка
-    /// сохраняется — значит, считать повторы надо внутри своей группы.
-    has_stream: bool,
-    /// Сколько записей с тем же именем и тем же `has_stream` лежат раньше.
-    occurrence: usize,
-}
-
 /// Ограничение на длину цели символьной ссылки. Длину задаёт архив, поэтому
 /// доверять ей нельзя: без предела «ссылка» с телом на гигабайты съела бы
 /// память прямо в `open()`. 4096 — предел пути в Linux (в macOS он вчетверо
 /// меньше), настоящая цель в него укладывается всегда.
 const MAX_SYMLINK_TARGET: usize = 4096;
 
-/// Приёмник для цели символьной ссылки: копит байты в памяти, но обрывается
-/// ошибкой, как только превышен лимит.
-struct CappedBuf {
-    buf: Vec<u8>,
-    limit: usize,
-}
-
-impl Write for CappedBuf {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        if data.len() > self.limit - self.buf.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "7z: symlink target too long",
-            ));
-        }
-        self.buf.extend_from_slice(data);
-        Ok(data.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Копирует содержимое одной записи архива в `out`, отыскав её по `name` и
-/// `key` — то есть по имени, классу и номеру повтора, а не по позиции обхода.
+/// Один проход по одному сплошному блоку.
 ///
-/// Открывает архив заново: `ArchiveReader::new` перечитывает только заголовок,
-/// тела распаковываются по ходу обхода. Обход прекращается на нужной записи.
-fn read_entry_by_key(
-    file_path: &Path,
-    password: sevenz_rust2::Password,
-    name: &[u8],
-    key: &EntryKey,
-    out: &mut dyn Write,
-) -> Result<()> {
-    let file = File::open(file_path).map_err(Error::Io)?;
-    let mut seven = sevenz_rust2::ArchiveReader::new(file, password).map_err(map_7z_err)?;
+/// Блок 7z — это последовательный поток: до тела пятой записи не добраться,
+/// не распаковав четыре предыдущих. Поэтому единственный дешёвый способ взять
+/// из блока несколько записей — взять их все за один проход, а чужие тела
+/// протащить в раковину. Именно этого и не делал прежний код: он заводил
+/// распаковщик заново на каждую запись, и цена распаковки росла квадратично.
+///
+/// `wanted` — нужные записи этого блока, по возрастанию. Возвращает `true`,
+/// если приёмник попросил остановиться совсем.
+fn decode_block(
+    dec: sevenz_rust2::BlockDecoder<'_, File>,
+    first_file: usize,
+    wanted: &[usize],
+    sink: &mut dyn EntrySink,
+) -> Result<bool> {
+    let mut file_index = first_file;
+    let mut next = 0usize;
+    let mut stop = false;
+    // Ошибка приёмника: наружу её через `sevenz_rust2::Error` не пронести.
+    let mut sink_err: Option<Error> = None;
 
-    let mut seen: usize = 0;
-    let mut found = false;
-    let mut extract_err: Option<Error> = None;
+    let walk = dec.for_each_entries(&mut |_entry, reader| {
+        let idx = file_index;
+        file_index += 1;
 
-    seven
-        .for_each_entries(|entry, reader| {
-            if !found && entry.has_stream == key.has_stream && entry.name().as_bytes() == name {
-                if seen == key.occurrence {
-                    found = true;
-                    // Копируем только тело этой записи; `false` прекращает обход,
-                    // дальше ничего не распаковывается.
-                    if let Err(e) = std::io::copy(reader, out) {
-                        extract_err = Some(Error::Io(e));
-                    }
-                    return Ok(false);
-                }
-                seen += 1;
-            }
-            // Не наша запись: пропускаем. В сплошном (solid) архиве это всё
-            // равно распаковывает данные — иначе до нужного тела не добраться, —
-            // но в памяти мы их не держим.
+        // Нужное кончилось — хвост блока не распаковываем вовсе.
+        if next >= wanted.len() {
+            return Ok(false);
+        }
+        if wanted[next] != idx {
+            // Чужое тело. Протащить его через распаковщик всё равно надо —
+            // иначе сплошной поток съедет и следующая запись прочтёт чужие
+            // байты, — но на диск и в память оно не идёт.
             std::io::copy(reader, &mut std::io::sink())?;
-            Ok(true)
-        })
-        .map_err(map_7z_err)?;
+            return Ok(true);
+        }
+        next += 1;
 
-    if let Some(e) = extract_err {
+        match sink.begin(idx) {
+            Ok(SinkStep::Body) => {}
+            Ok(SinkStep::Skip) => {
+                std::io::copy(reader, &mut std::io::sink())?;
+                return Ok(true);
+            }
+            Ok(SinkStep::Stop) => {
+                stop = true;
+                return Ok(false);
+            }
+            Err(e) => {
+                sink_err = Some(e);
+                return Ok(false);
+            }
+        }
+
+        let mut w = SinkWriter::new(sink);
+        let copied = std::io::copy(reader, &mut w);
+        let body = match w.take_err() {
+            // Ошибка приёмника (в том числе отмена) важнее: `io::Error` донёс
+            // бы только текст.
+            Some(e) => Err(e),
+            None => copied.map(|_| ()).map_err(Error::Io),
+        };
+        if body.is_err() {
+            // Тело не дочитано: домотать, иначе следующая запись блока
+            // прочтёт его остаток.
+            let _ = std::io::copy(reader, &mut std::io::sink());
+        }
+
+        match sink.end(idx, body) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                stop = true;
+                Ok(false)
+            }
+            Err(e) => {
+                sink_err = Some(e);
+                Ok(false)
+            }
+        }
+    });
+
+    if let Some(e) = sink_err {
         return Err(e);
     }
-    if !found {
-        // Заголовок обещал запись, которой обход не выдал: архив противоречит
-        // сам себе. Отдать чужие байты вместо неё нельзя.
-        return Err(Error::Corrupt(format!(
-            "7z: entry not found while extracting: {}",
-            String::from_utf8_lossy(name)
-        )));
+    walk.map_err(map_7z_err)?;
+    Ok(stop)
+}
+
+/// Что нужно знать проходу, кроме самого файла архива.
+struct BlockCtx<'a> {
+    archive: &'a sevenz_rust2::Archive,
+    password: &'a sevenz_rust2::Password,
+    thread_count: u32,
+}
+
+/// Приёмник на одну запись: мост от пакетного прохода к обычному
+/// `read_entry(idx, out)`.
+struct OneEntry<'a> {
+    out: &'a mut dyn Write,
+    err: Option<Error>,
+}
+
+impl EntrySink for OneEntry<'_> {
+    fn begin(&mut self, _idx: usize) -> Result<SinkStep> {
+        Ok(SinkStep::Body)
     }
-    Ok(())
+
+    fn write_body(&mut self, buf: &[u8]) -> Result<()> {
+        self.out.write_all(buf).map_err(Error::Io)
+    }
+
+    fn end(&mut self, _idx: usize, outcome: Result<()>) -> Result<bool> {
+        self.err = outcome.err();
+        Ok(false)
+    }
+}
+
+/// Приёмник для целей символьных ссылок: копит тела в памяти, каждое — под
+/// потолком, потому что длину задаёт архив.
+struct TargetSink {
+    got: std::collections::HashMap<usize, Vec<u8>>,
+    cur: Option<(usize, Vec<u8>)>,
+}
+
+impl EntrySink for TargetSink {
+    fn begin(&mut self, idx: usize) -> Result<SinkStep> {
+        self.cur = Some((idx, Vec::new()));
+        Ok(SinkStep::Body)
+    }
+
+    fn write_body(&mut self, buf: &[u8]) -> Result<()> {
+        let Some((_, acc)) = self.cur.as_mut() else {
+            return Err(Error::Corrupt("7z: symlink body without begin".into()));
+        };
+        if acc.len() + buf.len() > MAX_SYMLINK_TARGET {
+            return Err(Error::Corrupt("7z: symlink target too long".into()));
+        }
+        acc.extend_from_slice(buf);
+        Ok(())
+    }
+
+    fn end(&mut self, _idx: usize, outcome: Result<()>) -> Result<bool> {
+        // Неудачную ссылку просто не запоминаем: `open()` из-за неё падать не
+        // должен, а звать будет нечего — запись станет обычным файлом.
+        if let (Some((idx, acc)), Ok(())) = (self.cur.take(), outcome) {
+            self.got.insert(idx, acc);
+        }
+        Ok(true)
+    }
 }
 
 impl FormatHandler for SevenZHandler {
@@ -240,7 +298,7 @@ impl FormatHandler for SevenZHandler {
             })
             .collect();
 
-        let mut entries: Vec<Entry> = archive
+        let entries: Vec<Entry> = archive
             .files
             .iter()
             .enumerate()
@@ -311,32 +369,6 @@ impl FormatHandler for SevenZHandler {
             })
             .collect();
 
-        // Ключи поиска — по одному на запись, в том же порядке, что и entries.
-        // Считаем повторы имени внутри своего класса (с потоком / без).
-        let mut seen_names: std::collections::HashMap<(&[u8], bool), usize> =
-            std::collections::HashMap::new();
-        let keys: Vec<EntryKey> = archive
-            .files
-            .iter()
-            .map(|f| {
-                let has_stream = f.has_stream;
-                let counter = seen_names
-                    .entry((f.name().as_bytes(), has_stream))
-                    .or_insert(0);
-                let occurrence = *counter;
-                *counter += 1;
-                EntryKey {
-                    has_stream,
-                    occurrence,
-                }
-            })
-            .collect();
-
-        // Second pass: populate symlink targets.
-        // Symlink content (the link target path) is stored as the entry's payload.
-        // Каждая ссылка читается отдельным проходом по архиву, и запись ищется
-        // по имени и номеру повтора (см. `EntryKey`): позиция обхода не совпадает
-        // с позицией в заголовке, как только в архиве есть хоть один каталог.
         let symlink_indices: Vec<usize> = entries
             .iter()
             .enumerate()
@@ -344,58 +376,64 @@ impl FormatHandler for SevenZHandler {
             .map(|(i, _)| i)
             .collect();
 
-        for sym_idx in symlink_indices {
-            let expected_name = entries[sym_idx].path_raw.clone();
-            // best-effort: ignore errors — open() must not fail due to symlink target reads.
-            // Returns the decoded, non-empty target if one was successfully read.
-            let target: Option<PathBuf> = (|| -> Option<PathBuf> {
-                // Длина цели ограничена: размер из заголовка — вход злоумышленника.
-                let mut sink = CappedBuf {
-                    buf: Vec::new(),
-                    limit: MAX_SYMLINK_TARGET,
-                };
-                read_entry_by_key(
-                    &file_path,
-                    password.clone(),
-                    &expected_name,
-                    &keys[sym_idx],
-                    &mut sink,
-                )
-                .ok()?;
-                let buf = sink.buf;
-                // Trim any trailing null bytes, then decode the target with the
-                // SAME charset as entry names (honoring opts.encoding_override),
-                // matching how tar/zip decode their symlink targets.
-                let trimmed: Vec<u8> = buf
-                    .iter()
-                    .rposition(|&b| b != 0)
-                    .map(|p| buf[..=p].to_vec())
-                    .unwrap_or_default();
-                let s = decode_names(&[trimmed], opts.encoding_override.as_deref())
-                    .pop()
-                    .unwrap_or_default();
-                if s.is_empty() {
-                    return None;
-                }
-                Some(PathBuf::from(s))
-            })();
-
-            match target {
-                Some(target) => entries[sym_idx].kind = EntryKind::Symlink { target },
-                // No usable target was read (empty/unreadable): fall back to a
-                // regular File so extraction produces a real file, not a dangling
-                // symlink pointing at "".
-                None => entries[sym_idx].kind = EntryKind::File,
-            }
-        }
-
-        Ok(Box::new(SevenZReader {
+        let mut reader = SevenZReader {
             file_path,
             password: opts.password.clone(),
             entries,
-            keys,
-        }))
+            archive,
+            thread_count: default_thread_count(),
+        };
+
+        // Second pass: populate symlink targets.
+        // Symlink content (the link target path) is stored as the entry's payload.
+        // Все ссылки читаются **одним** проходом: раньше на каждую заводился
+        // свой обход всего архива, и открытие образа с десятком ссылок стоило
+        // десяти распаковок подряд.
+        if !symlink_indices.is_empty() {
+            let mut targets = TargetSink {
+                got: std::collections::HashMap::new(),
+                cur: None,
+            };
+            // best-effort: ошибка чтения целей не должна валить open().
+            let _ = reader.read_entries(&symlink_indices, &mut targets);
+
+            for sym_idx in symlink_indices {
+                // Trim any trailing null bytes, then decode the target with the
+                // SAME charset as entry names (honoring opts.encoding_override),
+                // matching how tar/zip decode their symlink targets.
+                let target = targets.got.get(&sym_idx).and_then(|buf| {
+                    let trimmed: Vec<u8> = buf
+                        .iter()
+                        .rposition(|&b| b != 0)
+                        .map(|p| buf[..=p].to_vec())
+                        .unwrap_or_default();
+                    let s = decode_names(&[trimmed], opts.encoding_override.as_deref())
+                        .pop()
+                        .unwrap_or_default();
+                    (!s.is_empty()).then(|| PathBuf::from(s))
+                });
+
+                match target {
+                    Some(target) => reader.entries[sym_idx].kind = EntryKind::Symlink { target },
+                    // No usable target was read (empty/unreadable): fall back to a
+                    // regular File so extraction produces a real file, not a dangling
+                    // symlink pointing at "".
+                    None => reader.entries[sym_idx].kind = EntryKind::File,
+                }
+            }
+        }
+
+        Ok(Box::new(reader))
     }
+}
+
+/// Столько же потоков, сколько берёт сам `sevenz_rust2::ArchiveReader::new`:
+/// на LZMA2, упакованном с поддержкой многопоточности, это ускоряет распаковку,
+/// а на остальных кодеках ничего не меняет.
+fn default_thread_count() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
 }
 
 fn map_7z_err(e: sevenz_rust2::Error) -> Error {
@@ -410,9 +448,9 @@ fn map_7z_err(e: sevenz_rust2::Error) -> Error {
 
 /// Archive reader that extracts entries on demand.
 ///
-/// `open()` only parses the 7z header (zero payload decompression). Each call
-/// to `read_entry()` re-opens the archive file and decompresses only the
-/// requested entry, so at most one entry's data lives in RAM at a time.
+/// `open()` only parses the 7z header (zero payload decompression). Разобранный
+/// заголовок хранится здесь целиком: по нему видно, в каком сплошном блоке
+/// лежит каждая запись, а значит — какие записи можно взять одним проходом.
 struct SevenZReader {
     /// Path to the archive file on disk.
     file_path: PathBuf,
@@ -420,8 +458,106 @@ struct SevenZReader {
     password: Option<String>,
     /// Entry metadata populated at open time (headers only, no payloads).
     entries: Vec<Entry>,
-    /// Чем искать запись при обходе — по одному ключу на запись `entries`.
-    keys: Vec<EntryKey>,
+    /// Разобранный заголовок: карта «запись → блок» и границы блоков.
+    archive: sevenz_rust2::Archive,
+    thread_count: u32,
+}
+
+impl SevenZReader {
+    /// Проход по архиву, отдающий приёмнику запрошенные записи.
+    ///
+    /// Идёт блоками: все нужные записи одного блока берутся за один его
+    /// разбор, блоки без нужных записей не открываются вовсе. Последнее и
+    /// лечит несплошной архив, где блок заведён на каждый файл.
+    fn walk(&mut self, indices: &[usize], sink: &mut dyn EntrySink) -> Result<()> {
+        let password: sevenz_rust2::Password = match self.password.as_deref() {
+            Some(pw) => pw.into(),
+            None => sevenz_rust2::Password::empty(),
+        };
+        let ctx = BlockCtx {
+            archive: &self.archive,
+            password: &password,
+            thread_count: self.thread_count,
+        };
+        let mut source = File::open(&self.file_path).map_err(Error::Io)?;
+
+        let mut i = 0usize;
+        while i < indices.len() {
+            let idx = indices[i];
+            if idx >= self.entries.len() {
+                return Err(Error::InvalidIndex(idx));
+            }
+
+            // Границы блока, которому принадлежит запись. Файлы блока лежат в
+            // заголовке подряд, поэтому все нужные записи блока идут в
+            // `indices` тоже подряд.
+            let mut handled = false;
+            if let Some(b) = ctx
+                .archive
+                .stream_map
+                .file_block_index
+                .get(idx)
+                .copied()
+                .flatten()
+                && let Some(&start) = ctx.archive.stream_map.block_first_file_index.get(b)
+            {
+                let dec = sevenz_rust2::BlockDecoder::new(
+                    ctx.thread_count,
+                    b,
+                    ctx.archive,
+                    ctx.password,
+                    &mut source,
+                );
+                // Сколько записей отдаст сам распаковщик — спрашиваем у него,
+                // а не считаем по заголовку: разойтись эти два числа не должны,
+                // и если разойдутся, то не по-нашему.
+                let end = start.saturating_add(dec.entry_count());
+                if idx >= start && idx < end {
+                    let mut j = i;
+                    while j < indices.len() && indices[j] >= start && indices[j] < end {
+                        j += 1;
+                    }
+                    if decode_block(dec, start, &indices[i..j], sink)? {
+                        return Ok(());
+                    }
+                    i = j;
+                    handled = true;
+                }
+            }
+            if handled {
+                continue;
+            }
+
+            // Тела у записи нет. Обычный случай — каталог или пустой файл: 7z
+            // хранит их без потока данных. Редкий — заголовок противоречит сам
+            // себе: запись обещает данные, а в границы своего блока не
+            // попадает. Подсунуть вместо неё пустоту нельзя, это была бы тихая
+            // потеря содержимого.
+            let claims_data = ctx
+                .archive
+                .files
+                .get(idx)
+                .is_some_and(|f| f.has_stream && f.size > 0);
+            match sink.begin(idx)? {
+                SinkStep::Stop => return Ok(()),
+                SinkStep::Skip => {}
+                SinkStep::Body => {
+                    let outcome = if claims_data {
+                        Err(Error::Corrupt(format!(
+                            "7z: entry {idx} claims data but lies outside its block"
+                        )))
+                    } else {
+                        Ok(())
+                    };
+                    if !sink.end(idx, outcome)? {
+                        return Ok(());
+                    }
+                }
+            }
+            i += 1;
+        }
+        Ok(())
+    }
 }
 
 impl ArchiveReader for SevenZReader {
@@ -450,25 +586,19 @@ impl ArchiveReader for SevenZReader {
     }
 
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
-        // Validate index before doing any I/O.
-        // `entries` и `keys` строятся из одного и того же `archive.files`, так
-        // что одной проверки хватает на оба обращения по индексу.
-        let (Some(entry), Some(key)) = (self.entries.get(idx), self.keys.get(idx)) else {
+        if idx >= self.entries.len() {
             return Err(Error::InvalidIndex(idx));
-        };
+        }
+        let mut one = OneEntry { out, err: None };
+        self.walk(&[idx], &mut one)?;
+        match one.err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 
-        let password: sevenz_rust2::Password = match self.password.as_deref() {
-            Some(pw) => pw.into(),
-            None => sevenz_rust2::Password::empty(),
-        };
-
-        // Ищем запись ПО ИМЕНИ, а не по позиции обхода: `for_each_entries`
-        // выдаёт сперва записи с потоком данных и лишь затем каталоги и пустые
-        // файлы, тогда как `archive.files` (из него собран `entries`) хранит
-        // порядок заголовка. Счётчик обхода поэтому указывает на чужую запись
-        // в любом архиве, где есть хотя бы один каталог, — и подменял бы
-        // содержимое молча, без ошибки.
-        read_entry_by_key(&self.file_path, password, &entry.path_raw, key, out)
+    fn read_entries(&mut self, indices: &[usize], sink: &mut dyn EntrySink) -> Result<()> {
+        self.walk(indices, sink)
     }
 }
 
