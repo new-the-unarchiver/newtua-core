@@ -202,11 +202,19 @@ pub(crate) fn open_hfsplus(path: &Path, offset: u64) -> Result<Box<dyn ArchiveRe
     // is long enough to hold the Volume Header; anything else (too short, no
     // signature, legacy HFS `BD`, APFS `NXSB`, garbage) is `None`.
     hfsplus_forensic::parse(volume).ok_or(Error::UnknownFormat)?;
-    let (entries, cnids) = build_entries(volume)?;
+    // The catalog B-tree is read once here and kept for the reader's lifetime.
+    // Every question afterwards — the path list, each entry's stat, each body —
+    // is answered from that one pass. Asking the crate per entry instead made
+    // the cost grow with the square of the entry count: a volume of 32 000 files
+    // took seven seconds to list where the same work now takes a fraction of it.
+    let catalog = hfsplus_forensic::Catalog::open(volume)
+        .ok_or_else(|| Error::Corrupt("hfsplus: catalog B-tree unreadable".into()))?;
+    let (entries, cnids) = build_entries(&catalog, volume)?;
 
     Ok(Box::new(HfsPlusReader {
         mmap,
         offset,
+        catalog,
         entries,
         cnids,
     }))
@@ -242,9 +250,11 @@ fn is_hfs_private(path: &str) -> bool {
         .any(|d| path == *d || path.strip_prefix(d).is_some_and(|r| r.starts_with('/')))
 }
 
-fn build_entries(volume: &[u8]) -> Result<(Vec<Entry>, Vec<u32>)> {
-    let walked = hfsplus_forensic::walk(volume)
-        .ok_or_else(|| Error::Corrupt("hfsplus: catalog B-tree unreadable".into()))?;
+fn build_entries(
+    catalog: &hfsplus_forensic::Catalog,
+    volume: &[u8],
+) -> Result<(Vec<Entry>, Vec<u32>)> {
+    let walked = catalog.walk();
 
     let mut entries = Vec::with_capacity(walked.len());
     let mut cnids = Vec::with_capacity(walked.len());
@@ -252,13 +262,14 @@ fn build_entries(volume: &[u8]) -> Result<(Vec<Entry>, Vec<u32>)> {
         if is_hfs_private(&w.path) {
             continue;
         }
-        let st = hfsplus_forensic::stat(volume, w.cnid).ok_or_else(|| {
+        let st = catalog.stat(w.cnid).ok_or_else(|| {
             Error::Corrupt(format!("hfsplus: no catalog record for cnid {}", w.cnid))
         })?;
 
         let kind = if is_symlink_mode(w.is_dir, st.mode) {
             // The symlink target is stored as the data fork's content.
-            let target = hfsplus_forensic::read_file(volume, w.cnid)
+            let target = catalog
+                .read_file(volume, w.cnid)
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .map(PathBuf::from)
                 .unwrap_or_default();
@@ -301,6 +312,9 @@ struct HfsPlusReader {
     mmap: Mmap,
     /// Byte offset of the volume's start within `mmap` (0 for a bare file).
     offset: usize,
+    /// The catalog B-tree, read once at `open`. Holding it is what keeps
+    /// extraction linear: without it every body would re-walk the whole tree.
+    catalog: hfsplus_forensic::Catalog,
     entries: Vec<Entry>,
     /// Parallel to `entries`: the catalog node ID for on-demand extraction.
     cnids: Vec<u32>,
@@ -327,7 +341,9 @@ impl ArchiveReader for HfsPlusReader {
         // Already decodes decmpfs (zlib/LZVN/LZFSE, inline or resource-fork)
         // transparently; `None` means an unrecognised/undecodable file —
         // never a misleading empty body.
-        let bytes = hfsplus_forensic::read_file(volume, cnid)
+        let bytes = self
+            .catalog
+            .read_file(volume, cnid)
             .ok_or_else(|| Error::Corrupt(format!("hfsplus: failed to read/decode cnid {cnid}")))?;
         out.write_all(&bytes)?;
         Ok(())

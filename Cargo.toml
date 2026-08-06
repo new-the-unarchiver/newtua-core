@@ -117,7 +117,7 @@ newtua-mscompress = "0.1"
 # HFS+/HFSX (.hfs/.hfsplus/.hfsx, and the filesystem inside DMG images):
 # vendored reader (decmpfs-capable), see the newtua-hfsplus fork's README
 # and format/hfsplus.rs.
-hfsplus-forensic = { package = "newtua-hfsplus", version = "0.2.0-newtua.2" }
+hfsplus-forensic = { package = "newtua-hfsplus", version = "0.3.0-newtua.1" }
 # Memory-maps the volume for hfsplus-forensic's byte-buffer API. See
 # format/hfsplus.rs::open_hfsplus.
 memmap2 = "0.9"
