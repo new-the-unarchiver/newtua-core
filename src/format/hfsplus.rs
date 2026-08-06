@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use memmap2::Mmap;
 
 use crate::archive::{
-    ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
+    ArchiveReader, Confidence, Entry, EntryKind, EntrySink, FormatHandler, FormatId, OpenOptions,
+    Source,
 };
 use crate::error::{Error, Result};
 
@@ -209,15 +210,10 @@ pub(crate) fn open_hfsplus(path: &Path, offset: u64) -> Result<Box<dyn ArchiveRe
 pub(crate) fn open_hfsplus_source(
     source: Box<dyn hfsplus_forensic::VolumeSource>,
 ) -> Result<Box<dyn ArchiveReader>> {
-    // `parse` validates both the H+/HX signature at 1024 and that the volume
-    // is long enough to hold the Volume Header; anything else (too short, no
-    // signature, legacy HFS `BD`, APFS `NXSB`, garbage) is `None`. The header
-    // is the only part read as a slice, and it is 1076 bytes.
-    let header = source
-        .read_at(0, HEADER_PEEK)
-        .ok_or(Error::UnknownFormat)?
-        .into_owned();
-    hfsplus_forensic::parse(&header).ok_or(Error::UnknownFormat)?;
+    // Validates both the H+/HX signature at 1024 and that the volume is long
+    // enough to hold the Volume Header; anything else (too short, no signature,
+    // legacy HFS `BD`, APFS `NXSB`, garbage) is `None`.
+    hfsplus_forensic::parse_source(&*source).ok_or(Error::UnknownFormat)?;
     // The catalog B-tree is read once here and kept for the reader's lifetime.
     // Every question afterwards — the path list, each entry's stat, each body —
     // is answered from that one pass. Asking the crate per entry instead made
@@ -234,10 +230,6 @@ pub(crate) fn open_hfsplus_source(
         cnids,
     }))
 }
-
-/// How much of the volume start `parse` needs: the header sits at 1024 and is
-/// 52 bytes as far as the geometry fields go.
-const HEADER_PEEK: usize = VOLUME_HEADER_OFFSET as usize + 52;
 
 /// A memory-mapped volume, possibly starting partway into the mapping (a
 /// partition inside a larger image).
@@ -387,7 +379,46 @@ impl ArchiveReader for HfsPlusReader {
         out.write_all(&bytes)?;
         Ok(())
     }
+
+    /// Same walk as the default, with one thing said out loud first.
+    ///
+    /// HFS+ has random access, so a batch needs no special pass over the
+    /// volume — but the **source** underneath may not have the volume yet. A
+    /// DMG reconstructs it chunk by chunk as it is read, and from inside a
+    /// single read it cannot tell listing (a fraction of a percent of the
+    /// image) from extracting everything (all of it). This method is where that
+    /// is known: the caller has just named every entry it wants. So when those
+    /// entries come to most of the volume, the source is told, once, and can
+    /// rebuild the whole thing in one parallel pass instead of a piece at a
+    /// time.
+    ///
+    /// Below that share nothing is said, and laziness stands: pulling one file
+    /// out of a large image must not decompress the rest of it.
+    fn read_entries(&mut self, indices: &[usize], sink: &mut dyn EntrySink) -> Result<()> {
+        let wanted: u64 = indices
+            .iter()
+            .filter_map(|&i| self.entries.get(i))
+            .filter(|e| e.kind == EntryKind::File)
+            .map(|e| e.size)
+            .sum();
+        let volume = self.source.volume_len() as u64;
+        if wanted.saturating_mul(BULK_READ_DENOMINATOR) >= volume {
+            self.source.prefetch_all();
+        }
+        // The rest is the default walk; there is no cheaper order for HFS+.
+        crate::archive::read_entries_one_by_one(self, indices, sink)
+    }
 }
+
+/// Above `1 / BULK_READ_DENOMINATOR` of the volume, a batch counts as "reading
+/// the whole thing" and the source is told so.
+///
+/// Deliberately not a tight threshold. Below it the only cost of staying quiet
+/// is that a source rebuilding on demand works in smaller pieces; above it the
+/// only cost of speaking is rebuilding a part nobody reads. Neither is a cliff,
+/// so a quarter is a fair place to stand — and unlike a guess made from access
+/// patterns, this one is computed from what the caller actually asked for.
+const BULK_READ_DENOMINATOR: u64 = 4;
 
 #[cfg(test)]
 mod tests {

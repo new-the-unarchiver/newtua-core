@@ -340,24 +340,7 @@ pub trait ArchiveReader {
     /// стоит дорого; форматам с произвольным доступом (zip, tar, wim, xar,
     /// squashfs, iso и прочим) она подходит как есть.
     fn read_entries(&mut self, indices: &[usize], sink: &mut dyn EntrySink) -> Result<()> {
-        for &idx in indices {
-            match sink.begin(idx)? {
-                SinkStep::Stop => return Ok(()),
-                SinkStep::Skip => continue,
-                SinkStep::Body => {}
-            }
-            let mut w = SinkWriter::new(sink);
-            let outcome = self.read_entry(idx, &mut w);
-            // Ошибка приёмника важнее ошибки чтения: отмену видно только по ней.
-            let outcome = match w.take_err() {
-                Some(e) => Err(e),
-                None => outcome,
-            };
-            if !sink.end(idx, outcome)? {
-                return Ok(());
-            }
-        }
-        Ok(())
+        read_entries_one_by_one(self, indices, sink)
     }
 
     /// Verify that the archive can be decrypted with the given password,
@@ -376,6 +359,39 @@ pub trait ArchiveReader {
     fn verify_password(&mut self) -> Result<()> {
         Ok(())
     }
+}
+
+/// Пройти записи по одной через `read_entry` — тело реализации `read_entries`
+/// по умолчанию.
+///
+/// Отдельной функцией, потому что переопределивший `read_entries` не может
+/// позвать умолчание: носителю с произвольным доступом бывает нужно что-то
+/// сделать до обхода, а сам обход оставить прежним (так делает HFS+, который
+/// сообщает своему источнику байтов, что сейчас прочитают весь том). Без этого
+/// цикл пришлось бы переписать у каждого такого — и он бы разошёлся.
+pub(crate) fn read_entries_one_by_one<R: ArchiveReader + ?Sized>(
+    reader: &mut R,
+    indices: &[usize],
+    sink: &mut dyn EntrySink,
+) -> Result<()> {
+    for &idx in indices {
+        match sink.begin(idx)? {
+            SinkStep::Stop => return Ok(()),
+            SinkStep::Skip => continue,
+            SinkStep::Body => {}
+        }
+        let mut w = SinkWriter::new(sink);
+        let outcome = reader.read_entry(idx, &mut w);
+        // Ошибка приёмника важнее ошибки чтения: отмену видно только по ней.
+        let outcome = match w.take_err() {
+            Some(e) => Err(e),
+            None => outcome,
+        };
+        if !sink.end(idx, outcome)? {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
