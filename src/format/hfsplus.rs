@@ -197,27 +197,67 @@ pub(crate) fn open_hfsplus(path: &Path, offset: u64) -> Result<Box<dyn ArchiveRe
     if offset > mmap.len() {
         return Err(Error::UnknownFormat);
     }
-    let volume = &mmap[offset..];
-    // `parse` validates both the H+/HX signature at 1024 and that the buffer
+    open_hfsplus_source(Box::new(MappedVolume { mmap, offset }))
+}
+
+/// Open the HFS+/HFSX volume that `source` hands out, whatever is behind it.
+///
+/// A bare file arrives memory-mapped ([`MappedVolume`]); a DMG arrives as a
+/// source that decompresses image chunks only where they are read. Everything
+/// below this line is the same either way — which is the whole point of the
+/// split: laziness is the source's business, not the filesystem reader's.
+pub(crate) fn open_hfsplus_source(
+    source: Box<dyn hfsplus_forensic::VolumeSource>,
+) -> Result<Box<dyn ArchiveReader>> {
+    // `parse` validates both the H+/HX signature at 1024 and that the volume
     // is long enough to hold the Volume Header; anything else (too short, no
-    // signature, legacy HFS `BD`, APFS `NXSB`, garbage) is `None`.
-    hfsplus_forensic::parse(volume).ok_or(Error::UnknownFormat)?;
+    // signature, legacy HFS `BD`, APFS `NXSB`, garbage) is `None`. The header
+    // is the only part read as a slice, and it is 1076 bytes.
+    let header = source
+        .read_at(0, HEADER_PEEK)
+        .ok_or(Error::UnknownFormat)?
+        .into_owned();
+    hfsplus_forensic::parse(&header).ok_or(Error::UnknownFormat)?;
     // The catalog B-tree is read once here and kept for the reader's lifetime.
     // Every question afterwards — the path list, each entry's stat, each body —
     // is answered from that one pass. Asking the crate per entry instead made
     // the cost grow with the square of the entry count: a volume of 32 000 files
     // took seven seconds to list where the same work now takes a fraction of it.
-    let catalog = hfsplus_forensic::Catalog::open(volume)
+    let catalog = hfsplus_forensic::Catalog::open(&*source)
         .ok_or_else(|| Error::Corrupt("hfsplus: catalog B-tree unreadable".into()))?;
-    let (entries, cnids) = build_entries(&catalog, volume)?;
+    let (entries, cnids) = build_entries(&catalog, &*source)?;
 
     Ok(Box::new(HfsPlusReader {
-        mmap,
-        offset,
+        source,
         catalog,
         entries,
         cnids,
     }))
+}
+
+/// How much of the volume start `parse` needs: the header sits at 1024 and is
+/// 52 bytes as far as the geometry fields go.
+const HEADER_PEEK: usize = VOLUME_HEADER_OFFSET as usize + 52;
+
+/// A memory-mapped volume, possibly starting partway into the mapping (a
+/// partition inside a larger image).
+struct MappedVolume {
+    mmap: Mmap,
+    /// Byte offset of the volume's start within `mmap` (0 for a bare file).
+    offset: usize,
+}
+
+impl hfsplus_forensic::VolumeSource for MappedVolume {
+    fn volume_len(&self) -> usize {
+        self.mmap.len().saturating_sub(self.offset)
+    }
+
+    fn read_at(&self, off: usize, len: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+        let start = self.offset.checked_add(off)?;
+        self.mmap
+            .get(start..start.checked_add(len)?)
+            .map(std::borrow::Cow::Borrowed)
+    }
 }
 
 /// Walk the catalog and build the flat `Entry` list plus a parallel CNID
@@ -252,7 +292,7 @@ fn is_hfs_private(path: &str) -> bool {
 
 fn build_entries(
     catalog: &hfsplus_forensic::Catalog,
-    volume: &[u8],
+    volume: &dyn hfsplus_forensic::VolumeSource,
 ) -> Result<(Vec<Entry>, Vec<u32>)> {
     let walked = catalog.walk();
 
@@ -303,15 +343,15 @@ fn build_entries(
     Ok((entries, cnids))
 }
 
-/// Holds the memory-mapped volume plus the flat entry list and a parallel
+/// Holds the volume's byte source plus the flat entry list and a parallel
 /// `cnids` vector (catalog node ID per entry, for `read_file`/`stat` by
-/// index). `mmap` lives for as long as the reader — for DMG (#21b),
-/// `TempBackedReader` drops this reader (and so the mapping) before deleting
-/// the backing temp file.
+/// index). The source lives for as long as the reader — for DMG,
+/// `TempBackedReader` drops this reader (and with it the mapping, or the handle
+/// on the partly-decompressed image) before deleting the backing temp file.
 struct HfsPlusReader {
-    mmap: Mmap,
-    /// Byte offset of the volume's start within `mmap` (0 for a bare file).
-    offset: usize,
+    /// Where the volume's bytes come from: a memory-mapped file, or a DMG that
+    /// decompresses image chunks on demand. Lives as long as the reader.
+    source: Box<dyn hfsplus_forensic::VolumeSource>,
     /// The catalog B-tree, read once at `open`. Holding it is what keeps
     /// extraction linear: without it every body would re-walk the whole tree.
     catalog: hfsplus_forensic::Catalog,
@@ -336,14 +376,13 @@ impl ArchiveReader for HfsPlusReader {
         if self.entries[idx].kind != EntryKind::File {
             return Ok(()); // directory or symlink — no body to extract
         }
-        let volume = &self.mmap[self.offset..];
         let cnid = self.cnids[idx];
         // Already decodes decmpfs (zlib/LZVN/LZFSE, inline or resource-fork)
         // transparently; `None` means an unrecognised/undecodable file —
         // never a misleading empty body.
         let bytes = self
             .catalog
-            .read_file(volume, cnid)
+            .read_file(&*self.source, cnid)
             .ok_or_else(|| Error::Corrupt(format!("hfsplus: failed to read/decode cnid {cnid}")))?;
         out.write_all(&bytes)?;
         Ok(())

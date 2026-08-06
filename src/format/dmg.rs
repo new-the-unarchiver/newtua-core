@@ -3,20 +3,36 @@
 //! A `.dmg` stores a disk image sector-range-compressed: a koly trailer (last
 //! 512 bytes) points at an XML plist holding `blkx` records, each a base64
 //! `mish` chunk table. Each chunk decodes to a byte range of the "raw" disk
-//! image; assembling all chunks into a temp file yields a bare disk holding an
-//! HFS+/HFSX volume ([`open_hfsplus`](super::hfsplus::open_hfsplus)) or an APFS
-//! volume ([`open_apfs`](super::apfs::open_apfs)), located by [`locate_volume`].
+//! image; that image is a bare disk holding an HFS+/HFSX volume
+//! ([`open_hfsplus`](super::hfsplus::open_hfsplus)) or an APFS volume
+//! ([`open_apfs`](super::apfs::open_apfs)).
+//!
+//! **The image is assembled only where it is read** ([`LazyImage`]). Listing a
+//! DMG needs the filesystem's catalogue, which is a fraction of a percent of
+//! the image — 1.6 MB out of 218.7 MB on `IINA.v1.4.3.dmg`. Decompressing all
+//! of it first cost 1.45 s before a single name appeared; reading it on demand
+//! costs 0.05 s, which is what `7zz` takes. Extraction still touches every
+//! chunk and still runs in parallel, so it is unchanged.
+//!
+//! Which byte the volume starts at comes from the `blkx` records themselves —
+//! each describes one partition of the image, so its first output sector is a
+//! candidate. Sweeping sector by sector ([`locate_volume`]) would have meant
+//! decompressing the whole image to find the volume, and remains only as a
+//! fallback for an image whose volume sits nowhere near a partition boundary.
 
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
+use hfsplus_forensic::VolumeSource as _;
 
 use crate::archive::{ArchiveReader, Confidence, FormatHandler, FormatId, OpenOptions, Source};
 use crate::detect::TempBackedReader;
 use crate::error::{Error, Result};
 use crate::format::apfs::{APFS_MAGIC, APFS_MAGIC_OFFSET, open_apfs};
-use crate::format::hfsplus::{VOLUME_HEADER_OFFSET, is_hfsplus_signature, open_hfsplus};
+use crate::format::hfsplus::{
+    VOLUME_HEADER_OFFSET, is_hfsplus_signature, open_hfsplus, open_hfsplus_source,
+};
 use crate::format::xar::exceeds_nesting_depth;
 
 /// Read a big-endian `u32` at byte offset `off` in `b`. Callers bounds-check
@@ -111,15 +127,20 @@ fn read_plist_bytes(path: &Path, koly: &Koly) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Disassemble the UDIF container at `path` (koly already validated) into a
-/// raw disk image written to a fresh temp file, and return its path.
+/// Read the UDIF container at `path` (koly already validated) and work out
+/// where every chunk of the raw disk image comes from — **without decoding a
+/// single one of them**.
 ///
-/// For each blkx's chunk table: chunks are decoded and written at
-/// `(mish.sector_number + chunk.sector_number) · 512` in the output; the
-/// file's total length is the highest sector any blkx covers. ZERO_FILL/
-/// IGNORE chunks are skipped (the temp file is zero-initialized by
-/// `set_len`), and COMMENT/TERMINATOR carry no payload.
-fn build_raw_image(path: &Path, koly: &Koly) -> Result<tempfile::TempPath> {
+/// For each blkx's chunk table: a chunk belongs at
+/// `(mish.sector_number + chunk.sector_number) · 512` in the image, whose total
+/// length is the highest sector any blkx covers. ZERO_FILL/IGNORE chunks are
+/// skipped (the temp file is zero-initialized by `set_len`), and
+/// COMMENT/TERMINATOR carry no payload.
+///
+/// Every bound is checked here, single-threaded and in the container's own
+/// order, so a broken image fails identically no matter which chunks are later
+/// decoded, in what order, or whether they are decoded at all.
+fn plan_image(path: &Path, koly: &Koly) -> Result<ImagePlan> {
     let plist_bytes = read_plist_bytes(path, koly)?;
     let blkx_entries = parse_plist_blkx(&plist_bytes)?;
 
@@ -189,14 +210,48 @@ fn build_raw_image(path: &Path, koly: &Koly) -> Result<tempfile::TempPath> {
         }
     }
 
-    let tmp = tempfile::NamedTempFile::new()?;
-    tmp.as_file().set_len(total_bytes)?;
-    decode_chunks(path, &jobs, tmp.as_file())?;
-    Ok(tmp.into_temp_path())
+    // Куски приходят в порядке разделов, а искать их придётся по смещению в
+    // собираемом образе — отсюда сортировка. Порядок разбора она не задаёт:
+    // проверки границ выше уже прошли в исходном порядке.
+    jobs.sort_by_key(|j| j.out_offset);
+    let max_chunk_len = jobs.iter().map(|j| j.out_len).max().unwrap_or(0);
+
+    // Начало каждого раздела образа. Именно они — кандидаты на файловую
+    // систему: каждый `blkx` описывает один раздел, и его первый выходной
+    // сектор и есть начало этого раздела. Без этого том пришлось бы искать
+    // посекторным обходом всего образа, а обход по ленивому образу означал бы
+    // разжать его целиком — ровно то, чего мы избегаем.
+    let mut partition_starts: Vec<u64> = mish_entries
+        .iter()
+        .map(|m| m.sector_number.saturating_mul(SECTOR_SIZE))
+        .collect();
+    partition_starts.push(0);
+    partition_starts.sort_unstable();
+    partition_starts.dedup();
+
+    Ok(ImagePlan {
+        jobs,
+        max_chunk_len,
+        total_bytes,
+        partition_starts,
+    })
+}
+
+/// Разбор образа без единого разжатого байта: где какой кусок лежит, какой
+/// длины получается образ и где в нём начинаются разделы.
+struct ImagePlan {
+    /// Куски, отсортированные по смещению в собираемом образе.
+    jobs: Vec<ChunkJob>,
+    /// Длина самого длинного куска — граница, на которую надо отступить назад
+    /// при поиске кусков, накрывающих заданный диапазон.
+    max_chunk_len: usize,
+    total_bytes: u64,
+    partition_starts: Vec<u64>,
 }
 
 /// Один кусок образа, уже проверенный на границы: откуда читать сжатое и куда
 /// класть разжатое.
+#[derive(Clone, Copy)]
 struct ChunkJob {
     entry_type: u32,
     file_pos: u64,
@@ -232,6 +287,245 @@ fn write_all_at(f: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<(
     Ok(())
 }
 
+/// Прочитать `buf` целиком по абсолютному смещению, не двигая позицию файла —
+/// парная к [`write_all_at`].
+#[cfg(unix)]
+fn read_exact_at(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let (mut buf, mut offset) = (buf, offset);
+    while !buf.is_empty() {
+        let n = f.seek_read(buf, offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "dmg: short read from the assembled image",
+            ));
+        }
+        buf = &mut buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+/// Образ, который разжимается по мере того, как его читают.
+///
+/// Чтобы показать список файлов, нужен каталог файловой системы, а он занимает
+/// доли процента образа: у `IINA.v1.4.3.dmg` — 1,6 МБ из 218,7 МБ. Раньше
+/// `open()` разжимал все 218,7 МБ, потому что нижний слой требовал том целиком
+/// одним куском памяти. Теперь чтение идёт через
+/// `hfsplus_forensic::VolumeSource`, и сюда приходят запросы вида «дай столько-то
+/// байт с такого-то места» — разжимается только то, что их накрывает.
+///
+/// Разжатое складывается во временный файл: он и кэш (второе чтение того же
+/// места уже ничего не разжимает), и способ не держать образ в памяти.
+struct LazyImage {
+    /// Исходный `.dmg` — из него читаются сжатые куски.
+    src: PathBuf,
+    /// Собираемый образ. Создан на всю длину (`set_len`), но занимает на диске
+    /// только записанное: это разрежённый файл.
+    tmp: std::fs::File,
+    jobs: Vec<ChunkJob>,
+    max_chunk_len: usize,
+    len: usize,
+    state: std::sync::Mutex<LazyState>,
+}
+
+struct LazyState {
+    /// Разобран ли кусок с этим номером.
+    done: Vec<bool>,
+    done_count: usize,
+    /// Номер куска сразу за прошлой пачкой. Если следующий запрос начинается
+    /// ровно с него — образ читают подряд.
+    next_after_last: usize,
+    /// Ширина упреждающего чтения, в кусках.
+    readahead: usize,
+}
+
+/// Верхняя граница числа потоков разбора. Разбор кусков упирается в процессор,
+/// но восьми потоков хватает: дальше выигрыш съедается чтением с диска.
+const DECODE_MAX_THREADS: usize = 8;
+
+/// Сколько кусков вразбивку читает тот, кому нужен только список. Дальше этого
+/// ленивая фаза себя изживает: столько вразбивку читает уже тот, кто читает
+/// весь образ, и ему выгоднее полная ширина пачки. Взято с запасом вдвое над
+/// измеренным: листингу `IINA.v1.4.3.dmg` (1416 записей) нужно восемь кусков.
+const LAZY_CHUNK_BUDGET: usize = 16;
+
+/// Сколько кусков имеет смысл разбирать за один раз.
+fn decode_width() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, DECODE_MAX_THREADS)
+}
+
+impl LazyImage {
+    fn new(src: PathBuf, tmp: std::fs::File, plan: &ImagePlan) -> Self {
+        let n = plan.jobs.len();
+        LazyImage {
+            src,
+            tmp,
+            jobs: plan.jobs.clone(),
+            max_chunk_len: plan.max_chunk_len,
+            len: plan.total_bytes as usize,
+            state: std::sync::Mutex::new(LazyState {
+                done: vec![false; n],
+                done_count: 0,
+                // Заведомо недостижимый номер: первое чтение подряд не идёт.
+                next_after_last: usize::MAX,
+                readahead: 1,
+            }),
+        }
+    }
+
+    /// Номера кусков, накрывающих `from..to`.
+    ///
+    /// Куски отсортированы по смещению, поэтому начало ищется двоичным поиском;
+    /// отступ назад на длину самого длинного куска нужен на случай, когда кусок
+    /// начинается раньше `from` и дотягивается внутрь.
+    fn covering(&self, from: usize, to: usize) -> impl Iterator<Item = usize> + '_ {
+        let back = from.saturating_sub(self.max_chunk_len);
+        let start = self
+            .jobs
+            .partition_point(|j| (j.out_offset as usize) < back);
+        (start..self.jobs.len())
+            .take_while(move |&i| (self.jobs[i].out_offset as usize) < to)
+            .filter(move |&i| {
+                let j = &self.jobs[i];
+                let end = j.out_offset as usize + j.out_len;
+                end > from
+            })
+    }
+
+    /// Разжать всё, что нужно, чтобы байты `from..to` были на месте.
+    fn ensure(&self, from: usize, to: usize) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Corrupt("dmg: lazy image lock poisoned".into()))?;
+        if state.done_count == self.jobs.len() {
+            return Ok(());
+        }
+
+        let mut take: Vec<usize> = self
+            .covering(from, to)
+            .filter(|&i| !state.done[i])
+            .collect();
+        if take.is_empty() {
+            return Ok(());
+        }
+
+        // Сколько разбирать сверх запрошенного, и это две разные истории.
+        //
+        // Разбор куска — работа для процессора, и по куску за раз занято одно
+        // ядро из восьми. Поэтому важно понять, что за чтение идёт.
+        //
+        // **Читают подряд.** Дерево каталога обходится по цепочке листьев,
+        // большой файл — по своим экстентам; и то и другое идёт вперёд без
+        // разрывов. Тогда пачка удваивается на каждом шаге, пока не займёт все
+        // потоки: большой каталог разбирается параллельно и ровно в тех
+        // кусках, которые ему нужны.
+        //
+        // **Читают весь образ.** Распаковка чередует чтение записи каталога и
+        // тела файла, а тела разбросаны — непрерывности там нет, и одним
+        // первым признаком пачка так и осталась бы шириной в кусок (3,25 с
+        // против 1,9 с). Признак здесь другой: `LAZY_CHUNK_BUDGET` кусков
+        // вразбивку читает только тот, кто читает всё. Тогда остаток
+        // разбирается **целиком и разом**, а не пачками: пачка ждёт свой самый
+        // медленный кусок, и на 27 пачках это набегало в лишнюю треть секунды,
+        // тогда как один проход раздаёт куски потокам по мере освобождения.
+        //
+        // Листингу `IINA.v1.4.3.dmg` хватает восьми кусков из 214 — он не
+        // доходит ни до одного признака и лишнего не разжимает вовсе.
+        let sequential = take[0] == state.next_after_last;
+        if !sequential && state.done_count >= LAZY_CHUNK_BUDGET {
+            take = (0..self.jobs.len()).filter(|&i| !state.done[i]).collect();
+            state.next_after_last = self.jobs.len();
+        } else {
+            state.readahead = if sequential {
+                (state.readahead * 2).min(decode_width())
+            } else {
+                1
+            };
+            let width = state.readahead;
+            let mut next = take[take.len() - 1] + 1;
+            while take.len() < width && next < self.jobs.len() {
+                if !state.done[next] {
+                    take.push(next);
+                }
+                next += 1;
+            }
+            state.next_after_last = next;
+        }
+
+        let batch: Vec<ChunkJob> = take.iter().map(|&i| self.jobs[i]).collect();
+        decode_chunks(&self.src, &batch, &self.tmp)?;
+        for i in take {
+            state.done[i] = true;
+        }
+        state.done_count += batch.len();
+        Ok(())
+    }
+
+    /// Разжать образ целиком — запасной путь, когда том не нашёлся ни в одном
+    /// разделе и его приходится искать посекторным обходом.
+    fn materialize(&self) -> Result<()> {
+        self.ensure(0, self.len)
+    }
+}
+
+/// Том внутри ленивого образа: тот же образ, но отсчёт с начала раздела.
+struct LazyVolume {
+    image: std::sync::Arc<LazyImage>,
+    offset: usize,
+}
+
+impl hfsplus_forensic::VolumeSource for LazyVolume {
+    fn volume_len(&self) -> usize {
+        self.image.len.saturating_sub(self.offset)
+    }
+
+    fn read_at(&self, off: usize, len: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+        let start = self.offset.checked_add(off)?;
+        let end = start.checked_add(len)?;
+        if end > self.image.len {
+            return None;
+        }
+        // Кусок, который не разжался, — это отсутствующие байты, а не нули.
+        // Вернуть здесь нули значило бы показать человеку выдуманный список.
+        self.image.ensure(start, end).ok()?;
+        let mut buf = vec![0u8; len];
+        read_exact_at(&self.image.tmp, &mut buf, start as u64).ok()?;
+        Some(std::borrow::Cow::Owned(buf))
+    }
+
+    /// Тела файлов идут отсюда прямо в собираемый файл, без промежуточного
+    /// буфера: иначе каждый байт тома копировался бы дважды.
+    fn read_into(&self, off: usize, len: usize, out: &mut Vec<u8>) -> Option<()> {
+        let start = self.offset.checked_add(off)?;
+        let end = start.checked_add(len)?;
+        if end > self.image.len {
+            return None;
+        }
+        self.image.ensure(start, end).ok()?;
+        let at = out.len();
+        out.resize(at + len, 0);
+        match read_exact_at(&self.image.tmp, &mut out[at..], start as u64) {
+            Ok(()) => Some(()),
+            Err(_) => {
+                out.truncate(at);
+                None
+            }
+        }
+    }
+}
+
 /// Разжать куски образа в несколько потоков.
 ///
 /// Куски независимы: у каждого своя область в исходном файле и своя — в
@@ -249,11 +543,7 @@ fn decode_chunks(path: &Path, jobs: &[ChunkJob], out: &std::fs::File) -> Result<
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(jobs.len())
-        .clamp(1, 8);
+    let threads = decode_width().min(jobs.len()).max(1);
 
     let next = AtomicUsize::new(0);
     let failure: Mutex<Option<(usize, Error)>> = Mutex::new(None);
@@ -681,7 +971,31 @@ impl FormatHandler for DmgHandler {
             .to_path_buf();
 
         let koly = read_koly(&path)?;
-        let temp_path = build_raw_image(&path, &koly)?;
+        let plan = plan_image(&path, &koly)?;
+
+        let tmp = tempfile::NamedTempFile::new()?;
+        tmp.as_file().set_len(plan.total_bytes)?;
+        let image = std::sync::Arc::new(LazyImage::new(path, tmp.as_file().try_clone()?, &plan));
+
+        // Каждый `blkx` — это раздел образа, и его первый сектор есть начало
+        // раздела. Проверить десяток таких мест несопоставимо дешевле, чем
+        // мести весь образ посекторно: на проверку уходит один разжатый кусок,
+        // на обход — весь образ.
+        for &start in &plan.partition_starts {
+            if let Some(inner) = try_open_partition(&image, tmp.path(), start)? {
+                return Ok(Box::new(TempBackedReader::with_format(
+                    inner,
+                    tmp.into_temp_path(),
+                    FormatId::Dmg,
+                )));
+            }
+        }
+
+        // Ни один раздел не открылся: том лежит не по границе `blkx` (или
+        // образ устроен иначе, чем мы думаем). Тогда — как раньше: собрать
+        // образ целиком и обойти его посекторно.
+        image.materialize()?;
+        let temp_path = tmp.into_temp_path();
         let inner = locate_volume(&temp_path)?;
         Ok(Box::new(TempBackedReader::with_format(
             inner,
@@ -691,12 +1005,118 @@ impl FormatHandler for DmgHandler {
     }
 }
 
+/// Попробовать открыть файловую систему, начинающуюся с байта `start` образа.
+///
+/// HFS+ открывается прямо по ленивому образу — ему довольно чтения по
+/// смещению. APFS читает через `Read + Seek` по файлу, поэтому для него образ
+/// приходится собрать целиком; на скорости DMG с HFS+ это никак не сказывается,
+/// а APFS остаётся ровно таким же, каким был.
+fn try_open_partition(
+    image: &std::sync::Arc<LazyImage>,
+    raw_path: &Path,
+    start: u64,
+) -> Result<Option<Box<dyn ArchiveReader>>> {
+    let Ok(start) = usize::try_from(start) else {
+        return Ok(None);
+    };
+    let volume = LazyVolume {
+        image: image.clone(),
+        offset: start,
+    };
+
+    if let Ok(inner) = open_hfsplus_source(Box::new(volume)) {
+        return Ok(Some(inner));
+    }
+    // APFS: сперва дешёвая проверка сигнатуры по ленивому образу, и только
+    // если она сошлась — сборка всего образа.
+    let apfs_magic_at = start.saturating_add(APFS_MAGIC_OFFSET as usize);
+    let looks_like_apfs = LazyVolume {
+        image: image.clone(),
+        offset: 0,
+    }
+    .read_at(apfs_magic_at, APFS_MAGIC.len())
+    .is_some_and(|sig| sig.as_ref() == APFS_MAGIC);
+    if looks_like_apfs {
+        image.materialize()?;
+        if let Ok(inner) = open_apfs(raw_path, start as u64) {
+            return Ok(Some(inner));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     // Собирающему код `Write` больше не нужен — куски пишутся по абсолютному
     // смещению, — а тестам, которые готовят фикстуры, нужен.
     use std::io::Write;
+
+    // ── поиск кусков под запрошенным диапазоном ──────────────────────────────
+
+    /// План из кусков одинаковой длины `len`, начиная с нуля подряд.
+    fn plan_of(n: usize, len: usize) -> ImagePlan {
+        let jobs: Vec<ChunkJob> = (0..n)
+            .map(|i| ChunkJob {
+                entry_type: ENTRY_RAW,
+                file_pos: 0,
+                compressed_length: len as u64,
+                out_offset: (i * len) as u64,
+                out_len: len,
+            })
+            .collect();
+        ImagePlan {
+            jobs,
+            max_chunk_len: len,
+            total_bytes: (n * len) as u64,
+            partition_starts: vec![0],
+        }
+    }
+
+    fn lazy_of(plan: &ImagePlan) -> LazyImage {
+        LazyImage::new(
+            PathBuf::from("unused"),
+            tempfile::tempfile().expect("temp file"),
+            plan,
+        )
+    }
+
+    #[test]
+    fn covering_finds_only_the_chunks_under_the_range() {
+        // Ленивость держится на этом: спросили байт — разжали кусок, а не
+        // образ. Ошибись здесь в меньшую сторону, и читатель получит нули там,
+        // где ждёт данные, — молча и с неправильным ответом.
+        let plan = plan_of(10, 100);
+        let img = lazy_of(&plan);
+
+        assert_eq!(img.covering(0, 1).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(img.covering(150, 250).collect::<Vec<_>>(), vec![1, 2]);
+        // Диапазон точно по границе куска не захватывает соседей.
+        assert_eq!(img.covering(300, 400).collect::<Vec<_>>(), vec![3]);
+        // Пустой диапазон не накрывает ничего.
+        assert!(img.covering(300, 300).next().is_none());
+        // Начало внутри куска, конец за концом образа.
+        assert_eq!(img.covering(950, 5000).collect::<Vec<_>>(), vec![9]);
+    }
+
+    #[test]
+    fn covering_looks_back_past_a_long_chunk() {
+        // Куски бывают разной длины, и длинный может начинаться задолго до
+        // запрошенного места, дотягиваясь внутрь. Двоичный поиск по началу
+        // куска такой пропустил бы — отсюда отступ назад на длину самого
+        // длинного куска.
+        let mut plan = plan_of(3, 100);
+        plan.jobs[0].out_len = 250; // куски 0 и 1..2 теперь перекрываются
+        plan.max_chunk_len = 250;
+        let img = lazy_of(&plan);
+
+        let found = img.covering(220, 230).collect::<Vec<_>>();
+        assert!(
+            found.contains(&0),
+            "длинный первый кусок накрывает 220: {found:?}"
+        );
+        assert!(found.contains(&2), "и третий кусок тоже: {found:?}");
+    }
 
     #[test]
     fn id_is_dmg() {
