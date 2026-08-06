@@ -7,7 +7,7 @@
 //! HFS+/HFSX volume ([`open_hfsplus`](super::hfsplus::open_hfsplus)) or an APFS
 //! volume ([`open_apfs`](super::apfs::open_apfs)), located by [`locate_volume`].
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use base64::Engine as _;
@@ -141,11 +141,11 @@ fn build_raw_image(path: &Path, koly: &Koly) -> Result<tempfile::TempPath> {
         .checked_mul(SECTOR_SIZE)
         .ok_or_else(|| Error::Corrupt("dmg: raw image size overflow".into()))?;
 
-    let mut tmp = tempfile::NamedTempFile::new()?;
-    tmp.as_file_mut().set_len(total_bytes)?;
-
-    let mut src = std::fs::File::open(path)?;
-    let src_len = src.metadata()?.len();
+    // Сперва — все проверки границ, в один поток и в исходном порядке. Так
+    // ошибка на битом образе остаётся ровно той же и приходит на том же куске,
+    // сколько бы потоков ни разбирало его дальше.
+    let src_len = std::fs::File::open(path)?.metadata()?.len();
+    let mut jobs: Vec<ChunkJob> = Vec::new();
     for mish in &mish_entries {
         for chunk in &mish.chunks {
             // Payload-less chunks: the temp file is already zero-initialized by
@@ -179,18 +179,135 @@ fn build_raw_image(path: &Path, koly: &Koly) -> Result<tempfile::TempPath> {
                 Some(end) if end <= src_len => {}
                 _ => return Err(Error::Corrupt("dmg: chunk data out of range".into())),
             }
-            src.seek(SeekFrom::Start(file_pos))?;
-            let mut comp = vec![0u8; chunk.compressed_length as usize];
-            src.read_exact(&mut comp)
-                .map_err(crate::error::io_err_to_corrupt)?;
-
-            let decoded = decode_chunk(chunk.entry_type, &comp, out_len)?;
-            tmp.as_file_mut().seek(SeekFrom::Start(out_offset))?;
-            tmp.as_file_mut().write_all(&decoded)?;
+            jobs.push(ChunkJob {
+                entry_type: chunk.entry_type,
+                file_pos,
+                compressed_length: chunk.compressed_length,
+                out_offset,
+                out_len,
+            });
         }
     }
 
+    let tmp = tempfile::NamedTempFile::new()?;
+    tmp.as_file().set_len(total_bytes)?;
+    decode_chunks(path, &jobs, tmp.as_file())?;
     Ok(tmp.into_temp_path())
+}
+
+/// Один кусок образа, уже проверенный на границы: откуда читать сжатое и куда
+/// класть разжатое.
+struct ChunkJob {
+    entry_type: u32,
+    file_pos: u64,
+    compressed_length: u64,
+    out_offset: u64,
+    out_len: usize,
+}
+
+/// Записать `buf` по абсолютному смещению, не двигая позицию файла: несколько
+/// потоков пишут в один и тот же временный файл одновременно, и общего курсора
+/// у них быть не должно.
+#[cfg(unix)]
+fn write_all_at(f: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.write_all_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn write_all_at(f: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let (mut buf, mut offset) = (buf, offset);
+    while !buf.is_empty() {
+        let n = f.seek_write(buf, offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "dmg: short write while assembling the raw image",
+            ));
+        }
+        buf = &buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+/// Разжать куски образа в несколько потоков.
+///
+/// Куски независимы: у каждого своя область в исходном файле и своя — в
+/// собираемом образе. Именно на этом и стоит вся разница: разбор упирается в
+/// процессор (на `IINA.v1.4.3.dmg` — 8 секунд процессорного времени из 10,5
+/// реального), и одним потоком мы просто ждали. Читает каждый поток через свой
+/// дескриптор, пишет — по абсолютному смещению, так что общего курсора нет.
+///
+/// Порядок разбора перестаёт быть определённым, и на **испорченном** образе, где
+/// куски налезают друг на друга, победит уже не обязательно последний по
+/// порядку. За пределы образа при этом не выйдет ничего: длина задана
+/// `set_len`, а границы каждого куска проверены до входа сюда. Ошибка же
+/// остаётся определённой — берётся та, что у куска с наименьшим номером.
+fn decode_chunks(path: &Path, jobs: &[ChunkJob], out: &std::fs::File) -> Result<()> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(jobs.len())
+        .clamp(1, 8);
+
+    let next = AtomicUsize::new(0);
+    let failure: Mutex<Option<(usize, Error)>> = Mutex::new(None);
+
+    let worker = || -> Result<()> {
+        let mut src = std::fs::File::open(path)?;
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(job) = jobs.get(i) else {
+                return Ok(());
+            };
+            // Кто-то уже упал на более раннем куске — дальше смысла нет.
+            if failure.lock().is_ok_and(|f| f.is_some()) {
+                return Ok(());
+            }
+            let step = (|| -> Result<()> {
+                src.seek(SeekFrom::Start(job.file_pos))?;
+                let mut comp = vec![0u8; job.compressed_length as usize];
+                src.read_exact(&mut comp)
+                    .map_err(crate::error::io_err_to_corrupt)?;
+                let decoded = decode_chunk(job.entry_type, &comp, job.out_len)?;
+                write_all_at(out, &decoded, job.out_offset)?;
+                Ok(())
+            })();
+            if let Err(e) = step
+                && let Ok(mut slot) = failure.lock()
+            {
+                match &*slot {
+                    Some((prev, _)) if *prev <= i => {}
+                    _ => *slot = Some((i, e)),
+                }
+            }
+        }
+    };
+
+    if threads <= 1 {
+        worker()?;
+    } else {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads).map(|_| scope.spawn(worker)).collect();
+            for h in handles {
+                // Паника в потоке — не наш случай (весь разбор возвращает
+                // ошибки), но проглатывать её нельзя.
+                h.join()
+                    .map_err(|_| Error::Corrupt("dmg: chunk decoder panicked".into()))??;
+            }
+            Ok::<(), Error>(())
+        })?;
+    }
+
+    match failure.into_inner() {
+        Ok(Some((_, e))) => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Sweep sector boundaries for a filesystem signature at `s + magic_offset`,
@@ -577,6 +694,9 @@ impl FormatHandler for DmgHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Собирающему код `Write` больше не нужен — куски пишутся по абсолютному
+    // смещению, — а тестам, которые готовят фикстуры, нужен.
+    use std::io::Write;
 
     #[test]
     fn id_is_dmg() {
