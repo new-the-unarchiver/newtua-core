@@ -191,6 +191,17 @@ impl ArchiveReader for AppImageReader {
         self.inner.read_entry(idx, out)
     }
 
+    /// Индексы у обёртки и у вложенной файловой системы одни и те же, так что
+    /// пакетный проход пробрасывается как есть — иначе обёртка навязала бы
+    /// вложенному обработчику реализацию по умолчанию.
+    fn read_entries(
+        &mut self,
+        indices: &[usize],
+        sink: &mut dyn crate::archive::EntrySink,
+    ) -> Result<()> {
+        self.inner.read_entries(indices, sink)
+    }
+
     fn verify_password(&mut self) -> Result<()> {
         self.inner.verify_password()
     }

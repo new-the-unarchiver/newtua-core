@@ -5,8 +5,8 @@ pub use error::{Error, Result};
 
 pub mod archive;
 pub use archive::{
-    ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, ReadSeek,
-    Source,
+    ArchiveReader, Confidence, Entry, EntryKind, EntrySink, FormatHandler, FormatId, OpenOptions,
+    ReadSeek, SinkStep, SinkWriter, Source,
 };
 
 pub mod encoding;

@@ -1,14 +1,11 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use filetime::FileTime;
 
-use crate::archive::{ArchiveReader, Entry, EntryKind};
-use crate::error::Result;
-// Нужен только ветке AppleDouble: на macOS вилка пишется в сам файл, и
-// ограничения на 4 ГиБ там нет.
-#[cfg(not(target_os = "macos"))]
-use crate::error::Error;
+use crate::archive::{ArchiveReader, Entry, EntryKind, EntrySink, SinkStep};
+use crate::error::{Error, Result};
 use crate::path_safety::safe_join;
 
 /// Streamed progress notifications during extraction.
@@ -84,7 +81,10 @@ pub struct ExtractOptions {
     /// Restore mtime (and in future: mode) from archive metadata. Default: true.
     pub preserve: bool,
     /// Restrict extraction to these original entry indices. `None` = all.
-    /// (Honored starting in Task 2; accepted here for a stable struct shape.)
+    ///
+    /// On a solid format the entries before a selected one still have to be
+    /// decompressed to reach it — but nothing outside the selection is written
+    /// to disk.
     pub selection: Option<Vec<usize>>,
     /// Optional progress/cancellation callback.
     pub progress: Option<ProgressFn>,
@@ -187,55 +187,33 @@ pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &mut ExtractOptions) -> Res
     let preserve = opts.preserve;
     let strict = opts.strict;
 
-    let mut dir_mtimes: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
+    // Отобранные записи, по возрастанию — именно такой список ждёт
+    // `read_entries`, и это же порядок заголовка архива.
+    let indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| selected.as_ref().is_none_or(|set| set.contains(i)) && !is_skipped(e))
+        .map(|(i, _)| i)
+        .collect();
 
-    for (idx, entry) in entries.iter().enumerate() {
-        if let Some(set) = &selected
-            && !set.contains(&idx)
-        {
-            continue;
-        }
-        if !opts.keep_macos_metadata && crate::is_macos_metadata(&entry.path) {
-            continue;
-        }
-        // EntryStart (also a cancellation checkpoint for dirs/symlinks).
-        if let Some(p) = opts.progress.as_mut() {
-            let path = entry.path.to_string_lossy();
-            if let Flow::Abort = p(ProgressEvent::EntryStart {
-                index: idx,
-                path: &path,
-                size: entry.size,
-            }) {
-                report.aborted = true;
-                break;
-            }
-        }
-
-        let mut aborted = false;
-        let ctx = ProgressCtx {
-            progress: opts.progress.as_mut(),
-            aborted: &mut aborted,
-        };
-        let result = extract_one(ar, idx, entry, &dest, preserve, &mut dir_mtimes, ctx);
-        if aborted {
-            report.aborted = true;
-            break;
-        }
-        match result {
-            Ok(()) => {
-                report.extracted += 1;
-                if let Some(p) = opts.progress.as_mut() {
-                    let _ = p(ProgressEvent::EntryDone { index: idx });
-                }
-            }
-            Err(e) => {
-                if strict {
-                    return Err(e);
-                }
-                report.failed.push((entry.path.clone(), e.to_string()));
-            }
-        }
-    }
+    // Один проход по архиву вместо `read_entry` на каждую запись. Формату,
+    // под которым лежит последовательный поток (7z, RAR, папка CAB), это
+    // разница между секундами и часом; остальные получают ровно прежнее
+    // поведение через реализацию по умолчанию.
+    let mut sink = ExtractSink {
+        entries: &entries,
+        dest: &dest,
+        preserve,
+        strict,
+        progress: opts.progress.as_mut(),
+        report: &mut report,
+        dir_mtimes: Vec::new(),
+        cur: None,
+        aborted: false,
+    };
+    let outcome = ar.read_entries(&indices, &mut sink);
+    let dir_mtimes = std::mem::take(&mut sink.dir_mtimes);
+    outcome?;
 
     if preserve {
         for (path, modified) in &dir_mtimes {
@@ -246,92 +224,124 @@ pub fn extract_all(ar: &mut dyn ArchiveReader, opts: &mut ExtractOptions) -> Res
     Ok(report)
 }
 
-/// Bundles the optional progress callback with the cooperative-abort flag so
-/// `extract_one` stays within clippy's argument-count limit.
-struct ProgressCtx<'a> {
+/// Приёмник, в который обработчик формата отдаёт тела записей на своём проходе
+/// по архиву.
+///
+/// Раньше здесь был цикл `extract_one`, дёргавший `read_entry` на каждую
+/// запись. Теперь порядок обратный: ходит по архиву обработчик, а эта
+/// сторона отвечает на три вопроса — куда писать, что делать с тем, что
+/// записалось, и не пора ли остановиться. Причина в том, что под 7z, RAR и
+/// папкой CAB лежит последовательный поток, и «дай мне запись N» там означает
+/// «распакуй всё, что до неё» (см. `.claude/PERF-2026-08-06-findings.md`).
+struct ExtractSink<'a> {
+    entries: &'a [Entry],
+    dest: &'a Path,
+    preserve: bool,
+    strict: bool,
     progress: Option<&'a mut ProgressFn>,
-    aborted: &'a mut bool,
+    report: &'a mut ExtractReport,
+    dir_mtimes: Vec<(PathBuf, Option<SystemTime>)>,
+    /// Запись, тело которой пишется прямо сейчас.
+    cur: Option<Current>,
+    /// Человек отменил распаковку. Отдельно от ошибки: обрыв по отмене — не
+    /// поломка, и разбираются с ним иначе.
+    aborted: bool,
 }
 
-fn extract_one(
-    ar: &mut dyn ArchiveReader,
+/// Запись, тело которой пишется прямо сейчас. Одна зараз: последовательный
+/// носитель по-другому и не умеет.
+struct Current {
     idx: usize,
-    entry: &Entry,
-    dest: &Path,
-    preserve: bool,
-    dir_mtimes: &mut Vec<(PathBuf, Option<SystemTime>)>,
-    mut ctx: ProgressCtx<'_>,
-) -> Result<()> {
-    let target = safe_join(dest, &entry.path)?;
-    if entry.is_resource_fork {
-        return write_resource_fork(ar, idx, entry, &target, preserve);
+    /// Путь самой записи: на нём права и дата, от него считается имя бокового
+    /// файла AppleDouble.
+    entry_path: PathBuf,
+    /// Куда льются байты. Для обычного файла совпадает с `entry_path`; для
+    /// ресурсной вилки на macOS это `entry_path/..namedfork/rsrc`.
+    write_path: PathBuf,
+    /// Это ресурсная вилка, а не сам файл.
+    is_fork: bool,
+    body: Body,
+}
+
+enum Body {
+    File(std::fs::File),
+    /// Ресурсная вилка там, где вилок нет: её надо обернуть в AppleDouble
+    /// целиком, а в заголовке стоит длина — значит, сперва копим.
+    #[cfg(not(target_os = "macos"))]
+    Buffer(Vec<u8>),
+}
+
+impl ExtractSink<'_> {
+    /// Запись не удалась: в строгом режиме это конец распаковки, иначе —
+    /// строка в отчёте, и идём дальше.
+    fn failed(&mut self, entry: &Entry, e: Error) -> Result<bool> {
+        if self.strict {
+            return Err(e);
+        }
+        self.report.failed.push((entry.path.clone(), e.to_string()));
+        Ok(true)
     }
-    match &entry.kind {
-        EntryKind::Dir => {
-            std::fs::create_dir_all(&target)?;
-            if preserve {
-                apply_mode(&target, entry.mode);
-            }
-            dir_mtimes.push((target.clone(), entry.modified));
-        }
-        EntryKind::Symlink {
-            target: link_target,
-        } => {
-            crate::path_safety::safe_symlink_target(dest, &entry.path, link_target)?;
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            create_symlink(link_target, &target)?;
-            if preserve {
-                apply_symlink_mtime(&target, entry.modified);
-            }
-        }
-        EntryKind::File => {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let out = std::fs::File::create(&target)?;
-            // The file exists from this line on, before a single byte of content
-            // is known. Whatever happens next, an unfinished one must not be left
-            // behind: a zero-length file with the right name reads as success,
-            // and that is worse than the entry plainly not being there. The two
-            // ways out below therefore both delete it — see the note on `aborted`.
-            let outcome = match ctx.progress.as_mut() {
-                Some(p) => {
-                    let mut w = ProgressWriter {
-                        idx,
-                        inner: out,
-                        progress: p,
-                        aborted: ctx.aborted,
-                    };
-                    ar.read_entry(idx, &mut w)
-                }
-                None => {
-                    let mut out = out;
-                    ar.read_entry(idx, &mut out)
-                }
-            };
-            if let Err(e) = outcome {
-                // The write handle is gone by now (both arms dropped it with the
-                // match), so the file can be removed on Windows too.
-                let _ = std::fs::remove_file(&target);
-                // On cooperative abort, ProgressWriter returns an io error and
-                // sets *aborted; that stop is swallowed here. The half-written
-                // file still goes: cancelling means the person does not want this
-                // entry, and a truncated file looks exactly like a whole one.
-                // Entries already written in full stay — they are finished work.
-                if *ctx.aborted {
-                    return Ok(());
-                }
-                return Err(e);
-            }
-            if preserve {
-                apply_mode(&target, entry.mode);
-                apply_mtime(&target, entry.modified);
-            }
+
+    /// Запись состоялась: посчитать и сообщить.
+    fn done(&mut self, idx: usize) {
+        self.report.extracted += 1;
+        if let Some(p) = self.progress.as_mut() {
+            let _ = p(ProgressEvent::EntryDone { index: idx });
         }
     }
-    Ok(())
+
+    /// Создать то, у чего нет тела (каталог, ссылка), или открыть файл под
+    /// тело. Ошибки отсюда ловит `begin`.
+    fn prepare(&mut self, idx: usize, entry: &Entry) -> Result<SinkStep> {
+        let target = safe_join(self.dest, &entry.path)?;
+        if entry.is_resource_fork {
+            return self.prepare_fork(idx, target);
+        }
+        match &entry.kind {
+            EntryKind::Dir => {
+                std::fs::create_dir_all(&target)?;
+                if self.preserve {
+                    apply_mode(&target, entry.mode);
+                }
+                self.dir_mtimes.push((target, entry.modified));
+                self.done(idx);
+                Ok(SinkStep::Skip)
+            }
+            EntryKind::Symlink {
+                target: link_target,
+            } => {
+                crate::path_safety::safe_symlink_target(self.dest, &entry.path, link_target)?;
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                create_symlink(link_target, &target)?;
+                if self.preserve {
+                    apply_symlink_mtime(&target, entry.modified);
+                }
+                self.done(idx);
+                Ok(SinkStep::Skip)
+            }
+            EntryKind::File => {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let out = std::fs::File::create(&target)?;
+                // Файл существует с этой строки — раньше, чем известен хоть
+                // один байт содержимого. Как бы дальше ни вышло, недописанный
+                // остаться не должен: пустой файл с правильным именем читается
+                // как успех, а это хуже, чем честное отсутствие записи. Убирает
+                // его `end`, на обоих выходах.
+                self.cur = Some(Current {
+                    idx,
+                    entry_path: target.clone(),
+                    write_path: target,
+                    is_fork: false,
+                    body: Body::File(out),
+                });
+                Ok(SinkStep::Body)
+            }
+        }
+    }
 }
 
 /// AppleDouble v2 header, as Apple writes it when a Mac file lands on a
@@ -367,86 +377,186 @@ const APPLEDOUBLE_HEADER_LEN: u32 = 38;
 ///
 /// The data-fork entry may not have been written yet (nothing orders the two),
 /// so on macOS the base file is created empty if it is missing.
-fn write_resource_fork(
-    ar: &mut dyn ArchiveReader,
-    idx: usize,
-    entry: &Entry,
-    target: &Path,
-    preserve: bool,
-) -> Result<()> {
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
+impl ExtractSink<'_> {
+    fn prepare_fork(&mut self, idx: usize, target: PathBuf) -> Result<SinkStep> {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if !target.exists() {
+                std::fs::File::create(&target)?;
+            }
+            let write_path = target.join("..namedfork").join("rsrc");
+            let out = std::fs::File::create(&write_path)?;
+            self.cur = Some(Current {
+                idx,
+                entry_path: target,
+                write_path,
+                is_fork: true,
+                body: Body::File(out),
+            });
+            Ok(SinkStep::Body)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.cur = Some(Current {
+                idx,
+                entry_path: target.clone(),
+                write_path: target,
+                is_fork: true,
+                body: Body::Buffer(Vec::new()),
+            });
+            Ok(SinkStep::Body)
+        }
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        if !target.exists() {
-            std::fs::File::create(target)?;
-        }
-        let mut out = std::fs::File::create(target.join("..namedfork").join("rsrc"))?;
-        ar.read_entry(idx, &mut out)?;
-        // Times go on the file, not on the fork: the fork is not a file of its
-        // own and has no timestamps to carry.
-        if preserve {
-            apply_mtime(target, entry.modified);
-        }
-        Ok(())
-    }
+    /// Тело записи дошло целиком: доложить его до конца и проставить время и
+    /// права.
+    fn finish(&mut self, cur: Current, entry: &Entry) -> Result<()> {
+        match cur.body {
+            Body::File(out) => {
+                drop(out);
+                if cur.is_fork {
+                    // Время ставится на файл, а не на вилку: вилка — не
+                    // отдельный файл, и своих дат у неё нет.
+                    if self.preserve {
+                        apply_mtime(&cur.entry_path, entry.modified);
+                    }
+                } else if self.preserve {
+                    apply_mode(&cur.entry_path, entry.mode);
+                    apply_mtime(&cur.entry_path, entry.modified);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            Body::Buffer(fork) => {
+                let len = u32::try_from(fork.len()).map_err(|_| Error::Unsupported {
+                    format: "resource fork".into(),
+                    feature: "fork larger than 4 GiB in an AppleDouble sidecar".into(),
+                })?;
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        let mut fork = Vec::new();
-        ar.read_entry(idx, &mut fork)?;
-        let len = u32::try_from(fork.len()).map_err(|_| Error::Unsupported {
-            format: "resource fork".into(),
-            feature: "fork larger than 4 GiB in an AppleDouble sidecar".into(),
-        })?;
+                let name = cur
+                    .entry_path
+                    .file_name()
+                    .ok_or_else(|| Error::Corrupt("resource fork entry has no file name".into()))?;
+                let mut sidecar_name = std::ffi::OsString::from("._");
+                sidecar_name.push(name);
+                let sidecar = cur.entry_path.with_file_name(sidecar_name);
 
-        let name = target
-            .file_name()
-            .ok_or_else(|| Error::Corrupt("resource fork entry has no file name".into()))?;
-        let mut sidecar_name = std::ffi::OsString::from("._");
-        sidecar_name.push(name);
-        let sidecar = target.with_file_name(sidecar_name);
+                let mut buf = Vec::with_capacity(APPLEDOUBLE_HEADER_LEN as usize + fork.len());
+                buf.extend_from_slice(&APPLEDOUBLE_MAGIC.to_be_bytes());
+                buf.extend_from_slice(&APPLEDOUBLE_VERSION.to_be_bytes());
+                buf.extend_from_slice(&[0u8; 16]);
+                buf.extend_from_slice(&1u16.to_be_bytes());
+                buf.extend_from_slice(&APPLEDOUBLE_RESOURCE_FORK_ID.to_be_bytes());
+                buf.extend_from_slice(&APPLEDOUBLE_HEADER_LEN.to_be_bytes());
+                buf.extend_from_slice(&len.to_be_bytes());
+                buf.extend_from_slice(&fork);
+                std::fs::write(&sidecar, &buf)?;
 
-        let mut buf = Vec::with_capacity(APPLEDOUBLE_HEADER_LEN as usize + fork.len());
-        buf.extend_from_slice(&APPLEDOUBLE_MAGIC.to_be_bytes());
-        buf.extend_from_slice(&APPLEDOUBLE_VERSION.to_be_bytes());
-        buf.extend_from_slice(&[0u8; 16]);
-        buf.extend_from_slice(&1u16.to_be_bytes());
-        buf.extend_from_slice(&APPLEDOUBLE_RESOURCE_FORK_ID.to_be_bytes());
-        buf.extend_from_slice(&APPLEDOUBLE_HEADER_LEN.to_be_bytes());
-        buf.extend_from_slice(&len.to_be_bytes());
-        buf.extend_from_slice(&fork);
-        std::fs::write(&sidecar, &buf)?;
-
-        if preserve {
-            apply_mtime(&sidecar, entry.modified);
+                if self.preserve {
+                    apply_mtime(&sidecar, entry.modified);
+                }
+            }
         }
         Ok(())
     }
 }
 
-struct ProgressWriter<'a> {
-    idx: usize,
-    inner: std::fs::File,
-    progress: &'a mut ProgressFn,
-    aborted: &'a mut bool,
-}
+impl EntrySink for ExtractSink<'_> {
+    fn begin(&mut self, idx: usize) -> Result<SinkStep> {
+        // `entries` — общая ссылка, взятая насквозь: она не мешает менять сам
+        // приёмник дальше по методу.
+        let entries = self.entries;
+        let entry = entries.get(idx).ok_or(Error::InvalidIndex(idx))?;
 
-impl std::io::Write for ProgressWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        if let Flow::Abort = (self.progress)(ProgressEvent::Bytes {
-            index: self.idx,
-            written: n as u64,
-        }) {
-            *self.aborted = true;
-            return Err(std::io::Error::other("extraction aborted"));
+        // EntryStart, он же точка отмены для каталогов и ссылок.
+        if let Some(p) = self.progress.as_mut() {
+            let path = entry.path.to_string_lossy();
+            if let Flow::Abort = p(ProgressEvent::EntryStart {
+                index: idx,
+                path: &path,
+                size: entry.size,
+            }) {
+                self.report.aborted = true;
+                return Ok(SinkStep::Stop);
+            }
         }
-        Ok(n)
+
+        match self.prepare(idx, entry) {
+            Ok(step) => Ok(step),
+            Err(e) => {
+                if self.strict {
+                    return Err(e);
+                }
+                self.report.failed.push((entry.path.clone(), e.to_string()));
+                // `Skip` — учёт по этой записи уже закрыт, `end` для неё не
+                // придёт.
+                Ok(SinkStep::Skip)
+            }
+        }
     }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+
+    fn write_body(&mut self, buf: &[u8]) -> Result<()> {
+        let Some(cur) = self.cur.as_mut() else {
+            return Err(Error::Corrupt(
+                "extract: entry body arrived without begin".into(),
+            ));
+        };
+        let idx = cur.idx;
+        match &mut cur.body {
+            Body::File(f) => f.write_all(buf)?,
+            #[cfg(not(target_os = "macos"))]
+            Body::Buffer(v) => v.extend_from_slice(buf),
+        }
+        if let Some(p) = self.progress.as_mut()
+            && let Flow::Abort = p(ProgressEvent::Bytes {
+                index: idx,
+                written: buf.len() as u64,
+            })
+        {
+            self.aborted = true;
+            return Err(Error::Io(std::io::Error::other("extraction aborted")));
+        }
+        Ok(())
+    }
+
+    fn end(&mut self, idx: usize, outcome: Result<()>) -> Result<bool> {
+        let Some(cur) = self.cur.take() else {
+            return Err(Error::Corrupt("extract: entry end without begin".into()));
+        };
+        let entries = self.entries;
+        let entry = entries.get(idx).ok_or(Error::InvalidIndex(idx))?;
+
+        match outcome {
+            Ok(()) => match self.finish(cur, entry) {
+                Ok(()) => {
+                    self.done(idx);
+                    Ok(true)
+                }
+                Err(e) => self.failed(entry, e),
+            },
+            Err(e) => {
+                // Дескриптор надо закрыть до удаления, иначе на Windows файл не
+                // убрать. Ресурсную вилку не трогаем: на macOS это второй поток
+                // уже существующего файла, а не отдельная запись на диске.
+                let is_fork = cur.is_fork;
+                let write_path = cur.write_path.clone();
+                drop(cur);
+                if !is_fork {
+                    let _ = std::fs::remove_file(&write_path);
+                }
+                // Отмена — не поломка. Раз человек отменил, эта запись ему не
+                // нужна, а обрезанный файл выглядит ровно как целый. Записи,
+                // дописанные до этого, остаются: это законченная работа.
+                if self.aborted {
+                    self.report.aborted = true;
+                    return Ok(false);
+                }
+                self.failed(entry, e)
+            }
+        }
     }
 }
