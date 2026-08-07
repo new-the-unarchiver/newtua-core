@@ -151,7 +151,7 @@ impl CabReader {
     /// decodes the blocks in between, while seeking back would restart the
     /// folder from its first block.
     fn copy_body(
-        folder: &mut cab::FolderReader<'_, Box<dyn ReadSeek>>,
+        folder: &mut cab::FolderReader<'_>,
         place: &Place,
         out: &mut dyn Write,
     ) -> Result<()> {
@@ -256,7 +256,7 @@ impl CabReader {
         &'a self,
         idx: usize,
         folder_idx: usize,
-        folder: &mut Option<cab::FolderReader<'a, Box<dyn ReadSeek>>>,
+        folder: &mut Option<cab::FolderReader<'a>>,
         sink: &mut dyn EntrySink,
     ) -> Result<()> {
         let place = &self.places[idx];

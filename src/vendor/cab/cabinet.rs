@@ -131,7 +131,7 @@ impl<R: Read + Seek> Cabinet<R> {
     /// behind a `RefCell`, so the borrow checker was the only thing insisting
     /// on exclusivity, and a `&mut` here would stop the caller holding a folder
     /// reader while reading its own entry list.
-    pub fn open_folder(&self, index: usize) -> io::Result<FolderReader<'_, R>> {
+    pub fn open_folder(&self, index: usize) -> io::Result<FolderReader<'_>> {
         if index >= self.inner.folders.len() {
             invalid_input!(
                 "Folder index {} is out of range (cabinet has {} folders)",

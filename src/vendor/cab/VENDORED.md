@@ -96,11 +96,28 @@ curl -sL -o cab-master.tar.gz \
 ```
 
 Expect the diff to be large in shape and small in substance: the cuts above,
-plus reformatting. When upstream finally releases `all_files()`, going back to
-the registry is worth reconsidering — but note that its `next_file()` hands out
-*all* files of a folder with no way to select a subset, and swallows a folder
-that fails to open (`FolderReader::new(..).ok()?`) as "no more files", which
-would truncate an extraction and report success.
+plus reformatting.
+
+**Going back to the registry is not the plan, and saying so is kinder than
+pretending.** Upstream has no Quantum decoder at all, so returning would cost a
+compression method outright; and its unreleased `next_file()` hands out *all*
+files of a folder with no way to select a subset, and swallows a folder that
+fails to open (`FolderReader::new(..).ok()?`) as "no more files" — an extraction
+truncated and reported as success. `newtua-hfsplus` went the same way and its
+README says so rather than keeping up appearances.
+
+**So what is the resemblance still for?** One thing: picking up an upstream
+*fix*. If a header-parsing bug is fixed there, we want to find the same place
+here. That needs the **layout** preserved — same files, same function names,
+same boundaries between them — and nothing more. It is not a reason to keep an
+implementation we would otherwise improve: a rewritten function body costs
+nothing to a future patch, while moving or renaming things costs everything.
+
+Judged that way, `mszip.rs`'s per-block allocations stay as they are on the
+evidence, not on principle: an 88 MB single-file cabinet (2691 blocks) extracts
+at **447 MB/s here against 333 MB/s for `cabextract`**, which is libmspack —
+the implementation whose own `TODO` complains about those very allocations.
+There is nothing to win there.
 
 ## Quantum
 

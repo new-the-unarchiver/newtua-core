@@ -1,5 +1,4 @@
 use std::io::{self, Read, Seek, SeekFrom};
-use std::marker::PhantomData;
 use std::slice;
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -39,7 +38,13 @@ struct DataBlockEntry {
 }
 
 /// A reader for reading decompressed data from a cabinet folder.
-pub struct FolderReader<'a, R> {
+///
+/// Upstream carried a `R` type parameter here in a `PhantomData`, and nothing
+/// ever read it — the bytes come from the `Cabinet` borrowed below, whose own
+/// reader is already erased to `dyn ReadSeek`. Dropping it takes the ceremony
+/// out of every signature that mentions this type, in `format/cab.rs` most of
+/// all.
+pub struct FolderReader<'a> {
     reader: &'a Cabinet<dyn ReadSeek + 'a>,
     num_data_blocks: usize,
     data_reserve_size: u8,
@@ -52,7 +57,6 @@ pub struct FolderReader<'a, R> {
     current_block_data: Vec<u8>,
     current_offset_within_block: usize,
     current_offset_within_folder: u64,
-    _p: PhantomData<R>,
 }
 
 impl<'a> Iterator for FolderEntries<'a> {
@@ -78,12 +82,12 @@ impl FolderEntry {
     }
 }
 
-impl<'a, R: Read + Seek> FolderReader<'a, R> {
+impl<'a> FolderReader<'a> {
     pub(crate) fn new(
         reader: &'a Cabinet<dyn ReadSeek + 'a>,
         entry: &FolderEntry,
         data_reserve_size: u8,
-    ) -> io::Result<FolderReader<'a, R>> {
+    ) -> io::Result<FolderReader<'a>> {
         let num_data_blocks = entry.num_data_blocks as usize;
         let mut data_blocks = Vec::with_capacity(num_data_blocks);
 
@@ -105,7 +109,6 @@ impl<'a, R: Read + Seek> FolderReader<'a, R> {
             current_block_data: Vec::new(),
             current_offset_within_block: 0,
             current_offset_within_folder: 0,
-            _p: PhantomData,
         };
         folder_reader.load_block()?;
         Ok(folder_reader)
@@ -200,7 +203,7 @@ impl<'a, R: Read + Seek> FolderReader<'a, R> {
     }
 }
 
-impl<'a, R: Read + Seek + 'a> Read for FolderReader<'a, R> {
+impl Read for FolderReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() || self.current_block_index >= self.num_data_blocks {
             return Ok(0);
