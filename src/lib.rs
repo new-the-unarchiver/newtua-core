@@ -20,6 +20,12 @@ pub use decompress::{Compressor, decompressor};
 
 mod datetime;
 
+/// Third-party code carried inside this crate rather than depended on.
+///
+/// See `src/vendor/<name>/VENDORED.md` for what each one is, why it is not a
+/// dependency, and how to compare it against its upstream.
+mod vendor;
+
 pub mod format;
 
 pub mod volume;
