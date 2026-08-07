@@ -369,15 +369,27 @@ impl ArchiveReader for HfsPlusReader {
             return Ok(()); // directory or symlink — no body to extract
         }
         let cnid = self.cnids[idx];
+        // Poured straight into `out` as it is produced, so the peak memory is a
+        // piece of the file rather than the file: a four-gigabyte film inside an
+        // image used to mean four gigabytes of RAM, which on a smaller machine
+        // is the system killing the process — an ending we cannot catch and
+        // cannot explain to anyone.
+        //
         // Already decodes decmpfs (zlib/LZVN/LZFSE, inline or resource-fork)
-        // transparently; `None` means an unrecognised/undecodable file —
-        // never a misleading empty body.
-        let bytes = self
-            .catalog
-            .read_file(&*self.source, cnid)
-            .ok_or_else(|| Error::Corrupt(format!("hfsplus: failed to read/decode cnid {cnid}")))?;
-        out.write_all(&bytes)?;
-        Ok(())
+        // transparently, and still never writes a misleading empty body: an
+        // undecodable file fails instead.
+        self.catalog
+            .read_file_into(&*self.source, cnid, out)
+            .map_err(|e| match e.kind() {
+                // `InvalidData` is the crate's own way of saying the volume
+                // cannot produce this file; anything else came from `out` and
+                // is a plain I/O failure (a full disk, a vanished directory).
+                // `extract.rs` removes the unfinished file either way.
+                std::io::ErrorKind::InvalidData => {
+                    Error::Corrupt(format!("hfsplus: failed to read/decode cnid {cnid}: {e}"))
+                }
+                _ => Error::Io(e),
+            })
     }
 
     /// Same walk as the default, with one thing said out loud first.
