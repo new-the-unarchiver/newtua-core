@@ -247,10 +247,109 @@ pub trait FormatHandler {
     fn open(&self, src: Source, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>>;
 }
 
+/// Что делать с очередной записью пакетного прохода — решает приёмник.
+pub enum SinkStep {
+    /// Тело записи нужно: обработчик передаёт его в [`EntrySink::write_body`],
+    /// а затем обязан позвать [`EntrySink::end`].
+    Body,
+    /// Тело не нужно. Обработчик к этой записи больше не возвращается:
+    /// `end` для неё **не** зовётся, весь учёт приёмник уже сделал сам.
+    /// Так проходят каталоги и ссылки — у них тела нет вовсе.
+    Skip,
+    /// Прекратить проход. Записи, дописанные до этого, остаются.
+    Stop,
+}
+
+/// Приёмник пакетного чтения: куда идут тела записей и что с ними вышло.
+///
+/// Живёт на стороне того, кто распаковывает (`extract_all`), а зовёт его
+/// обработчик формата изнутри своего прохода по архиву. Отсюда и порядок
+/// вызовов — `begin` → `write_body`* → `end` на каждую запись, строго по одной
+/// зараз: последовательный носитель иначе и не умеет.
+pub trait EntrySink {
+    /// Приготовиться к записи `idx` и сказать, нужно ли её тело.
+    fn begin(&mut self, idx: usize) -> Result<SinkStep>;
+
+    /// Очередной кусок тела текущей записи.
+    fn write_body(&mut self, buf: &[u8]) -> Result<()>;
+
+    /// Тело текущей записи кончилось. `outcome` — `Ok(())`, если оно дошло
+    /// целиком, иначе причина. Возврат `false` прекращает проход.
+    fn end(&mut self, idx: usize, outcome: Result<()>) -> Result<bool>;
+}
+
+/// Мост от [`EntrySink`] к обычному `Write`, чтобы обработчик мог лить тело
+/// через `std::io::copy`.
+///
+/// Настоящая ошибка приёмника хранится отдельно: `io::Error` донёс бы только
+/// её текст, а наверх нужен наш `Error` — по нему решают, отменили распаковку
+/// или она сломалась.
+pub struct SinkWriter<'a> {
+    sink: &'a mut dyn EntrySink,
+    err: Option<Error>,
+}
+
+impl<'a> SinkWriter<'a> {
+    pub fn new(sink: &'a mut dyn EntrySink) -> Self {
+        Self { sink, err: None }
+    }
+
+    /// Ошибка приёмника, если она была. Её и надо отдать в `end`, а не ту,
+    /// что вернул `io::copy`.
+    pub fn take_err(&mut self) -> Option<Error> {
+        self.err.take()
+    }
+}
+
+impl Write for SinkWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.sink.write_body(buf) {
+            Ok(()) => Ok(buf.len()),
+            Err(e) => {
+                self.err = Some(e);
+                Err(std::io::Error::other("entry sink rejected the body"))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub trait ArchiveReader {
     fn format(&self) -> FormatId;
     fn entries(&mut self) -> Result<&[Entry]>;
+    /// Write entry `idx`'s body to `out`.
+    ///
+    /// `out` should not report [`std::io::ErrorKind::InvalidData`]: handlers
+    /// read that kind as "the archive says something impossible" and turn it
+    /// into [`Error::Corrupt`], so a sink that borrows the kind for its own
+    /// validation gets its complaint reported as a damaged archive. Every sink
+    /// in this crate obeys that — `SinkWriter` returns `io::Error::other` — but
+    /// the trait is public, so it is written down rather than assumed.
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()>;
+
+    /// Прочитать несколько записей за один проход по архиву.
+    ///
+    /// Зачем отдельный метод, если есть `read_entry`. Под частью форматов лежит
+    /// **последовательный** поток: 7z со сплошным блоком, RAR, папка CAB. Там
+    /// «дай запись номер N» означает «распакуй всё, что лежит до неё», и цикл
+    /// по `read_entry` превращает распаковку в квадратичную — на семнадцати
+    /// тысячах значков это сорок пять минут против восьми секунд у `7zz`
+    /// (замеры: `.claude/PERF-2026-08-06-findings.md`). Здесь носителю говорят
+    /// сразу весь список, и он проходит архив один раз.
+    ///
+    /// `indices` идут **по возрастанию и без повторов** — это порядок заголовка,
+    /// он же естественный порядок носителя.
+    ///
+    /// Реализация по умолчанию — цикл по `read_entry`, то есть ровно нынешнее
+    /// поведение. Переопределять её нужно только там, где проход по архиву
+    /// стоит дорого; форматам с произвольным доступом (zip, tar, wim, xar,
+    /// squashfs, iso и прочим) она подходит как есть.
+    fn read_entries(&mut self, indices: &[usize], sink: &mut dyn EntrySink) -> Result<()> {
+        read_entries_one_by_one(self, indices, sink)
+    }
 
     /// Verify that the archive can be decrypted with the given password,
     /// WITHOUT extracting any files. The orchestrator (`extract_all`) calls
@@ -268,6 +367,39 @@ pub trait ArchiveReader {
     fn verify_password(&mut self) -> Result<()> {
         Ok(())
     }
+}
+
+/// Пройти записи по одной через `read_entry` — тело реализации `read_entries`
+/// по умолчанию.
+///
+/// Отдельной функцией, потому что переопределивший `read_entries` не может
+/// позвать умолчание: носителю с произвольным доступом бывает нужно что-то
+/// сделать до обхода, а сам обход оставить прежним (так делает HFS+, который
+/// сообщает своему источнику байтов, что сейчас прочитают весь том). Без этого
+/// цикл пришлось бы переписать у каждого такого — и он бы разошёлся.
+pub(crate) fn read_entries_one_by_one<R: ArchiveReader + ?Sized>(
+    reader: &mut R,
+    indices: &[usize],
+    sink: &mut dyn EntrySink,
+) -> Result<()> {
+    for &idx in indices {
+        match sink.begin(idx)? {
+            SinkStep::Stop => return Ok(()),
+            SinkStep::Skip => continue,
+            SinkStep::Body => {}
+        }
+        let mut w = SinkWriter::new(sink);
+        let outcome = reader.read_entry(idx, &mut w);
+        // Ошибка приёмника важнее ошибки чтения: отмену видно только по ней.
+        let outcome = match w.take_err() {
+            Some(e) => Err(e),
+            None => outcome,
+        };
+        if !sink.end(idx, outcome)? {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

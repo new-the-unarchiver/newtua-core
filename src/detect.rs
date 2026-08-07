@@ -282,6 +282,18 @@ impl ArchiveReader for TempBackedReader {
         self.inner.read_entry(idx, out)
     }
 
+    /// Проброс обязателен: без него обёртка подсунула бы реализацию по
+    /// умолчанию (цикл по `read_entry`) и отняла бы у вложенного обработчика
+    /// его собственный однопроходный путь. Через эту обёртку открываются SFX,
+    /// deb/rpm и тома — то есть и 7z внутри самораспаковки.
+    fn read_entries(
+        &mut self,
+        indices: &[usize],
+        sink: &mut dyn crate::archive::EntrySink,
+    ) -> Result<()> {
+        self.inner.read_entries(indices, sink)
+    }
+
     fn verify_password(&mut self) -> Result<()> {
         self.inner.verify_password()
     }

@@ -467,3 +467,126 @@ fn sevenz_never_reports_the_filetime_zero_point() {
         }
     }
 }
+
+/// Обёртка, у которой пакетного прохода **нет**: она нарочно оставляет
+/// реализацию `read_entries` по умолчанию — цикл по `read_entry`. Ею и
+/// сверяется новый однопроходный путь 7z: два разных пути обязаны положить на
+/// диск одни и те же байты, иначе расхождение вылезет через полгода на чужом
+/// архиве и объяснить его будет нечем.
+struct DefaultPath(Box<dyn newtua_core::ArchiveReader>);
+
+impl newtua_core::ArchiveReader for DefaultPath {
+    fn format(&self) -> newtua_core::FormatId {
+        self.0.format()
+    }
+
+    fn entries(&mut self) -> newtua_core::Result<&[newtua_core::Entry]> {
+        self.0.entries()
+    }
+
+    fn read_entry(&mut self, idx: usize, out: &mut dyn std::io::Write) -> newtua_core::Result<()> {
+        self.0.read_entry(idx, out)
+    }
+
+    fn verify_password(&mut self) -> newtua_core::Result<()> {
+        self.0.verify_password()
+    }
+}
+
+fn open_no_stream_fixture(tmp: &tempfile::NamedTempFile) -> Box<dyn newtua_core::ArchiveReader> {
+    std::fs::write(tmp.path(), NO_STREAM_FIXTURE).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    SevenZHandler.open(src, &OpenOptions::default()).unwrap()
+}
+
+fn extract_to(ar: &mut dyn newtua_core::ArchiveReader, dest: &Path, selection: Option<Vec<usize>>) {
+    newtua_core::extract_all(
+        ar,
+        &mut newtua_core::ExtractOptions {
+            dest: dest.to_path_buf(),
+            wrapper_name: None,
+            strict: true,
+            preserve: false,
+            selection,
+            progress: None,
+            keep_macos_metadata: false,
+        },
+    )
+    .unwrap();
+}
+
+/// Все файлы дерева: относительный путь → содержимое.
+fn tree(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn walk(
+        dir: &Path,
+        root: &Path,
+        acc: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, root, acc);
+            } else {
+                let rel = p.strip_prefix(root).unwrap().to_path_buf();
+                acc.insert(rel, std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    let mut acc = std::collections::BTreeMap::new();
+    walk(root, root, &mut acc);
+    acc
+}
+
+/// Однопроходный путь 7z и путь по умолчанию дают одно и то же дерево.
+#[test]
+fn batch_pass_matches_the_default_path_byte_for_byte() {
+    let tmp_batch = tempfile::NamedTempFile::new().unwrap();
+    let mut batch = open_no_stream_fixture(&tmp_batch);
+    let dest_batch = tempfile::tempdir().unwrap();
+    extract_to(&mut *batch, dest_batch.path(), None);
+
+    let tmp_plain = tempfile::NamedTempFile::new().unwrap();
+    let mut plain = DefaultPath(open_no_stream_fixture(&tmp_plain));
+    let dest_plain = tempfile::tempdir().unwrap();
+    extract_to(&mut plain, dest_plain.path(), None);
+
+    let a = tree(dest_batch.path());
+    let b = tree(dest_plain.path());
+    assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());
+    assert_eq!(
+        a, b,
+        "пакетный проход отдал не те байты, что путь по умолчанию"
+    );
+    assert_eq!(a.len(), 4, "в эталоне четыре файла");
+}
+
+/// Выборочная распаковка из **сплошного** блока: чтобы добраться до нужной
+/// записи, распаковать приходится всё, что лежит до неё, — но на диск не
+/// должно лечь ничего сверх запрошенного. Иначе получилось бы, что программа
+/// втихаря кладёт человеку файлы, которых он не просил.
+#[test]
+fn selecting_one_entry_from_a_solid_block_writes_only_that_entry() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let mut ar = open_no_stream_fixture(&tmp);
+
+    let entries = ar.entries().unwrap().to_vec();
+    // Берём последний по порядку файл: до него в сплошном блоке лежат все
+    // остальные, так что случай самый неудобный.
+    let (idx, want) = entries
+        .iter()
+        .enumerate()
+        .rfind(|(_, e)| !e.is_dir())
+        .map(|(i, e)| (i, e.path.clone()))
+        .unwrap();
+
+    let dest = tempfile::tempdir().unwrap();
+    extract_to(&mut *ar, dest.path(), Some(vec![idx]));
+
+    let got = tree(dest.path());
+    assert_eq!(
+        got.keys().cloned().collect::<Vec<_>>(),
+        vec![want.clone()],
+        "на диск попало что-то кроме запрошенной записи"
+    );
+    assert_eq!(got[&want].len(), entries[idx].size as usize);
+}
