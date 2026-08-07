@@ -26,7 +26,7 @@
 //! |----------------------------|-------------------|
 //! | Uncompressed               | Yes               |
 //! | MSZIP ([Deflate][deflate]) | Yes               |
-//! | [Quantum][quantum]         | No                |
+//! | [Quantum][quantum]         | Yes               |
 //! | [LZX][lzx]                 | Yes               |
 //!
 //! [deflate]: https://en.wikipedia.org/wiki/DEFLATE
@@ -34,7 +34,6 @@
 //! [lzx]: https://en.wikipedia.org/wiki/LZX_(algorithm)
 
 pub use cabinet::Cabinet;
-pub use ctype::CompressionType;
 pub use folder::FolderReader;
 
 #[macro_use]
@@ -47,4 +46,5 @@ mod ctype;
 mod file;
 mod folder;
 mod mszip;
+mod quantum;
 mod string;

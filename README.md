@@ -137,7 +137,7 @@ a `.dmg` in ADC — that is parity and closing it would be new work, not a repai
 | `Raw` | any other single decompressed stream (e.g. `.zst`, `.lz4`, `.Z`, `.br`, `.sz`, `.lzma`, `.lz`) |
 | `SevenZ` | `.7z`, incl. AES-256 encryption |
 | `Rar` | `.rar`, single- and multi-volume |
-| `Cab` | `.cab` |
+| `Cab` | `.cab` (MSZIP, LZX and Quantum) |
 | `Ar` | `.ar`/`.a` |
 | `Deb` | `.deb` (Debian package, ar + tar members) |
 | `Cpio` | `.cpio` and `.cpgz` (cpio inside a compressor); the newc, crc and odc variants |

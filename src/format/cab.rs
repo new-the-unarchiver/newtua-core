@@ -48,10 +48,6 @@ impl FormatHandler for CabHandler {
         let mut places: Vec<Place> = Vec::new();
         let mut stamps: Vec<(u16, u16)> = Vec::new();
         for (folder_idx, folder) in cab.folder_entries().enumerate() {
-            let is_quantum = matches!(
-                folder.compression_type(),
-                cab::CompressionType::Quantum(_, _)
-            );
             for file in folder.file_entries() {
                 raw_names.push(file.name().to_vec());
                 declared_utf8.push(file.name_is_utf8());
@@ -60,7 +56,6 @@ impl FormatHandler for CabHandler {
                     folder: folder_idx,
                     offset: file.uncompressed_offset() as u64,
                     size: file.uncompressed_size() as u64,
-                    is_quantum,
                 });
             }
         }
@@ -123,8 +118,6 @@ struct Place {
     folder: usize,
     offset: u64,
     size: u64,
-    /// This entry's folder uses Quantum compression, which nothing here decodes.
-    is_quantum: bool,
 }
 
 struct CabReader {
@@ -157,13 +150,6 @@ impl CabReader {
         }
         Ok(())
     }
-
-    fn quantum_error() -> Error {
-        Error::Unsupported {
-            format: "cab".into(),
-            feature: "Quantum compression".into(),
-        }
-    }
 }
 
 impl ArchiveReader for CabReader {
@@ -177,9 +163,6 @@ impl ArchiveReader for CabReader {
 
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
         let place = self.places.get(idx).ok_or(Error::InvalidIndex(idx))?;
-        if place.is_quantum {
-            return Err(Self::quantum_error());
-        }
         let mut folder = self
             .cab
             .open_folder(place.folder)
@@ -256,9 +239,6 @@ impl CabReader {
         sink: &mut dyn EntrySink,
     ) -> Result<()> {
         let place = &self.places[idx];
-        if place.is_quantum {
-            return Err(Self::quantum_error());
-        }
         if folder.is_none() {
             *folder = Some(
                 self.cab

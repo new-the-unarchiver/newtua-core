@@ -38,14 +38,14 @@ fn make_cab_folders(folders: &[&[(&str, &[u8])]]) -> tempfile::NamedTempFile {
     tmp
 }
 
-/// Mark folder `index` as Quantum-compressed, in place.
+/// Mark folder `index` as Quantum-compressed, in place, without touching its
+/// data — which stays MSZIP and will therefore not decode.
 ///
-/// Nothing available writes Quantum — not `gcab`, not `7zz`, and no sample of
-/// one exists in the reference corpus — so the refusal path would otherwise be
-/// covered by reading the code and hoping. Two bytes in the folder's header are
-/// enough to exercise it honestly: the reader decides from the compression
-/// field, and what follows never gets decoded because opening the folder fails
-/// first.
+/// This is how "one folder is unreadable, the rest are not" gets tested at all:
+/// nothing available writes a *broken* CAB folder on purpose. Since the Quantum
+/// decoder arrived the mislabelled folder fails inside decoding rather than at
+/// the door, which is the more interesting path — a real damaged archive fails
+/// the same way.
 ///
 /// Header geometry, from the CAB specification: the fixed header is 36 bytes
 /// (and this builder sets no reserve areas and no previous/next cabinet names,
@@ -298,7 +298,7 @@ fn extraction_across_folders_writes_every_file() {
 }
 
 #[test]
-fn a_quantum_folder_refuses_without_taking_the_others_with_it() {
+fn a_folder_whose_data_will_not_decode_fails_alone() {
     let cab = make_cab_folders(&[
         &[("readable.txt", b"this folder is MSZIP")],
         &[("locked.txt", b"this folder claims Quantum")],
@@ -314,11 +314,12 @@ fn a_quantum_folder_refuses_without_taking_the_others_with_it() {
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[1].path, Path::new("locked.txt"));
 
+    // The folder is labelled Quantum but holds MSZIP bytes, so the Quantum
+    // decoder refuses them — a damaged archive, not an unsupported one.
     let err = ar.read_entry(1, &mut Vec::new()).unwrap_err();
     assert!(
-        matches!(&err, Error::Unsupported { format, feature }
-            if format == "cab" && feature.contains("Quantum")),
-        "ожидали отказ по Quantum, получили {err:?}"
+        matches!(&err, Error::Corrupt(m) if m.contains("Quantum")),
+        "ожидали отказ по испорченным данным, получили {err:?}"
     );
 
     // The batch pass reports that one refusal and keeps going.
@@ -362,7 +363,7 @@ impl EntrySink for Reporter {
 }
 
 #[test]
-fn extraction_reports_the_quantum_folder_and_writes_the_rest() {
+fn extraction_reports_the_broken_folder_and_writes_the_rest() {
     let cab = make_cab_folders(&[
         &[("data\\ok.txt", b"written")],
         &[("data\\locked.txt", b"not written")],
@@ -433,4 +434,105 @@ fn a_name_in_a_legacy_codepage_survives() {
     let mut out = Vec::new();
     ar.read_entry(0, &mut out).unwrap();
     assert_eq!(out, b"body");
+}
+
+// ── Quantum ──────────────────────────────────────────────────────────────────
+//
+// The three fixtures come from libmspack's own test suite (LGPL-2.1) and are
+// the only Quantum cabinets to be had: nothing available writes the format, and
+// the reference corpus holds none. The oracle for them is `cabextract`, which
+// is libmspack — a different lineage from XADMaster, where our decoder is
+// ported from, so agreement between the two means something.
+
+/// One file per compression method: MSZIP, LZX and Quantum, 379 bytes in all.
+const QUANTUM_MSZIP_LZX: &[u8] = include_bytes!("../fixtures/quantum_mszip_lzx.cab");
+/// From CVE-2014-9556: a cabinet that sent the reference decoder into an
+/// infinite loop.
+const QUANTUM_CVE_2014_9556: &[u8] = include_bytes!("../fixtures/quantum_cve_2014_9556.cab");
+/// From CVE-2018-18584: a block claiming the maximum size.
+const QUANTUM_CVE_2018_18584: &[u8] = include_bytes!("../fixtures/quantum_cve_2018_18584.cab");
+
+fn write_fixture(bytes: &[u8]) -> tempfile::NamedTempFile {
+    let mut tmp = tempfile::Builder::new().suffix(".cab").tempfile().unwrap();
+    tmp.write_all(bytes).unwrap();
+    tmp.flush().unwrap();
+    tmp
+}
+
+#[test]
+fn quantum_decodes_beside_mszip_and_lzx() {
+    let cab = write_fixture(QUANTUM_MSZIP_LZX);
+    let src = Source::path(cab.path()).unwrap();
+    let mut ar = CabHandler.open(src, &OpenOptions::default()).unwrap();
+
+    let names: Vec<String> = ar
+        .entries()
+        .unwrap()
+        .iter()
+        .map(|e| e.path.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["mszip.txt", "lzx.txt", "qtm.txt"]);
+
+    // Byte for byte what `cabextract` produces from the same cabinet.
+    let expected: [&[u8]; 3] = [
+        b"If you can read this, the MSZIP decompressor is working!\n",
+        b"-----------------------------------------------------------------\n\
+          If you can read this, the LZX decompressor is working!\n\
+          -----------------------------------------------------------------\n",
+        b"If you can read this, the Quantum decompressor is working!\n",
+    ];
+    for (idx, want) in expected.iter().enumerate() {
+        let mut got = Vec::new();
+        ar.read_entry(idx, &mut got).unwrap();
+        assert_eq!(&got, want, "запись {idx}");
+    }
+}
+
+#[test]
+fn quantum_survives_the_infinite_loop_sample() {
+    // The archive declares a Quantum level of zero, which no cabinet may, so it
+    // is turned away before a decoder is ever built. What matters is that it
+    // returns at all.
+    let cab = write_fixture(QUANTUM_CVE_2014_9556);
+    let src = Source::path(cab.path()).unwrap();
+    match CabHandler.open(src, &OpenOptions::default()) {
+        Err(Error::Corrupt(m)) => assert!(m.contains("Quantum"), "неожиданная причина: {m}"),
+        Err(other) => panic!("ожидали отказ по заголовку, получили {other:?}"),
+        Ok(_) => panic!("испорченный архив открылся"),
+    }
+}
+
+#[test]
+fn quantum_refuses_the_max_size_block_sample_and_leaves_nothing_behind() {
+    let cab = write_fixture(QUANTUM_CVE_2018_18584);
+    let src = Source::path(cab.path()).unwrap();
+    let mut ar = CabHandler.open(src, &OpenOptions::default()).unwrap();
+    assert_eq!(ar.entries().unwrap().len(), 1);
+
+    let err = ar.read_entry(0, &mut Vec::new()).unwrap_err();
+    assert!(
+        matches!(&err, Error::Corrupt(m) if m.contains("Quantum")),
+        "ожидали отказ по испорченным данным, получили {err:?}"
+    );
+
+    // `cabextract` refuses this one too, but leaves a zero-length file wearing
+    // the right name. Nothing is worse than that: it reads as success.
+    let dest = tempfile::tempdir().unwrap();
+    let src = Source::path(cab.path()).unwrap();
+    let mut ar = CabHandler.open(src, &OpenOptions::default()).unwrap();
+    let report = extract_all(
+        &mut *ar,
+        &mut ExtractOptions {
+            dest: dest.path().to_path_buf(),
+            wrapper_name: Some("arc".into()),
+            strict: false,
+            preserve: true,
+            selection: None,
+            progress: None,
+            keep_macos_metadata: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.failed.len(), 1);
+    assert!(!dest.path().join("arc/test1.bin").exists());
 }

@@ -3,6 +3,7 @@ use std::io;
 use lzxd::Lzxd;
 
 use super::mszip::MsZipDecompressor;
+use super::quantum::QuantumDecompressor;
 
 const CTYPE_NONE: u16 = 0;
 const CTYPE_MSZIP: u16 = 1;
@@ -73,9 +74,9 @@ impl CompressionType {
         match self {
             CompressionType::None => Ok(Decompressor::Uncompressed),
             CompressionType::MsZip => Ok(Decompressor::MsZip(Box::new(MsZipDecompressor::new()))),
-            CompressionType::Quantum(_, _) => {
-                invalid_data!("Quantum decompression is not yet supported.")
-            }
+            CompressionType::Quantum(_, memory) => Ok(Decompressor::Quantum(Box::new(
+                QuantumDecompressor::new(memory),
+            ))),
             CompressionType::Lzx(window_size) => {
                 Ok(Decompressor::Lzx(Box::new(Lzxd::new(window_size))))
             }
@@ -87,6 +88,7 @@ pub enum Decompressor {
     Uncompressed,
     MsZip(Box<MsZipDecompressor>),
     Lzx(Box<Lzxd>),
+    Quantum(Box<QuantumDecompressor>),
 }
 
 impl Decompressor {
@@ -95,6 +97,7 @@ impl Decompressor {
             Self::Uncompressed => {}
             Self::MsZip(d) => d.reset(),
             Self::Lzx(d) => d.reset(),
+            Self::Quantum(d) => d.reset(),
         }
     }
 
@@ -114,6 +117,9 @@ impl Decompressor {
         let data = match self {
             Decompressor::Uncompressed => data,
             Decompressor::MsZip(decompressor) => {
+                decompressor.decompress_block(&data, uncompressed_size)?
+            }
+            Decompressor::Quantum(decompressor) => {
                 decompressor.decompress_block(&data, uncompressed_size)?
             }
             Decompressor::Lzx(decompressor) => decompressor

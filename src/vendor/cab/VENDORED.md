@@ -104,11 +104,10 @@ would truncate an extraction and report success.
 
 ## Quantum
 
-Not decoded, as upstream. A folder that declares it refuses when opened, and
-`format/cab.rs` refuses each of its entries individually so the rest of the
-cabinet still extracts. Nothing available writes Quantum — not `gcab`, not
-`7zz` — and the reference corpus holds no sample, so the test builds an MSZIP
-cabinet and rewrites two bytes of one folder's header
-(`mark_folder_quantum` in `tests/integration/cab_handler.rs`). That covers the
-refusal, which is all this reader claims; it does not cover decoding, which it
-does not do.
+**Decoded, unlike upstream** — `quantum.rs`, ported from XADMaster rather than
+from this crate's lineage, since upstream `cab` has no Quantum decoder at all
+and no Rust implementation exists anywhere. It plugs into `Decompressor` beside
+MSZIP and LZX; see the module's own documentation for the format and for what
+is bounded.
+
+The reader now covers every compression a cabinet can declare.

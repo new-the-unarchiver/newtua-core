@@ -70,11 +70,6 @@ impl<'a> Iterator for FolderEntries<'a> {
 impl ExactSizeIterator for FolderEntries<'_> {}
 
 impl FolderEntry {
-    /// Returns the scheme used to compress this folder's data.
-    pub fn compression_type(&self) -> CompressionType {
-        self.compression_type
-    }
-
     /// Returns an iterator over the file entries in this folder.
     pub fn file_entries(&self) -> FileEntries<'_> {
         FileEntries {
