@@ -457,6 +457,10 @@ mod tests {
     /// libmspack's `qtmd_update_model` (C) — while the code under test came
     /// from XADMaster (Objective-C). Two lineages agreeing is worth something;
     /// a decoder agreeing with itself is not.
+    ///
+    /// That transliteration is kept, not thrown away:
+    /// `tests/fixtures/quantum_model_reference.py` regenerates these tables and
+    /// prints them in the shape below.
     #[test]
     fn the_model_matches_the_reference_after_hundreds_of_rescales() {
         // The same linear congruential sequence the reference script used.
