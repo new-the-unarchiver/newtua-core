@@ -271,11 +271,7 @@ impl CabReader {
 
         let mut writer = SinkWriter::new(sink);
         let outcome = Self::copy_body(reader, place, &mut writer);
-        // Приёмник важнее: только по его ошибке видно отмену.
-        match writer.take_err() {
-            Some(e) => Err(e),
-            None => outcome,
-        }
+        writer.outcome(outcome)
     }
 }
 

@@ -2,7 +2,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::archive::{
-    ArchiveReader, Confidence, Entry, EntryKind, FormatHandler, FormatId, OpenOptions, Source,
+    ArchiveReader, Confidence, Entry, EntryKind, EntrySink, FormatHandler, FormatId, OneEntry,
+    OpenOptions, SinkStep, SinkWriter, Source,
 };
 use crate::encoding::decode_names;
 use crate::error::{Error, Result};
@@ -52,16 +53,16 @@ impl FormatHandler for RarHandler {
     }
 }
 
+/// What the header walk collects per entry, before names are charset-decoded:
+/// size, is-a-directory, is-encrypted, POSIX mode, modification time.
+type RawMeta = (u64, bool, bool, Option<u32>, Option<std::time::SystemTime>);
+
 /// List all entries in the archive, collecting metadata.
 ///
 /// Returns `(entries, is_multivolume)`.  `is_multivolume` is `true` when the
 /// archive header reports that this file is the first (or a subsequent) volume
 /// in a multi-part RAR set, as indicated by `VolumeInfo::First` /
 /// `VolumeInfo::Subsequent` from the unrar crate.
-/// What the header walk collects per entry, before names are charset-decoded:
-/// size, is-a-directory, is-encrypted, POSIX mode, modification time.
-type RawMeta = (u64, bool, bool, Option<u32>, Option<std::time::SystemTime>);
-
 fn list_entries(
     path: &Path,
     password: Option<&str>,
@@ -198,10 +199,10 @@ struct RarReader {
     password: Option<String>,
     entries: Vec<Entry>,
     /// True when the opened file is the first or a subsequent volume in a
-    /// multi-part RAR set.  Multi-volume entries are extracted via
-    /// `read_entry_via_extract` (libunrar RAR_EXTRACT mode, which follows
-    /// volume continuations by path) instead of the in-memory `read()` fast
-    /// path used for single-volume archives.
+    /// multi-part RAR set.  Bodies are then poured through a file on disk
+    /// (`body_via_disk`, libunrar's RAR_EXTRACT mode, which follows volume
+    /// continuations by path) instead of the in-memory `read()` fast path used
+    /// for single-volume archives.
     is_multivolume: bool,
 }
 
@@ -231,148 +232,214 @@ impl ArchiveReader for RarReader {
     }
 
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()> {
-        let target = self
-            .entries
-            .get(idx)
-            .ok_or(Error::InvalidIndex(idx))?
-            .path_raw
-            .clone();
+        // Зовётся собственный проход, а не `read_entries` из трейта: умолчание
+        // трейта ведёт обратно сюда, и снятое когда-нибудь переопределение
+        // обернулось бы не ошибкой сборки, а бесконечной рекурсией.
+        self.walk(&[idx], &mut OneEntry { out })
+    }
 
-        if self.is_multivolume {
-            // For multi-volume RAR archives the unrar 0.5.8 crate's in-memory
-            // `read()` API (which uses RAR_TEST mode internally) SIGABRTs when
-            // the payload crosses a volume boundary.  The `extract_to` API
-            // (RAR_EXTRACT mode, writes to disk) correctly follows the volume
-            // continuation chain — libunrar locates the next volumes by path,
-            // calling the UCM_CHANGEVOLUMEW callback with RAR_VOL_NOTIFY (found)
-            // rather than RAR_VOL_ASK (missing), so no abort occurs.
-            //
-            // Strategy: open the archive in Process mode, iterate headers
-            // sequentially (skip non-targets), and for the target entry call
-            // `extract_to(temp_file)`.  Then stream the temp file into `out`.
-            return self.read_entry_via_extract(idx, &target, out);
-        }
-
-        // Single-volume fast path: in-memory read via the unrar crate.
-        let password = self.password.as_deref();
-
-        macro_rules! open_proc {
-            () => {
-                if let Some(pw) = password {
-                    unrar::Archive::with_password(self.path.as_path(), pw)
-                        .open_for_processing()
-                        .map_err(map_rar_err)?
-                } else {
-                    unrar::Archive::new(self.path.as_path())
-                        .open_for_processing()
-                        .map_err(map_rar_err)?
-                }
-            };
-        }
-
-        let mut archive = open_proc!();
-
-        loop {
-            let header_archive = archive.read_header().map_err(map_rar_err)?;
-            match header_archive {
-                None => return Err(Error::InvalidIndex(idx)),
-                Some(with_file) => {
-                    let raw = with_file
-                        .entry()
-                        .filename
-                        .to_string_lossy()
-                        .as_bytes()
-                        .to_vec();
-                    if raw == target {
-                        // This is our entry — read it into the output.
-                        let (data, _next) = with_file.read().map_err(map_rar_err)?;
-                        out.write_all(&data)?;
-                        return Ok(());
-                    } else {
-                        // Skip this entry and continue.
-                        archive = with_file.skip().map_err(map_rar_err)?;
-                    }
-                }
-            }
-        }
+    /// Один проход по архиву на весь список вместо одного на каждую запись.
+    ///
+    /// Под RAR лежит библиотека на C, и её договор сам последовательный:
+    /// `RARReadHeader` идёт вперёд по архиву, назад не отматывается — «начать
+    /// сначала» для неё значит закрыть и открыть. Прежний `read_entry` именно
+    /// это и делал на каждую запись, а у сплошного архива дойти до записи
+    /// значит распаковать всё, что лежит до неё: на тысяче файлов выходило
+    /// в тридцать девять раз дольше `unar`.
+    fn read_entries(&mut self, indices: &[usize], sink: &mut dyn EntrySink) -> Result<()> {
+        self.walk(indices, sink)
     }
 }
 
+/// Итог одной записи: что с ней вышло и жива ли ручка архива.
+///
+/// `None` вместо архива значит, что продолжать этот проход нечем. Методы
+/// крейта съедают `self` и собирают возврат через `?`, поэтому на ошибке
+/// `OpenArchive` роняется, а его `Drop` закрывает архив. Ручку отнимает
+/// подпись обёртки на Rust, не сама libunrar, — почини это форк, и
+/// перезапуск в `walk` стал бы не нужен.
+type BodyOutcome = (
+    Result<()>,
+    Option<unrar::OpenArchive<unrar::Process, unrar::CursorBeforeHeader>>,
+);
+
 impl RarReader {
-    /// Multi-volume extraction path: extract the target entry to a temporary
-    /// file on disk, then stream that file into `out`.
+    fn open_for_processing(
+        &self,
+    ) -> Result<unrar::OpenArchive<unrar::Process, unrar::CursorBeforeHeader>> {
+        match self.password.as_deref() {
+            Some(pw) => unrar::Archive::with_password(self.path.as_path(), pw)
+                .open_for_processing()
+                .map_err(map_rar_err),
+            None => unrar::Archive::new(self.path.as_path())
+                .open_for_processing()
+                .map_err(map_rar_err),
+        }
+    }
+
+    /// Пройти архив, отдавая приёмнику записи из `indices`.
     ///
-    /// Using `extract_to` (RAR_EXTRACT mode) instead of `read()` (RAR_TEST
-    /// mode) is required for multi-volume archives because libunrar must write
-    /// through its normal extraction path for volume continuation to work
-    /// correctly.  The next-volume files must exist on disk in the same
-    /// directory as `self.path`.
-    fn read_entry_via_extract(&self, idx: usize, target: &[u8], out: &mut dyn Write) -> Result<()> {
-        // Create a temp file to receive the extracted bytes.
-        let tmp = tempfile::NamedTempFile::new().map_err(Error::Io)?;
-        let tmp_path = tmp.path().to_path_buf();
-        // We must close/drop the NamedTempFile handle so that the OS allows
-        // libunrar to write to the same path (important on Windows; on macOS
-        // both handles can coexist, but keeping it explicit is cleaner).
-        // We keep the path around to read back and then remove.
-        drop(tmp);
-
-        let password = self.password.as_deref();
-
-        let mut archive = if let Some(pw) = password {
-            unrar::Archive::with_password(self.path.as_path(), pw)
-                .open_for_processing()
-                .map_err(map_rar_err)?
+    /// Запись узнаётся **по месту**, а не по имени: список собран тем же
+    /// обходом заголовков (`list_entries`), поэтому N-й заголовок — это и есть
+    /// запись N. Прежнее сравнение имён путало два одноимённых файла, а имя
+    /// каждой записи приходилось ещё и заново собирать в строку.
+    ///
+    /// Из заголовка читается ровно один флаг — «это продолжение из прошлого
+    /// тома». Он лежит в `Flags`, то есть до `FileAttr`, и мина тикета 15
+    /// остаётся спящей: раскладка биндинга съезжает позже, с `CmtBuf`.
+    fn walk(&self, indices: &[usize], sink: &mut dyn EntrySink) -> Result<()> {
+        // Номер вне списка — ошибка вызывающего, и она не должна всплыть на
+        // середине уже начатой распаковки.
+        if let Some(&bad) = indices.iter().find(|&&i| i >= self.entries.len()) {
+            return Err(Error::InvalidIndex(bad));
+        }
+        // Многотомная распаковка идёт через файл на диске, поэтому каталог под
+        // него заводится один на вызов, а не один на запись. Для однотомного
+        // архива он не нужен вовсе.
+        let tmp_dir = if self.is_multivolume {
+            Some(tempfile::tempdir().map_err(Error::Io)?)
         } else {
-            unrar::Archive::new(self.path.as_path())
-                .open_for_processing()
-                .map_err(map_rar_err)?
+            None
         };
+        let tmp = tmp_dir.as_ref().map(|d| d.path().join("entry"));
 
-        let mut found = false;
-        loop {
-            let header_archive = archive.read_header().map_err(map_rar_err)?;
-            match header_archive {
-                None => {
-                    if !found {
-                        let _ = std::fs::remove_file(&tmp_path);
-                        return Err(Error::InvalidIndex(idx));
-                    }
-                    break;
+        let mut archive = self.open_for_processing()?;
+        // `i` — место в списке запрошенного, `pos` — номер заголовка в архиве.
+        let mut i = 0usize;
+        let mut pos = 0usize;
+
+        while i < indices.len() {
+            let want = indices[i];
+            let Some(with_file) = archive.read_header().map_err(map_rar_err)? else {
+                // Заголовки кончились раньше списка — архив короче своего же
+                // оглавления. Каждая недостающая запись отмечается отказом,
+                // как это делал прежний обход по одной, чтобы уже записанное
+                // осталось и было видно, чего не хватает.
+                return fail_rest(&indices[i..], sink);
+            };
+
+            // Продолжение файла в следующем томе — не отдельная запись.
+            //
+            // Режимы открытия расходятся ровно здесь: листинг (`RAR_OM_LIST`,
+            // `open_for_listing`), которым собран список, показывает
+            // разрезанный файл **один раз** — куски он склеивает, о чём прямо
+            // говорит соседний `open_for_listing_split`. Распаковка
+            // (`RAR_OM_EXTRACT`) склеивать не обязана и отдаёт по заголовку на
+            // кусок. Измерено на трёхтомном наборе: `mvB.bin` и `mvC.bin`
+            // приходят дважды, вторым разом с поднятым `is_split_before`.
+            // Считать такой заголовок за запись значит сдвинуть все номера
+            // после него.
+            //
+            // Видно это только когда кусок **пропустили**: на распаковке
+            // libunrar проводит файл через тома сама и лишних заголовков не
+            // отдаёт.
+            if with_file.entry().is_split_before() {
+                archive = with_file.skip().map_err(map_rar_err)?;
+                continue;
+            }
+            if pos < want {
+                archive = with_file.skip().map_err(map_rar_err)?;
+                pos += 1;
+                continue;
+            }
+
+            match sink.begin(want)? {
+                SinkStep::Stop => return Ok(()),
+                SinkStep::Skip => {
+                    archive = with_file.skip().map_err(map_rar_err)?;
                 }
-                Some(with_file) => {
-                    let raw = with_file
-                        .entry()
-                        .filename
-                        .to_string_lossy()
-                        .as_bytes()
-                        .to_vec();
-                    if raw == target {
-                        // Extract to the temp file on disk.
-                        let _next = with_file.extract_to(&tmp_path).map_err(map_rar_err)?;
-                        found = true;
-                        // The archive might have more entries but we are done.
-                        break;
-                    } else {
-                        archive = with_file.skip().map_err(map_rar_err)?;
+                SinkStep::Body => {
+                    let (outcome, next) = match tmp.as_deref() {
+                        Some(tmp) => body_via_disk(with_file, tmp, sink),
+                        None => body_in_memory(with_file, sink),
+                    };
+                    if !sink.end(want, outcome)? {
+                        return Ok(());
+                    }
+                    match next {
+                        Some(a) => archive = a,
+                        // Ручка не пережила отказа (см. `BodyOutcome`). Отказ
+                        // одной записи не должен ронять остальные, поэтому
+                        // проход начинается заново, а список продолжается со
+                        // следующего номера. На сплошном архиве это дорого:
+                        // пропуск там означает распаковку, так что рестарт
+                        // стоит всего, что лежит до точки возобновления.
+                        // Дороже прежнего кода это не будет — тот начинал
+                        // сначала на **каждой** записи, а не на отказавшей.
+                        None => {
+                            archive = self.open_for_processing()?;
+                            pos = 0;
+                            i += 1;
+                            continue;
+                        }
                     }
                 }
             }
+            pos += 1;
+            i += 1;
         }
-
-        if !found {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(Error::InvalidIndex(idx));
-        }
-
-        // Stream the extracted temp file into `out`.
-        let mut f = std::fs::File::open(&tmp_path).map_err(Error::Io)?;
-        std::io::copy(&mut f, out)?;
-        drop(f);
-        let _ = std::fs::remove_file(&tmp_path);
-
         Ok(())
     }
+}
+
+/// Однотомный архив: тело читается в память средствами крейта.
+fn body_in_memory(
+    with_file: unrar::OpenArchive<unrar::Process, unrar::CursorBeforeFile>,
+    sink: &mut dyn EntrySink,
+) -> BodyOutcome {
+    match with_file.read() {
+        Ok((data, next)) => (sink.write_body(&data), Some(next)),
+        Err(e) => (Err(map_rar_err(e)), None),
+    }
+}
+
+/// Многотомный архив: тело извлекается во временный файл и оттуда переливается
+/// приёмнику.
+///
+/// Чтение в память (`read()`, режим `RAR_TEST`) на границе томов роняло процесс
+/// по `SIGABRT`; `extract_to` (режим `RAR_EXTRACT`) идёт обычным путём
+/// распаковки, и продолжение в следующем томе libunrar находит сама — соседние
+/// тома должны лежать рядом с открытым файлом.
+fn body_via_disk(
+    with_file: unrar::OpenArchive<unrar::Process, unrar::CursorBeforeFile>,
+    tmp: &Path,
+    sink: &mut dyn EntrySink,
+) -> BodyOutcome {
+    let next = match with_file.extract_to(tmp) {
+        Ok(next) => next,
+        // Убирать за собой тут не надо: каталог сносится целиком, а до
+        // следующей записи тот же путь всё равно перезапишут.
+        Err(e) => return (Err(map_rar_err(e)), None),
+    };
+    let outcome = pour(tmp, sink);
+    let _ = std::fs::remove_file(tmp);
+    (outcome, Some(next))
+}
+
+fn pour(tmp: &Path, sink: &mut dyn EntrySink) -> Result<()> {
+    let mut f = std::fs::File::open(tmp).map_err(Error::Io)?;
+    let mut w = SinkWriter::new(sink);
+    let copied = std::io::copy(&mut f, &mut w);
+    w.outcome(copied.map(|_| ()).map_err(Error::Io))
+}
+
+/// Отметить остаток списка как непрочитанный.
+///
+/// Виноват тут архив, а не вызывающий: номера пришли из `entries()`, а
+/// заголовков под них не хватило. Поэтому `Corrupt`, а не `InvalidIndex`.
+fn fail_rest(rest: &[usize], sink: &mut dyn EntrySink) -> Result<()> {
+    for &idx in rest {
+        match sink.begin(idx)? {
+            SinkStep::Stop => break,
+            SinkStep::Skip => continue,
+            SinkStep::Body => {}
+        }
+        let why = Error::Corrupt(format!("rar: заголовки кончились на записи {idx}"));
+        if !sink.end(idx, Err(why))? {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

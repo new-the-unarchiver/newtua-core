@@ -3,8 +3,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::archive::{
-    ArchiveReader, Confidence, Entry, EntryKind, EntrySink, FormatHandler, FormatId, OpenOptions,
-    SinkStep, SinkWriter, Source,
+    ArchiveReader, Confidence, Entry, EntryKind, EntrySink, FormatHandler, FormatId, OneEntry,
+    OpenOptions, SinkStep, SinkWriter, Source,
 };
 use crate::encoding::decode_names;
 use crate::error::{Error, Result};
@@ -124,12 +124,7 @@ fn decode_block(
 
         let mut w = SinkWriter::new(sink);
         let copied = std::io::copy(reader, &mut w);
-        let body = match w.take_err() {
-            // Ошибка приёмника (в том числе отмена) важнее: `io::Error` донёс
-            // бы только текст.
-            Some(e) => Err(e),
-            None => copied.map(|_| ()).map_err(Error::Io),
-        };
+        let body = w.outcome(copied.map(|_| ()).map_err(Error::Io));
         if body.is_err() {
             // Тело не дочитано: домотать, иначе следующая запись блока
             // прочтёт его остаток.
@@ -161,28 +156,6 @@ struct BlockCtx<'a> {
     archive: &'a sevenz_rust2::Archive,
     password: &'a sevenz_rust2::Password,
     thread_count: u32,
-}
-
-/// Приёмник на одну запись: мост от пакетного прохода к обычному
-/// `read_entry(idx, out)`.
-struct OneEntry<'a> {
-    out: &'a mut dyn Write,
-    err: Option<Error>,
-}
-
-impl EntrySink for OneEntry<'_> {
-    fn begin(&mut self, _idx: usize) -> Result<SinkStep> {
-        Ok(SinkStep::Body)
-    }
-
-    fn write_body(&mut self, buf: &[u8]) -> Result<()> {
-        self.out.write_all(buf).map_err(Error::Io)
-    }
-
-    fn end(&mut self, _idx: usize, outcome: Result<()>) -> Result<bool> {
-        self.err = outcome.err();
-        Ok(false)
-    }
 }
 
 /// Приёмник для целей символьных ссылок: копит тела в памяти, каждое — под
@@ -589,12 +562,7 @@ impl ArchiveReader for SevenZReader {
         if idx >= self.entries.len() {
             return Err(Error::InvalidIndex(idx));
         }
-        let mut one = OneEntry { out, err: None };
-        self.walk(&[idx], &mut one)?;
-        match one.err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        self.walk(&[idx], &mut OneEntry { out })
     }
 
     fn read_entries(&mut self, indices: &[usize], sink: &mut dyn EntrySink) -> Result<()> {
