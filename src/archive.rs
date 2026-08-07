@@ -299,6 +299,50 @@ impl<'a> SinkWriter<'a> {
     pub fn take_err(&mut self) -> Option<Error> {
         self.err.take()
     }
+
+    /// Чем кончилась запись тела: `wrote` — то, что сказал сам перелив, но
+    /// **ошибка приёмника важнее** и перекрывает его.
+    ///
+    /// Правило тонкое и целиком про отмену: `io::copy` на отказе приёмника
+    /// вернёт безликую `io::Error`, и написавший `copied?` вместо разбора
+    /// доложит «архив сломан» там, где человек просто нажал отмену. Поэтому
+    /// правило живёт здесь, при типе, который его порождает, а не копией в
+    /// каждом обработчике.
+    pub fn outcome(&mut self, wrote: Result<()>) -> Result<()> {
+        match self.take_err() {
+            Some(e) => Err(e),
+            None => wrote,
+        }
+    }
+}
+
+/// Приёмник на одну запись — мост от пакетного прохода обратно к `read_entry`.
+///
+/// Встречный к [`read_entries_one_by_one`]: тот пакетный вызов сводит к
+/// одиночным, этот одиночный — к пакетному. Обработчику с последовательным
+/// носителем нужен именно второй: у него настоящий проход один, и `read_entry`
+/// дешевле выразить через него, чем писать вторым циклом. Зовите из
+/// обработчика его **собственный** проход, а не `read_entries` из трейта:
+/// умолчание трейта ведёт обратно в `read_entry`, и вышла бы бесконечная
+/// рекурсия, если переопределение когда-нибудь снимут.
+pub(crate) struct OneEntry<'a> {
+    pub out: &'a mut dyn Write,
+}
+
+impl EntrySink for OneEntry<'_> {
+    fn begin(&mut self, _idx: usize) -> Result<SinkStep> {
+        Ok(SinkStep::Body)
+    }
+
+    fn write_body(&mut self, buf: &[u8]) -> Result<()> {
+        self.out.write_all(buf).map_err(Error::Io)
+    }
+
+    /// Запись одна, поэтому её отказ — это и есть отказ вызова: он уходит
+    /// наверх через `?` у проходящего, а не складывается в поле.
+    fn end(&mut self, _idx: usize, outcome: Result<()>) -> Result<bool> {
+        outcome.map(|()| false)
+    }
 }
 
 impl Write for SinkWriter<'_> {
@@ -396,11 +440,7 @@ pub(crate) fn read_entries_one_by_one<R: ArchiveReader + ?Sized>(
         }
         let mut w = SinkWriter::new(sink);
         let outcome = reader.read_entry(idx, &mut w);
-        // Ошибка приёмника важнее ошибки чтения: отмену видно только по ней.
-        let outcome = match w.take_err() {
-            Some(e) => Err(e),
-            None => outcome,
-        };
+        let outcome = w.outcome(outcome);
         if !sink.end(idx, outcome)? {
             return Ok(());
         }

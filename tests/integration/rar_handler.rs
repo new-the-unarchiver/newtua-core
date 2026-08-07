@@ -4,12 +4,22 @@ use std::path::Path;
 
 const FIXTURE: &[u8] = include_bytes!("../fixtures/hello.rar");
 
+/// Открыть архив из встроенных байтов. Временный файл надо держать живым,
+/// пока читатель открыт, поэтому он возвращается вместе с ним.
+fn open_fixture(
+    bytes: &[u8],
+    opts: &OpenOptions,
+) -> (tempfile::NamedTempFile, Box<dyn ArchiveReader>) {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), bytes).unwrap();
+    let src = Source::path(tmp.path()).unwrap();
+    let ar = RarHandler.open(src, opts).unwrap();
+    (tmp, ar)
+}
+
 #[test]
 fn lists_and_extracts_rar() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), FIXTURE).unwrap();
-    let src = Source::path(tmp.path()).unwrap();
-    let mut ar = RarHandler.open(src, &OpenOptions::default()).unwrap();
+    let (_tmp, mut ar) = open_fixture(FIXTURE, &OpenOptions::default());
     let entries = ar.entries().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].path.to_str().unwrap(), "a.txt");
@@ -28,10 +38,7 @@ const META_FIXTURE: &[u8] = include_bytes!("../fixtures/meta.rar");
 
 #[test]
 fn rar_populates_mode_when_available() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), META_FIXTURE).unwrap();
-    let src = Source::path(tmp.path()).unwrap();
-    let mut ar = RarHandler.open(src, &OpenOptions::default()).unwrap();
+    let (_tmp, mut ar) = open_fixture(META_FIXTURE, &OpenOptions::default());
     let entries = ar.entries().unwrap().to_vec();
     let f = entries
         .iter()
@@ -53,14 +60,11 @@ const ENC_FIXTURE: &[u8] = include_bytes!("../fixtures/secret.rar");
 #[test]
 fn wrong_password_errors() {
     use newtua_core::Error;
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), ENC_FIXTURE).unwrap();
-    let src = Source::path(tmp.path()).unwrap();
     let opts = OpenOptions {
         password: Some("WRONG".into()),
         encoding_override: None,
     };
-    let mut ar = RarHandler.open(src, &opts).unwrap();
+    let (_tmp, mut ar) = open_fixture(ENC_FIXTURE, &opts);
     ar.entries().unwrap();
     let mut out = Vec::new();
     let err = ar.read_entry(0, &mut out).unwrap_err();
@@ -73,10 +77,7 @@ fn wrong_password_errors() {
 #[test]
 fn verify_password_without_password_is_encrypted() {
     use newtua_core::Error;
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), ENC_FIXTURE).unwrap();
-    let src = Source::path(tmp.path()).unwrap();
-    let mut ar = RarHandler.open(src, &OpenOptions::default()).unwrap();
+    let (_tmp, mut ar) = open_fixture(ENC_FIXTURE, &OpenOptions::default());
     // Listing works without a password; the guard comes from verify_password.
     ar.entries().unwrap();
     assert!(matches!(ar.verify_password(), Err(Error::Encrypted)));
@@ -85,14 +86,11 @@ fn verify_password_without_password_is_encrypted() {
 #[test]
 fn verify_password_with_wrong_password_errors() {
     use newtua_core::Error;
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), ENC_FIXTURE).unwrap();
-    let src = Source::path(tmp.path()).unwrap();
     let opts = OpenOptions {
         password: Some("WRONG".into()),
         encoding_override: None,
     };
-    let mut ar = RarHandler.open(src, &opts).unwrap();
+    let (_tmp, mut ar) = open_fixture(ENC_FIXTURE, &opts);
     assert!(matches!(
         ar.verify_password(),
         Err(Error::WrongPassword) | Err(Error::Encrypted) | Err(Error::Corrupt(_))
@@ -101,14 +99,11 @@ fn verify_password_with_wrong_password_errors() {
 
 #[test]
 fn verify_password_with_correct_password_is_ok() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), ENC_FIXTURE).unwrap();
-    let src = Source::path(tmp.path()).unwrap();
     let opts = OpenOptions {
         password: Some("pw".into()),
         encoding_override: None,
     };
-    let mut ar = RarHandler.open(src, &opts).unwrap();
+    let (_tmp, mut ar) = open_fixture(ENC_FIXTURE, &opts);
     assert!(ar.verify_password().is_ok());
 }
 
@@ -127,10 +122,7 @@ fn verify_password_with_correct_password_is_ok() {
 /// we cannot reach; see the note in `format/rar.rs`.
 #[test]
 fn rar_reports_the_stored_modification_time_as_local() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), META_FIXTURE).unwrap();
-    let src = Source::path(tmp.path()).unwrap();
-    let mut ar = RarHandler.open(src, &OpenOptions::default()).unwrap();
+    let (_tmp, mut ar) = open_fixture(META_FIXTURE, &OpenOptions::default());
     let e = &ar.entries().unwrap()[0];
 
     let secs = e
@@ -208,17 +200,6 @@ impl EntrySink for Collector {
         }
         Ok(true)
     }
-}
-
-fn open_fixture(
-    bytes: &[u8],
-    opts: &OpenOptions,
-) -> (tempfile::NamedTempFile, Box<dyn ArchiveReader>) {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), bytes).unwrap();
-    let src = Source::path(tmp.path()).unwrap();
-    let ar = RarHandler.open(src, opts).unwrap();
-    (tmp, ar)
 }
 
 // solid3.rar: три файла, сплошной архив (`rar a -s`).
@@ -349,6 +330,18 @@ const MV_P1: &[u8] = include_bytes!("../fixtures/mvmulti.part1.rar");
 const MV_P2: &[u8] = include_bytes!("../fixtures/mvmulti.part2.rar");
 const MV_P3: &[u8] = include_bytes!("../fixtures/mvmulti.part3.rar");
 
+/// Разложить три тома рядом друг с другом и открыть первый: libunrar ищет
+/// продолжение по соседним именам, поэтому лежать они обязаны вместе.
+fn open_multivolume() -> (tempfile::TempDir, Box<dyn ArchiveReader>) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mvmulti.part1.rar"), MV_P1).unwrap();
+    std::fs::write(dir.path().join("mvmulti.part2.rar"), MV_P2).unwrap();
+    std::fs::write(dir.path().join("mvmulti.part3.rar"), MV_P3).unwrap();
+    let src = Source::path(&dir.path().join("mvmulti.part1.rar")).unwrap();
+    let ar = RarHandler.open(src, &OpenOptions::default()).unwrap();
+    (dir, ar)
+}
+
 /// Тела фикстуры — тот же линейный конгруэнтный генератор, каким они созданы.
 /// Хранить рядом ещё 36 КБ ожидаемых байт незачем.
 fn blob(seed: u32, n: usize) -> Vec<u8> {
@@ -368,13 +361,7 @@ fn blob(seed: u32, n: usize) -> Vec<u8> {
 /// `SIGABRT`.
 #[test]
 fn a_multivolume_set_of_several_files_is_read_in_one_pass() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("mvmulti.part1.rar"), MV_P1).unwrap();
-    std::fs::write(dir.path().join("mvmulti.part2.rar"), MV_P2).unwrap();
-    std::fs::write(dir.path().join("mvmulti.part3.rar"), MV_P3).unwrap();
-
-    let src = Source::path(&dir.path().join("mvmulti.part1.rar")).unwrap();
-    let mut ar = RarHandler.open(src, &OpenOptions::default()).unwrap();
+    let (_dir, mut ar) = open_multivolume();
     assert_eq!(ar.entries().unwrap().len(), 3);
 
     let mut sink = Collector::default();
@@ -390,13 +377,7 @@ fn a_multivolume_set_of_several_files_is_read_in_one_pass() {
 /// не должен сбить обход границ томов.
 #[test]
 fn a_multivolume_set_reads_a_subset() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("mvmulti.part1.rar"), MV_P1).unwrap();
-    std::fs::write(dir.path().join("mvmulti.part2.rar"), MV_P2).unwrap();
-    std::fs::write(dir.path().join("mvmulti.part3.rar"), MV_P3).unwrap();
-
-    let src = Source::path(&dir.path().join("mvmulti.part1.rar")).unwrap();
-    let mut ar = RarHandler.open(src, &OpenOptions::default()).unwrap();
+    let (_dir, mut ar) = open_multivolume();
 
     let mut sink = Collector::default();
     ar.read_entries(&[2], &mut sink).unwrap();
@@ -406,13 +387,7 @@ fn a_multivolume_set_reads_a_subset() {
 /// После пакетного прохода за собой не остаётся временных файлов.
 #[test]
 fn a_multivolume_pass_leaves_no_temporary_files() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("mvmulti.part1.rar"), MV_P1).unwrap();
-    std::fs::write(dir.path().join("mvmulti.part2.rar"), MV_P2).unwrap();
-    std::fs::write(dir.path().join("mvmulti.part3.rar"), MV_P3).unwrap();
-
-    let src = Source::path(&dir.path().join("mvmulti.part1.rar")).unwrap();
-    let mut ar = RarHandler.open(src, &OpenOptions::default()).unwrap();
+    let (dir, mut ar) = open_multivolume();
     let mut sink = Collector::default();
     ar.read_entries(&[0, 1, 2], &mut sink).unwrap();
 
