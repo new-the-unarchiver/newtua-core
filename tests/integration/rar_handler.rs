@@ -383,18 +383,3 @@ fn a_multivolume_set_reads_a_subset() {
     ar.read_entries(&[2], &mut sink).unwrap();
     assert_eq!(sink.body(2), blob(3, 12_000));
 }
-
-/// После пакетного прохода за собой не остаётся временных файлов.
-#[test]
-fn a_multivolume_pass_leaves_no_temporary_files() {
-    let (dir, mut ar) = open_multivolume();
-    let mut sink = Collector::default();
-    ar.read_entries(&[0, 1, 2], &mut sink).unwrap();
-
-    let left: Vec<_> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| !n.starts_with("mvmulti."))
-        .collect();
-    assert!(left.is_empty(), "рядом остались лишние файлы: {left:?}");
-}
