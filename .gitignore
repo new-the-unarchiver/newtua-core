@@ -1,6 +1,4 @@
 /target
-Cargo.lock
-Cargo.lock.bak
 .DS_Store
 .code-index/
 
