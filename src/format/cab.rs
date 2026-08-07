@@ -1,12 +1,14 @@
 use std::io::{Read, Write};
-use std::time::SystemTime;
+use std::path::PathBuf;
 
 use crate::archive::{
     ArchiveReader, Confidence, Entry, EntryKind, EntrySink, FormatHandler, FormatId, OpenOptions,
     ReadSeek, SinkStep, SinkWriter, Source,
 };
-use crate::datetime::civil_to_systime;
+use crate::datetime::dos_words_to_systime;
+use crate::encoding::decode_names;
 use crate::error::{Error, Result, io_err_to_corrupt};
+use crate::path_safety::raw_path_escapes;
 use crate::vendor::cab;
 
 pub struct CabHandler;
@@ -24,7 +26,7 @@ impl FormatHandler for CabHandler {
         }
     }
 
-    fn open(&self, src: Source, _opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
+    fn open(&self, src: Source, opts: &OpenOptions) -> Result<Box<dyn ArchiveReader>> {
         let inner: Box<dyn ReadSeek> = match src {
             Source::Seekable { inner, .. } => inner,
             Source::Stream { .. } => {
@@ -36,29 +38,24 @@ impl FormatHandler for CabHandler {
         };
         let cab = cab::Cabinet::new(inner).map_err(io_err_to_corrupt)?;
 
-        let mut entries: Vec<Entry> = Vec::new();
+        // Two passes, because the encoding of a name is decided from the whole
+        // set at once: one archive, one encoding. A cabinet that declares its
+        // names UTF-8 says so per entry, and that declaration is believed rather
+        // than guessed at — a detector fed a handful of short ASCII names will
+        // happily call them something else.
+        let mut raw_names: Vec<Vec<u8>> = Vec::new();
+        let mut declared_utf8: Vec<bool> = Vec::new();
         let mut places: Vec<Place> = Vec::new();
+        let mut stamps: Vec<(u16, u16)> = Vec::new();
         for (folder_idx, folder) in cab.folder_entries().enumerate() {
             let is_quantum = matches!(
                 folder.compression_type(),
                 cab::CompressionType::Quantum(_, _)
             );
             for file in folder.file_entries() {
-                let raw = file.name();
-                let (date, time) = file.dos_date_time();
-                entries.push(Entry {
-                    path_raw: raw.as_bytes().to_vec(),
-                    // CAB uses `\` separators; normalize to `/` so list output and
-                    // common-root/wrapper detection (which read `Entry::path`)
-                    // work. `safe_join` re-normalizes for the on-disk write path.
-                    path: std::path::PathBuf::from(raw.replace('\\', "/")),
-                    kind: EntryKind::File,
-                    size: file.uncompressed_size() as u64,
-                    mode: None,
-                    is_encrypted: false,
-                    modified: cab_dos_to_systime(date, time),
-                    is_resource_fork: false,
-                });
+                raw_names.push(file.name().to_vec());
+                declared_utf8.push(file.name_is_utf8());
+                stamps.push(file.dos_date_time());
                 places.push(Place {
                     folder: folder_idx,
                     offset: file.uncompressed_offset() as u64,
@@ -67,6 +64,45 @@ impl FormatHandler for CabHandler {
                 });
             }
         }
+
+        let names = decode_names(&raw_names, opts.encoding_override.as_deref());
+        let entries = raw_names
+            .into_iter()
+            .zip(names)
+            .zip(declared_utf8)
+            .zip(&stamps)
+            .zip(&places)
+            .map(|((((raw, decoded), utf8), &(date, time)), place)| {
+                let name = if utf8 {
+                    String::from_utf8_lossy(&raw).into_owned()
+                } else {
+                    decoded
+                };
+                // An escaping name is rendered from its raw bytes, so the `..`
+                // reaches `safe_join` verbatim: a multi-byte legacy charset can
+                // otherwise swallow a separator into a lead byte and hand the
+                // orchestrator a name that no longer looks like traversal.
+                let name = if raw_path_escapes(&raw) {
+                    String::from_utf8_lossy(&raw).into_owned()
+                } else {
+                    name
+                };
+                Entry {
+                    path_raw: raw,
+                    // CAB uses `\` separators; normalize to `/` so list output
+                    // and common-root/wrapper detection (which read
+                    // `Entry::path`) work. `safe_join` re-normalizes for the
+                    // on-disk write path.
+                    path: PathBuf::from(name.replace('\\', "/")),
+                    kind: EntryKind::File,
+                    size: place.size,
+                    mode: None,
+                    is_encrypted: false,
+                    modified: dos_words_to_systime(date, time),
+                    is_resource_fork: false,
+                }
+            })
+            .collect();
 
         Ok(Box::new(CabReader {
             cab,
@@ -89,30 +125,6 @@ struct Place {
     size: u64,
     /// This entry's folder uses Quantum compression, which nothing here decodes.
     is_quantum: bool,
-}
-
-/// The two packed MS-DOS words a cabinet stores, read as **UTC**.
-///
-/// The CAB spec calls the field local time with no zone attached, and every
-/// other format of that era is read as local wall clock here (see
-/// `datetime::dos_words_to_systime`). CAB is the exception on purpose: The
-/// Unarchiver reads it as UTC, and the reference corpus is checked against that.
-/// Changing it would move every date in every cabinet by the reader's offset,
-/// which is a decision about listings, not about speed.
-fn cab_dos_to_systime(date: u16, time: u16) -> Option<SystemTime> {
-    if date == 0 {
-        return None;
-    }
-    let year = 1980 + i32::from(date >> 9);
-    let month = u32::from((date >> 5) & 0x0F);
-    let day = u32::from(date & 0x1F);
-    let hour = u64::from(time >> 11);
-    let min = u64::from((time >> 5) & 0x3F);
-    let sec = u64::from(time & 0x1F) * 2;
-    if hour > 23 || min > 59 || sec > 59 {
-        return None;
-    }
-    civil_to_systime(year, month, day, hour, min, sec)
 }
 
 struct CabReader {
@@ -290,22 +302,48 @@ mod tests {
         assert_eq!(CabHandler.id(), FormatId::Cab);
     }
 
+    /// The cabinet from the CAB specification: one uncompressed file `hi.txt`
+    /// stamped 1997-03-12 11:13:52.
+    const SPEC_CABINET: &[u8] = b"MSCF\0\0\0\0\x59\0\0\0\0\0\0\0\
+        \x2c\0\0\0\0\0\0\0\x03\x01\x01\0\x01\0\0\0\x34\x12\0\0\
+        \x43\0\0\0\x01\0\0\0\
+        \x0e\0\0\0\0\0\0\0\0\0\x6c\x22\xba\x59\x01\0hi.txt\0\
+        \x4c\x1a\x2e\x7f\x0e\0\x0e\0Hello, world!\n";
+
+    fn open_bytes(bytes: &[u8]) -> Box<dyn ArchiveReader> {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, bytes).unwrap();
+        let src = Source::path(tmp.path()).unwrap();
+        // The temp file must outlive the reader, which keeps it open.
+        let reader = CabHandler.open(src, &OpenOptions::default()).unwrap();
+        std::mem::forget(tmp);
+        reader
+    }
+
+    /// **A cabinet stores the clock on the wall, not an instant.**
+    ///
+    /// This read the fields as UTC until 2026-08-07, and the comment claiming
+    /// that matched The Unarchiver was simply wrong: `unar` extracting
+    /// `IE40CIF.CAB` sets the mtime six hours away from what we set, on a
+    /// machine at UTC+5 — a whole timezone off, for every file in every
+    /// cabinet. CAB stores the identical word pair zip does, so it converts by
+    /// the identical rule.
+    ///
+    /// The corpus could not have caught this: the harness runs with `TZ=UTC`,
+    /// where reading a wall clock as local and as UTC give the same answer.
     #[test]
-    fn dos_words_are_read_as_utc() {
-        // 1997-03-12 11:13:52, the timestamp in the CAB spec's example cabinet.
-        let t = cab_dos_to_systime(0x226c, 0x59ba).unwrap();
-        let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
-        assert_eq!(secs, 858_165_232);
+    fn a_date_is_read_as_local_wall_clock_like_zip() {
+        let mut ar = open_bytes(SPEC_CABINET);
+        let entries = ar.entries().unwrap();
+        assert_eq!(entries[0].modified, dos_words_to_systime(0x226c, 0x59ba));
+        assert!(entries[0].modified.is_some());
     }
 
     #[test]
-    fn a_zero_date_is_no_date() {
-        assert_eq!(cab_dos_to_systime(0, 0), None);
-    }
-
-    #[test]
-    fn a_clock_that_never_was_is_no_date() {
-        // Hour 31 — five bits of hour, all set.
-        assert_eq!(cab_dos_to_systime(0x226c, 0xF800), None);
+    fn a_name_is_carried_as_the_bytes_the_cabinet_holds() {
+        let mut ar = open_bytes(SPEC_CABINET);
+        let entries = ar.entries().unwrap();
+        assert_eq!(entries[0].path_raw, b"hi.txt");
+        assert_eq!(entries[0].path.to_str().unwrap(), "hi.txt");
     }
 }

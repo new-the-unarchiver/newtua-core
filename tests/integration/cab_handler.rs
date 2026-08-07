@@ -2,7 +2,7 @@ use newtua_core::format::CabHandler;
 use newtua_core::{
     EntrySink, Error, ExtractOptions, FormatHandler, OpenOptions, SinkStep, Source, extract_all,
 };
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 /// Build a single-folder MSZIP cabinet in a temp file. Files are written in the
@@ -36,6 +36,36 @@ fn make_cab_folders(folders: &[&[(&str, &[u8])]]) -> tempfile::NamedTempFile {
     }
     cw.finish().unwrap();
     tmp
+}
+
+/// Mark folder `index` as Quantum-compressed, in place.
+///
+/// Nothing available writes Quantum — not `gcab`, not `7zz`, and no sample of
+/// one exists in the reference corpus — so the refusal path would otherwise be
+/// covered by reading the code and hoping. Two bytes in the folder's header are
+/// enough to exercise it honestly: the reader decides from the compression
+/// field, and what follows never gets decoded because opening the folder fails
+/// first.
+///
+/// Header geometry, from the CAB specification: the fixed header is 36 bytes
+/// (and this builder sets no reserve areas and no previous/next cabinet names,
+/// so nothing follows it), then one 8-byte folder entry each — `u32` first data
+/// block offset, `u16` block count, `u16` compression.
+fn mark_folder_quantum(cab: &tempfile::NamedTempFile, index: usize) {
+    const HEADER_LEN: u64 = 36;
+    const FOLDER_ENTRY_LEN: u64 = 8;
+    const COMPRESSION_OFFSET: u64 = 6;
+    // Quantum, level 7, memory 20 — the same bit pattern the vendored reader's
+    // own unit test recognises.
+    const QUANTUM_BITS: u16 = 0x1472;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(cab.path())
+        .unwrap();
+    let at = HEADER_LEN + FOLDER_ENTRY_LEN * index as u64 + COMPRESSION_OFFSET;
+    file.seek(SeekFrom::Start(at)).unwrap();
+    file.write_all(&QUANTUM_BITS.to_le_bytes()).unwrap();
 }
 
 /// Everything `read_entries` reported, as `(index, body)` pairs.
@@ -265,4 +295,142 @@ fn extraction_across_folders_writes_every_file() {
     assert_eq!(std::fs::read(dest.path().join("data/a.txt")).unwrap(), b"A");
     assert_eq!(std::fs::read(dest.path().join("data/b.txt")).unwrap(), b"B");
     assert_eq!(std::fs::read(dest.path().join("data/c.txt")).unwrap(), b"C");
+}
+
+#[test]
+fn a_quantum_folder_refuses_without_taking_the_others_with_it() {
+    let cab = make_cab_folders(&[
+        &[("readable.txt", b"this folder is MSZIP")],
+        &[("locked.txt", b"this folder claims Quantum")],
+        &[("also-readable.txt", b"and this one is MSZIP again")],
+    ]);
+    mark_folder_quantum(&cab, 1);
+
+    let src = Source::path(cab.path()).unwrap();
+    let mut ar = CabHandler.open(src, &OpenOptions::default()).unwrap();
+    // Listing still works: names and sizes come from headers, which are not
+    // compressed at all.
+    let entries = ar.entries().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[1].path, Path::new("locked.txt"));
+
+    let err = ar.read_entry(1, &mut Vec::new()).unwrap_err();
+    assert!(
+        matches!(&err, Error::Unsupported { format, feature }
+            if format == "cab" && feature.contains("Quantum")),
+        "ожидали отказ по Quantum, получили {err:?}"
+    );
+
+    // The batch pass reports that one refusal and keeps going.
+    let mut sink = Reporter::default();
+    ar.read_entries(&[0, 1, 2], &mut sink).unwrap();
+    assert_eq!(
+        sink.bodies,
+        vec![
+            (0, b"this folder is MSZIP".to_vec()),
+            (2, b"and this one is MSZIP again".to_vec()),
+        ]
+    );
+    assert_eq!(sink.failed, vec![1]);
+}
+
+/// Like `Collector`, but records which entries failed instead of unwrapping.
+#[derive(Default)]
+struct Reporter {
+    bodies: Vec<(usize, Vec<u8>)>,
+    failed: Vec<usize>,
+}
+
+impl EntrySink for Reporter {
+    fn begin(&mut self, idx: usize) -> newtua_core::Result<SinkStep> {
+        self.bodies.push((idx, Vec::new()));
+        Ok(SinkStep::Body)
+    }
+
+    fn write_body(&mut self, buf: &[u8]) -> newtua_core::Result<()> {
+        self.bodies.last_mut().unwrap().1.extend_from_slice(buf);
+        Ok(())
+    }
+
+    fn end(&mut self, idx: usize, outcome: newtua_core::Result<()>) -> newtua_core::Result<bool> {
+        if outcome.is_err() {
+            self.failed.push(idx);
+            self.bodies.retain(|(i, _)| *i != idx);
+        }
+        Ok(true)
+    }
+}
+
+#[test]
+fn extraction_reports_the_quantum_folder_and_writes_the_rest() {
+    let cab = make_cab_folders(&[
+        &[("data\\ok.txt", b"written")],
+        &[("data\\locked.txt", b"not written")],
+    ]);
+    mark_folder_quantum(&cab, 1);
+    let dest = tempfile::tempdir().unwrap();
+    let src = Source::path(cab.path()).unwrap();
+    let mut ar = CabHandler.open(src, &OpenOptions::default()).unwrap();
+    let report = extract_all(
+        &mut *ar,
+        &mut ExtractOptions {
+            dest: dest.path().to_path_buf(),
+            wrapper_name: Some("arc".into()),
+            strict: false,
+            preserve: true,
+            selection: None,
+            progress: None,
+            keep_macos_metadata: false,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(dest.path().join("data/ok.txt")).unwrap(),
+        b"written"
+    );
+    // The refused entry leaves no file behind — a zero-length one wearing the
+    // right name reads as success and is worse than the entry plainly missing.
+    assert!(!dest.path().join("data/locked.txt").exists());
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].0, Path::new("data/locked.txt"));
+}
+
+/// Replace `from` with `to` in the cabinet's bytes. Both must be the same
+/// length, so nothing in the header moves.
+///
+/// This is how a non-UTF-8 name gets into a fixture at all: upstream's writer
+/// takes a `&str`, and Rust has no way to hand it bytes that are not UTF-8
+/// without undefined behaviour. Writing an ASCII placeholder and overwriting it
+/// afterwards produces exactly the file a Windows packer would.
+fn patch_bytes(cab: &tempfile::NamedTempFile, from: &[u8], to: &[u8]) {
+    assert_eq!(from.len(), to.len(), "замена должна быть той же длины");
+    let mut bytes = std::fs::read(cab.path()).unwrap();
+    let at = bytes
+        .windows(from.len())
+        .position(|w| w == from)
+        .expect("placeholder not found in the cabinet");
+    bytes[at..at + to.len()].copy_from_slice(to);
+    std::fs::write(cab.path(), bytes).unwrap();
+}
+
+#[test]
+fn a_name_in_a_legacy_codepage_survives() {
+    // CP1251 for "привет.txt" — a name a Windows packer writes with the UTF-8
+    // flag clear. Read through `from_utf8_lossy`, as it was until 2026-08-07,
+    // every one of those six bytes becomes U+FFFD and the name is gone for good.
+    const CP1251: &[u8] = &[0xEF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2, b'.', b't', b'x', b't'];
+    let cab = make_cab(&[("aaaaaa.txt", b"body")]);
+    patch_bytes(&cab, b"aaaaaa.txt", CP1251);
+
+    let src = Source::path(cab.path()).unwrap();
+    let mut ar = CabHandler.open(src, &OpenOptions::default()).unwrap();
+    let entries = ar.entries().unwrap();
+
+    assert_eq!(entries[0].path_raw, CP1251, "сырые байты идут как есть");
+    assert_eq!(entries[0].path, Path::new("привет.txt"));
+
+    let mut out = Vec::new();
+    ar.read_entry(0, &mut out).unwrap();
+    assert_eq!(out, b"body");
 }

@@ -37,7 +37,11 @@ Everything that writes, and everything nothing here reads:
   path they served is gone (see below).
 - **`datetime.rs`** — timestamps now leave as the raw MS-DOS words. That took
   the `time` crate out of this module; the conversion lives in
-  `format/cab.rs`, where the engine already decides how to read a wall clock.
+  `format/cab.rs`, which reads them by the same rule as zip. Upstream returned
+  a `time::PrimitiveDateTime` — a civil date with no zone attached — and left
+  the caller to decide what it meant; the caller decided "UTC", which put every
+  date in every cabinet a whole timezone away from what the packer saw.
+  Measured against `unar` in `.claude/issues/18`.
 - `FileEntry`'s DOS attribute accessors, `FolderEntry::num_data_blocks` and the
   reserve-data accessors, `Cabinet::cabinet_set_id`/`_index`/`reserve_data`,
   and the flat copy of the file list `Cabinet` kept alongside the per-folder
@@ -68,6 +72,14 @@ Everything that writes, and everything nothing here reads:
 - **One copy per data block removed**: upstream wrote
   `decompress_block(..)?.to_vec()`, and `decompress_block` already returns a
   `Vec<u8>`, so `.to_vec()` copied every decoded block a second time.
+- **Names leave as bytes, not as a `String`.** `FileEntry::name()` returns
+  `&[u8]` and `name_is_utf8()` reports the bit upstream parsed and then ignored
+  (its own TODO). Upstream ran every name through `String::from_utf8_lossy`,
+  which turns each byte it does not recognise into U+FFFD and cannot be undone:
+  a cabinet packed under a Windows code page came out as a row of replacement
+  characters. `format/cab.rs` now feeds the raw bytes to
+  `encoding::decode_names`, which picks one encoding for the whole archive, as
+  every other handler does.
 - Formatting is this repository's `rustfmt`, and the module paths are `super::`
   instead of `crate::`. Both are noise in a diff against upstream; see below.
 
@@ -90,10 +102,13 @@ the registry is worth reconsidering — but note that its `next_file()` hands ou
 that fails to open (`FolderReader::new(..).ok()?`) as "no more files", which
 would truncate an extraction and report success.
 
-## Known limitation, deliberately left alone
+## Quantum
 
-Entry names arrive as `String::from_utf8_lossy`, so `Entry::path_raw` for a CAB
-carries the *lossy* bytes rather than the archive's exact ones. Every other
-handler hands the raw bytes to `encoding::decode_names`. Fixing it changes what
-non-UTF-8 cabinets list as, which is a decision about listings and belongs in
-its own ticket — not in a change about speed.
+Not decoded, as upstream. A folder that declares it refuses when opened, and
+`format/cab.rs` refuses each of its entries individually so the rest of the
+cabinet still extracts. Nothing available writes Quantum — not `gcab`, not
+`7zz` — and the reference corpus holds no sample, so the test builds an MSZIP
+cabinet and rewrites two bytes of one folder's header
+(`mark_folder_quantum` in `tests/integration/cab_handler.rs`). That covers the
+refusal, which is all this reader claims; it does not cover decoding, which it
+does not do.

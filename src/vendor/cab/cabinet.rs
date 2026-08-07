@@ -6,7 +6,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use super::consts;
 use super::file::parse_file_entry;
 use super::folder::{FolderEntries, FolderEntry, FolderReader, parse_folder_entry};
-use super::string::read_null_terminated_string;
+use super::string::skip_null_terminated_string;
 
 pub(crate) trait ReadSeek: Read + Seek {}
 impl<R: Read + Seek> ReadSeek for R {}
@@ -74,20 +74,16 @@ impl<R: Read + Seek> Cabinet<R> {
             let mut discard = vec![0u8; header_reserve_size as usize];
             reader.read_exact(&mut discard)?;
         }
-        let _prev_cabinet = if (flags & consts::FLAG_PREV_CABINET) != 0 {
-            let cab_name = read_null_terminated_string(&mut reader)?;
-            let disk_name = read_null_terminated_string(&mut reader)?;
-            Some((cab_name, disk_name))
-        } else {
-            None
-        };
-        let _next_cabinet = if (flags & consts::FLAG_NEXT_CABINET) != 0 {
-            let cab_name = read_null_terminated_string(&mut reader)?;
-            let disk_name = read_null_terminated_string(&mut reader)?;
-            Some((cab_name, disk_name))
-        } else {
-            None
-        };
+        // Names of the previous and next cabinet in the set, plus the disk each
+        // sits on. Read past: the engine opens one cabinet at a time.
+        if (flags & consts::FLAG_PREV_CABINET) != 0 {
+            skip_null_terminated_string(&mut reader)?;
+            skip_null_terminated_string(&mut reader)?;
+        }
+        if (flags & consts::FLAG_NEXT_CABINET) != 0 {
+            skip_null_terminated_string(&mut reader)?;
+            skip_null_terminated_string(&mut reader)?;
+        }
         let mut folders = Vec::with_capacity(num_folders);
         for _ in 0..num_folders {
             let entry = parse_folder_entry(&mut reader, folder_reserve_size as usize)?;
@@ -217,7 +213,7 @@ mod tests {
             .file_entries()
             .next()
             .unwrap();
-        assert_eq!(file.name(), "hi.txt");
+        assert_eq!(file.name(), b"hi.txt");
         // 1997-03-12 11:13:52 as the two packed MS-DOS words. Converting them
         // is the caller's job now, so the test checks the words themselves.
         assert_eq!(file.dos_date_time(), (0x226c, 0x59ba));
@@ -338,7 +334,8 @@ mod tests {
             .file_entries()
             .next()
             .unwrap();
-        assert_eq!(file.name(), "\u{2603}.txt");
+        assert_eq!(file.name(), "\u{2603}.txt".as_bytes());
+        assert!(file.name_is_utf8(), "this cabinet sets the UTF-8 name bit");
         assert_eq!(file_bytes(&cabinet, 0, 0), b"Snowman!\n");
     }
 
