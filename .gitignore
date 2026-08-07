@@ -10,3 +10,7 @@
 /CLAUDE.md
 /.claude/
 /.superpowers/
+
+# Каталоги, которые заводит система навыков — в пакет не уезжают
+.agents/
+.cursor/
