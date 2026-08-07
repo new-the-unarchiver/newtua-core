@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::archive::{
     ArchiveReader, Confidence, Entry, EntryKind, EntrySink, FormatHandler, FormatId, OneEntry,
-    OpenOptions, SinkStep, SinkWriter, Source,
+    OpenOptions, SinkStep, Source,
 };
 use crate::encoding::decode_names;
 use crate::error::{Error, Result};
@@ -39,7 +39,7 @@ impl FormatHandler for RarHandler {
         // a password — only extraction does. For header-encrypted archives, we
         // need the password even for listing; try without first, then with.
         let encoding = opts.encoding_override.as_deref();
-        let (entries, is_multivolume) = match list_entries(path.as_path(), None, encoding) {
+        let entries = match list_entries(path.as_path(), None, encoding) {
             Ok(r) => r,
             Err(_) => list_entries(path.as_path(), opts.password.as_deref(), encoding)?,
         };
@@ -48,7 +48,6 @@ impl FormatHandler for RarHandler {
             path,
             password: opts.password.clone(),
             entries,
-            is_multivolume,
         }))
     }
 }
@@ -59,38 +58,29 @@ type RawMeta = (u64, bool, bool, Option<u32>, Option<std::time::SystemTime>);
 
 /// List all entries in the archive, collecting metadata.
 ///
-/// Returns `(entries, is_multivolume)`.  `is_multivolume` is `true` when the
-/// archive header reports that this file is the first (or a subsequent) volume
-/// in a multi-part RAR set, as indicated by `VolumeInfo::First` /
-/// `VolumeInfo::Subsequent` from the unrar crate.
-fn list_entries(
-    path: &Path,
-    password: Option<&str>,
-    encoding: Option<&str>,
-) -> Result<(Vec<Entry>, bool)> {
+/// Multi-volume sets need nothing special here: libunrar finds the sibling
+/// volumes by path on its own, and the listing reports a file split across
+/// them once.
+fn list_entries(path: &Path, password: Option<&str>, encoding: Option<&str>) -> Result<Vec<Entry>> {
     let mut raw_names: Vec<Vec<u8>> = Vec::new();
     let mut metas: Vec<RawMeta> = Vec::new();
 
     // The Iterator impl on OpenArchive<List, CursorBeforeHeader> yields Result<FileHeader>.
     // We use it for listing (payloads are skipped automatically).
-    //
-    // We also read `volume_info()` from the opened archive before consuming it
-    // as an iterator, so we can detect multi-volume sets without filename sniffing.
-    let (is_multivolume, iter): (
-        bool,
-        Box<dyn Iterator<Item = std::result::Result<unrar::FileHeader, unrar::error::UnrarError>>>,
-    ) = if let Some(pw) = password {
-        let open = unrar::Archive::with_password(path, pw)
-            .open_for_listing()
-            .map_err(map_rar_err)?;
-        let mv = open.volume_info() != unrar::VolumeInfo::None;
-        (mv, Box::new(open))
+    let iter: Box<
+        dyn Iterator<Item = std::result::Result<unrar::FileHeader, unrar::error::UnrarError>>,
+    > = if let Some(pw) = password {
+        Box::new(
+            unrar::Archive::with_password(path, pw)
+                .open_for_listing()
+                .map_err(map_rar_err)?,
+        )
     } else {
-        let open = unrar::Archive::new(path)
-            .open_for_listing()
-            .map_err(map_rar_err)?;
-        let mv = open.volume_info() != unrar::VolumeInfo::None;
-        (mv, Box::new(open))
+        Box::new(
+            unrar::Archive::new(path)
+                .open_for_listing()
+                .map_err(map_rar_err)?,
+        )
     };
 
     for item in iter {
@@ -182,7 +172,7 @@ fn list_entries(
         )
         .collect();
 
-    Ok((entries, is_multivolume))
+    Ok(entries)
 }
 
 fn map_rar_err(e: unrar::error::UnrarError) -> Error {
@@ -198,12 +188,6 @@ struct RarReader {
     path: PathBuf,
     password: Option<String>,
     entries: Vec<Entry>,
-    /// True when the opened file is the first or a subsequent volume in a
-    /// multi-part RAR set.  Bodies are then poured through a file on disk
-    /// (`body_via_disk`, libunrar's RAR_EXTRACT mode, which follows volume
-    /// continuations by path) instead of the in-memory `read()` fast path used
-    /// for single-volume archives.
-    is_multivolume: bool,
 }
 
 impl ArchiveReader for RarReader {
@@ -293,16 +277,6 @@ impl RarReader {
         if let Some(&bad) = indices.iter().find(|&&i| i >= self.entries.len()) {
             return Err(Error::InvalidIndex(bad));
         }
-        // Многотомная распаковка идёт через файл на диске, поэтому каталог под
-        // него заводится один на вызов, а не один на запись. Для однотомного
-        // архива он не нужен вовсе.
-        let tmp_dir = if self.is_multivolume {
-            Some(tempfile::tempdir().map_err(Error::Io)?)
-        } else {
-            None
-        };
-        let tmp = tmp_dir.as_ref().map(|d| d.path().join("entry"));
-
         let mut archive = self.open_for_processing()?;
         // `i` — место в списке запрошенного, `pos` — номер заголовка в архиве.
         let mut i = 0usize;
@@ -349,10 +323,7 @@ impl RarReader {
                     archive = with_file.skip().map_err(map_rar_err)?;
                 }
                 SinkStep::Body => {
-                    let (outcome, next) = match tmp.as_deref() {
-                        Some(tmp) => body_via_disk(with_file, tmp, sink),
-                        None => body_in_memory(with_file, sink),
-                    };
+                    let (outcome, next) = body_in_memory(with_file, sink);
                     if !sink.end(want, outcome)? {
                         return Ok(());
                     }
@@ -382,7 +353,20 @@ impl RarReader {
     }
 }
 
-/// Однотомный архив: тело читается в память средствами крейта.
+/// Тело записи читается средствами крейта.
+///
+/// Через границу тома libunrar проводит файл сама, и отдельного пути для
+/// многотомного набора больше нет. Он был: чтение в память роняло процесс по
+/// `SIGABRT`, когда тело пересекало границу, и приходилось извлекать запись во
+/// временный файл. Причина — разыменование нулевого указателя в обратном
+/// вызове `UCM_PROCESSDATA` — закрыта заплаткой в `newtua-unrar`; проверено
+/// 2026-08-08 на трёхтомной фикстуре и четырёхтомном образце корпуса,
+/// побайтно против `unar`, в том числе на выборочной распаковке с пропусками.
+///
+/// Осталась цена, которую этим не снять: тело кладётся в память целиком, то
+/// есть пик равен самой большой распаковываемой записи. Дешевле будет только
+/// потоковый режим в форке — крейт наружу отдаёт лишь «целиком в память» или
+/// «целиком в файл», хотя libunrar внутри уже отдаёт тело кусками.
 fn body_in_memory(
     with_file: unrar::OpenArchive<unrar::Process, unrar::CursorBeforeFile>,
     sink: &mut dyn EntrySink,
@@ -391,36 +375,6 @@ fn body_in_memory(
         Ok((data, next)) => (sink.write_body(&data), Some(next)),
         Err(e) => (Err(map_rar_err(e)), None),
     }
-}
-
-/// Многотомный архив: тело извлекается во временный файл и оттуда переливается
-/// приёмнику.
-///
-/// Чтение в память (`read()`, режим `RAR_TEST`) на границе томов роняло процесс
-/// по `SIGABRT`; `extract_to` (режим `RAR_EXTRACT`) идёт обычным путём
-/// распаковки, и продолжение в следующем томе libunrar находит сама — соседние
-/// тома должны лежать рядом с открытым файлом.
-fn body_via_disk(
-    with_file: unrar::OpenArchive<unrar::Process, unrar::CursorBeforeFile>,
-    tmp: &Path,
-    sink: &mut dyn EntrySink,
-) -> BodyOutcome {
-    let next = match with_file.extract_to(tmp) {
-        Ok(next) => next,
-        // Убирать за собой тут не надо: каталог сносится целиком, а до
-        // следующей записи тот же путь всё равно перезапишут.
-        Err(e) => return (Err(map_rar_err(e)), None),
-    };
-    let outcome = pour(tmp, sink);
-    let _ = std::fs::remove_file(tmp);
-    (outcome, Some(next))
-}
-
-fn pour(tmp: &Path, sink: &mut dyn EntrySink) -> Result<()> {
-    let mut f = std::fs::File::open(tmp).map_err(Error::Io)?;
-    let mut w = SinkWriter::new(sink);
-    let copied = std::io::copy(&mut f, &mut w);
-    w.outcome(copied.map(|_| ()).map_err(Error::Io))
 }
 
 /// Отметить остаток списка как непрочитанный.

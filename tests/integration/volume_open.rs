@@ -300,12 +300,13 @@ fn rar_native_multivolume_listing_works() {
 /// Extraction from a native multi-volume RAR must succeed and yield bytes
 /// that exactly match the original content file.
 ///
-/// Implementation note: the unrar 0.5.8 crate's in-memory `read()` API
-/// (RAR_TEST mode) SIGABRTs when the payload crosses a volume boundary.
-/// The fix uses `extract_to(temp_file)` (RAR_EXTRACT mode) instead, which
-/// correctly follows the volume continuation chain via libunrar's native
-/// disk-based path.  All volume parts must exist in the same directory as
-/// part1 so that libunrar can locate them automatically.
+/// Implementation note: the in-memory `read()` path used to SIGABRT here when
+/// the payload crossed a volume boundary, and the handler had to detour through
+/// `extract_to(temp_file)` on disk. The cause — a null pointer dereferenced in
+/// the `UCM_PROCESSDATA` callback — is patched in `newtua-unrar`, so the detour
+/// is gone and this test now guards the plain path. All volume parts must exist
+/// in the same directory as part1 so that libunrar can locate them
+/// automatically.
 #[test]
 fn rar_native_multivolume_extraction_works() {
     let dir = tempfile::tempdir().unwrap();
