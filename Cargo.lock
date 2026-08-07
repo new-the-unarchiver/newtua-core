@@ -1262,6 +1262,7 @@ dependencies = [
  "newtua-amiga",
  "newtua-apfs",
  "newtua-cdfs",
+ "newtua-common",
  "newtua-dos",
  "newtua-hfsplus",
  "newtua-lzw-z",

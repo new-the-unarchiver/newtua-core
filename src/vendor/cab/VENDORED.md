@@ -108,6 +108,9 @@ would truncate an extraction and report success.
 from this crate's lineage, since upstream `cab` has no Quantum decoder at all
 and no Rust implementation exists anywhere. It plugs into `Decompressor` beside
 MSZIP and LZX; see the module's own documentation for the format and for what
-is bounded.
+is bounded. Its bit reader and sliding window are `newtua-common`'s, not its
+own: that crate's `LzssWindow` is a port of the same XADMaster `LZSS.c` the
+donor calls, so borrowing it moves the port closer to its source rather than
+further from it.
 
 The reader now covers every compression a cabinet can declare.

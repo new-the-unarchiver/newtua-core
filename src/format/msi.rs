@@ -132,10 +132,12 @@ impl FormatHandler for MsiHandler {
             std::io::copy(&mut stream_reader, &mut temp_cab)?;
             let temp_path = temp_cab.into_temp_path();
 
-            // Open via CabHandler.  Propagate the inner error variant unchanged
-            // so that callers can distinguish Unsupported (e.g. Quantum
-            // compression) from Corrupt.  Wrapping every CabHandler error into
-            // Error::Corrupt would mask the variant and mislead the orchestrator.
+            // Open via CabHandler. Propagate the inner error variant unchanged
+            // so that callers can still tell a damaged cabinet (Corrupt) from a
+            // cabinet we decline to read (Unsupported — a stream source, say).
+            // Wrapping every CabHandler error into Error::Corrupt would mask the
+            // variant and mislead the orchestrator. Quantum used to be the
+            // example here; it is decoded now.
             let mut cab_reader = CabHandler.open(Source::path(&temp_path)?, opts)?;
 
             // Collect entries; apply stream-name prefix when there is >1 cab.

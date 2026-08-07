@@ -140,6 +140,11 @@ base64 = "0.22"
 # crate exposes a uniform recognize/open/entries/read_entry API over &[u8].
 # 0.1.4 — не "0.1": ZooEntry::timezone появился именно в ней (после 0.1.3),
 # и на 0.1.3 наш код не соберётся.
+# Общие кирпичи семейства: битовый читатель MSB и скользящее окно LZSS, оба
+# порты из XADMaster. Ими пользуется src/vendor/cab/quantum.rs — декодер
+# Quantum портирован из того же XADMaster, так что окно здесь буквально то же
+# самое `LZSS.c`, а не похожее. Своих копий этих двух примитивов не заводить.
+newtua-common = "0.1.2"
 newtua-dos = "0.1.4"
 newtua-mac = "0.1"
 newtua-stuffit = "0.1.2"

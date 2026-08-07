@@ -21,6 +21,9 @@
 
 use std::io;
 
+use newtua_common::bitreader::BitReaderMsb;
+use newtua_common::lzss::LzssWindow;
+
 /// A CAB block never decodes to more than this, and every block of a folder but
 /// the last decodes to exactly this much — the reference implementation says so
 /// outright, and both it and XADMaster realign the coder on that boundary. It
@@ -37,7 +40,7 @@ const OFFSET_BASE: [u32; 42] = [
 ];
 
 /// How many raw bits follow each offset slot.
-const OFFSET_EXTRA_BITS: [u32; 42] = [
+const OFFSET_EXTRA_BITS: [u8; 42] = [
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
     13, 14, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19,
 ];
@@ -49,43 +52,41 @@ const LENGTH_BASE: [u32; 27] = [
 ];
 
 /// How many raw bits follow each length slot.
-const LENGTH_EXTRA_BITS: [u32; 27] = [
+const LENGTH_EXTRA_BITS: [u8; 27] = [
     0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
 
-/// Reads single bits, most significant first.
+/// The block's bit stream, most significant bit first.
 ///
-/// **Running out is an error, not a supply of zeroes.** A reader that keeps
-/// answering past the end of the data lets a truncated block decode forever —
-/// that is precisely CVE-2014-9556 — and it would also let a damaged archive
-/// produce content out of nothing.
-struct BitReader<'a> {
-    data: &'a [u8],
-    /// Next bit to read, counted in bits from the start of `data`.
-    pos: usize,
+/// A thin skin over the family's shared [`BitReaderMsb`], and the skin earns
+/// its keep: the shared reader answers `None` when the data runs out, while
+/// this decoder must **refuse** at that moment rather than read on. A reader
+/// that keeps answering past the end of the data lets a truncated block decode
+/// forever — precisely CVE-2014-9556 — and lets a damaged archive produce
+/// content out of nothing. Keeping that decision here means it is made once,
+/// not remembered at each of the six call sites.
+struct Bits<'a> {
+    inner: BitReaderMsb<&'a [u8]>,
 }
 
-impl<'a> BitReader<'a> {
+impl<'a> Bits<'a> {
     fn new(data: &'a [u8]) -> Self {
-        BitReader { data, pos: 0 }
+        Bits {
+            inner: BitReaderMsb::new(data),
+        }
+    }
+
+    /// Read `count` bits (`count` ≤ 24, and Quantum never asks for more than
+    /// the 19 an offset slot can carry).
+    fn bits(&mut self, count: u8) -> io::Result<u32> {
+        match self.inner.read(count)? {
+            Some(value) => Ok(value),
+            None => invalid_data!("Quantum block ends in the middle of a symbol"),
+        }
     }
 
     fn bit(&mut self) -> io::Result<u32> {
-        let byte = self.pos / 8;
-        if byte >= self.data.len() {
-            invalid_data!("Quantum block ends in the middle of a symbol");
-        }
-        let bit = 7 - (self.pos % 8);
-        self.pos += 1;
-        Ok(u32::from(self.data[byte] >> bit) & 1)
-    }
-
-    fn bits(&mut self, count: u32) -> io::Result<u32> {
-        let mut value = 0u32;
-        for _ in 0..count {
-            value = (value << 1) | self.bit()?;
-        }
-        Ok(value)
+        self.bits(1)
     }
 }
 
@@ -190,7 +191,7 @@ struct Coder {
 }
 
 impl Coder {
-    fn new(bits: &mut BitReader<'_>) -> io::Result<Coder> {
+    fn new(bits: &mut Bits<'_>) -> io::Result<Coder> {
         Ok(Coder {
             low: 0,
             high: 0xFFFF,
@@ -209,7 +210,7 @@ impl Coder {
         cumfreq_hi: u16,
         cumfreq_lo: u16,
         total: u16,
-        bits: &mut BitReader<'_>,
+        bits: &mut Bits<'_>,
     ) -> io::Result<()> {
         let range = u32::from(self.high.wrapping_sub(self.low)) + 1;
         self.high = self
@@ -239,7 +240,7 @@ impl Coder {
     }
 
     /// Decode one symbol from `model` and let the model learn from it.
-    fn symbol(&mut self, model: &mut Model, bits: &mut BitReader<'_>) -> io::Result<u16> {
+    fn symbol(&mut self, model: &mut Model, bits: &mut Bits<'_>) -> io::Result<u16> {
         let total = model.total_frequency();
         if total == 0 {
             invalid_data!("Quantum model has no frequency left");
@@ -268,13 +269,15 @@ impl Coder {
 /// stream, and a match may reach back into an earlier block. The arithmetic
 /// coder does not: it starts afresh from each block's first sixteen bits.
 pub struct QuantumDecompressor {
-    window: Vec<u8>,
-    /// Where the next decoded byte goes; wraps at the end of the window.
-    window_posn: usize,
-    /// Total bytes decoded in this folder — the bound on how far a match may
-    /// reach back. Without it a match into never-written window space would
-    /// hand back zeroes as though they were content.
-    produced: u64,
+    /// The sliding window, and with it the count of bytes decoded so far —
+    /// which is the bound on how far a match may reach back. Without that bound
+    /// a match into never-written window space would hand back zeroes as though
+    /// they were content.
+    ///
+    /// Shared with the rest of the family rather than hand-rolled: it is a port
+    /// of the same XADMaster `LZSS.c` that this decoder's donor calls.
+    window: LzssWindow,
+    window_size: usize,
     selector: Model,
     literal: [Model; 4],
     offset4: Model,
@@ -288,10 +291,10 @@ impl QuantumDecompressor {
     /// which the header parser has already limited to 10..=21.
     pub fn new(window_bits: u16) -> QuantumDecompressor {
         let slots = usize::from(window_bits) * 2;
+        let window_size = 1usize << window_bits;
         QuantumDecompressor {
-            window: vec![0; 1usize << window_bits],
-            window_posn: 0,
-            produced: 0,
+            window: LzssWindow::new(window_size),
+            window_size,
             selector: Model::new(7),
             literal: [
                 Model::new(64),
@@ -307,8 +310,7 @@ impl QuantumDecompressor {
     }
 
     pub fn reset(&mut self) {
-        self.window_posn = 0;
-        self.produced = 0;
+        self.window = LzssWindow::new(self.window_size);
         self.selector.reset();
         for model in &mut self.literal {
             model.reset();
@@ -332,7 +334,7 @@ impl QuantumDecompressor {
                 FRAME_SIZE
             );
         }
-        let mut bits = BitReader::new(data);
+        let mut bits = Bits::new(data);
         let mut coder = Coder::new(&mut bits)?;
         let mut out = Vec::with_capacity(uncompressed_size);
 
@@ -354,7 +356,7 @@ impl QuantumDecompressor {
                     // the table lookup is written so that a future change to the
                     // model size cannot turn into an out-of-bounds read.
                     let (base, extra) = (
-                        *LENGTH_BASE.get(slot).ok_or_else(bad_length_slot)?,
+                        *LENGTH_BASE.get(slot).ok_or_else(|| bad_slot("length"))?,
                         LENGTH_EXTRA_BITS[slot],
                     );
                     let length = base + bits.bits(extra)? + 5;
@@ -372,7 +374,7 @@ impl QuantumDecompressor {
     fn decode_offset(
         &mut self,
         coder: &mut Coder,
-        bits: &mut BitReader<'_>,
+        bits: &mut Bits<'_>,
         selector: u8,
     ) -> io::Result<u32> {
         let model = match selector {
@@ -381,23 +383,19 @@ impl QuantumDecompressor {
             _ => &mut self.offset6,
         };
         let slot = usize::from(coder.symbol(model, bits)?);
-        let base = *OFFSET_BASE.get(slot).ok_or_else(bad_offset_slot)?;
+        let base = *OFFSET_BASE.get(slot).ok_or_else(|| bad_slot("offset"))?;
         Ok(base + bits.bits(OFFSET_EXTRA_BITS[slot])? + 1)
     }
 
     fn emit_literal(&mut self, byte: u8, out: &mut Vec<u8>) {
-        self.window[self.window_posn] = byte;
-        self.window_posn = (self.window_posn + 1) % self.window.len();
-        self.produced += 1;
-        out.push(byte);
+        self.window.emit_literal(byte, out);
     }
 
-    /// Copy `length` bytes from `offset` back in the window.
+    /// Check a back-reference and, if it is sound, let the window copy it.
     ///
-    /// Byte at a time on purpose: the source and destination overlap whenever
-    /// `offset < length` — that is how a run of repeated bytes is encoded — so
-    /// a block copy would be wrong, and Quantum archives are rare enough that
-    /// the simple loop costs nothing worth having.
+    /// Every number here came from the archive, so every one is bounded. The
+    /// copy itself is the window's business — including the overlapping case
+    /// (`offset < length`), which is how a run of repeated bytes is encoded.
     fn emit_match(
         &mut self,
         offset: u32,
@@ -406,14 +404,14 @@ impl QuantumDecompressor {
         out: &mut Vec<u8>,
     ) -> io::Result<()> {
         let offset = offset as usize;
-        if offset > self.window.len() {
+        if offset > self.window_size {
             invalid_data!(
                 "Quantum match reaches {} bytes back, past the {}-byte window",
                 offset,
-                self.window.len()
+                self.window_size
             );
         }
-        if offset as u64 > self.produced {
+        if offset as u64 > self.window.position() {
             invalid_data!(
                 "Quantum match reaches {} bytes back, before the start of the folder",
                 offset
@@ -429,27 +427,15 @@ impl QuantumDecompressor {
             );
         }
 
-        let mut src = (self.window_posn + self.window.len() - offset) % self.window.len();
-        for _ in 0..length {
-            let byte = self.window[src];
-            src = (src + 1) % self.window.len();
-            self.emit_literal(byte, out);
-        }
+        self.window.emit_match(offset, length as usize, out);
         Ok(())
     }
 }
 
-fn bad_offset_slot() -> io::Error {
+fn bad_slot(what: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        "Quantum offset slot is outside the table",
-    )
-}
-
-fn bad_length_slot() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        "Quantum length slot is outside the table",
+        format!("Quantum {what} slot is outside the table"),
     )
 }
 
@@ -578,7 +564,7 @@ mod tests {
 
     #[test]
     fn bits_are_read_most_significant_first() {
-        let mut bits = BitReader::new(&[0b1011_0000, 0xFF]);
+        let mut bits = Bits::new(&[0b1011_0000, 0xFF]);
         assert_eq!(bits.bits(4).unwrap(), 0b1011);
         assert_eq!(bits.bits(0).unwrap(), 0, "asking for no bits reads nothing");
         assert_eq!(bits.bits(8).unwrap(), 0b0000_1111);
@@ -586,7 +572,7 @@ mod tests {
 
     #[test]
     fn a_spent_bitstream_refuses_rather_than_inventing_zeroes() {
-        let mut bits = BitReader::new(&[0x00]);
+        let mut bits = Bits::new(&[0x00]);
         assert!(bits.bits(8).is_ok());
         let err = bits.bit().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

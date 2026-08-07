@@ -68,7 +68,8 @@ fn mark_folder_quantum(cab: &tempfile::NamedTempFile, index: usize) {
     file.write_all(&QUANTUM_BITS.to_le_bytes()).unwrap();
 }
 
-/// Everything `read_entries` reported, as `(index, body)` pairs.
+/// Everything `read_entries` reported: the bodies that arrived, keyed by entry,
+/// and the entries it refused.
 ///
 /// Deliberately not a `Vec<u8>` per index: the point of several of these tests
 /// is *which* entry each body was attributed to, and a sink that only collected
@@ -77,9 +78,13 @@ fn mark_folder_quantum(cab: &tempfile::NamedTempFile, index: usize) {
 struct Collector {
     current: Option<usize>,
     got: Vec<(usize, Vec<u8>)>,
+    /// Entries whose `end` carried a failure. A refusal is a normal outcome of a
+    /// batch pass — one unreadable file must not end the walk — so it is
+    /// recorded rather than unwrapped.
+    failed: Vec<usize>,
     /// Indices to answer `Skip` for.
     skip: Vec<usize>,
-    /// Index after which to answer `Stop`.
+    /// Index to answer `Stop` for.
     stop_before: Option<usize>,
 }
 
@@ -103,7 +108,10 @@ impl EntrySink for Collector {
 
     fn end(&mut self, idx: usize, outcome: newtua_core::Result<()>) -> newtua_core::Result<bool> {
         assert_eq!(self.current, Some(idx), "end() came for a different entry");
-        outcome.unwrap();
+        if outcome.is_err() {
+            self.failed.push(idx);
+            self.got.retain(|(i, _)| *i != idx);
+        }
         Ok(true)
     }
 }
@@ -323,43 +331,16 @@ fn a_folder_whose_data_will_not_decode_fails_alone() {
     );
 
     // The batch pass reports that one refusal and keeps going.
-    let mut sink = Reporter::default();
+    let mut sink = Collector::default();
     ar.read_entries(&[0, 1, 2], &mut sink).unwrap();
     assert_eq!(
-        sink.bodies,
+        sink.got,
         vec![
             (0, b"this folder is MSZIP".to_vec()),
             (2, b"and this one is MSZIP again".to_vec()),
         ]
     );
     assert_eq!(sink.failed, vec![1]);
-}
-
-/// Like `Collector`, but records which entries failed instead of unwrapping.
-#[derive(Default)]
-struct Reporter {
-    bodies: Vec<(usize, Vec<u8>)>,
-    failed: Vec<usize>,
-}
-
-impl EntrySink for Reporter {
-    fn begin(&mut self, idx: usize) -> newtua_core::Result<SinkStep> {
-        self.bodies.push((idx, Vec::new()));
-        Ok(SinkStep::Body)
-    }
-
-    fn write_body(&mut self, buf: &[u8]) -> newtua_core::Result<()> {
-        self.bodies.last_mut().unwrap().1.extend_from_slice(buf);
-        Ok(())
-    }
-
-    fn end(&mut self, idx: usize, outcome: newtua_core::Result<()>) -> newtua_core::Result<bool> {
-        if outcome.is_err() {
-            self.failed.push(idx);
-            self.bodies.retain(|(i, _)| *i != idx);
-        }
-        Ok(true)
-    }
 }
 
 #[test]
@@ -434,6 +415,36 @@ fn a_name_in_a_legacy_codepage_survives() {
     let mut out = Vec::new();
     ar.read_entry(0, &mut out).unwrap();
     assert_eq!(out, b"body");
+}
+
+#[test]
+fn damage_in_a_later_block_is_reported_as_a_damaged_archive() {
+    // A CAB data block holds at most 32 768 uncompressed bytes, so this file
+    // spans two of them. Opening the folder decodes only the first; the second
+    // is decoded while the body is poured out.
+    let body: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    let cab = make_cab(&[("big.bin", &body)]);
+
+    // Corrupt the tail — that is the second block's compressed data, and the
+    // first block stays readable.
+    let mut bytes = std::fs::read(cab.path()).unwrap();
+    let tail = bytes.len() - 64;
+    for b in &mut bytes[tail..] {
+        *b ^= 0xFF;
+    }
+    std::fs::write(cab.path(), bytes).unwrap();
+
+    let src = Source::path(cab.path()).unwrap();
+    let mut ar = CabHandler.open(src, &OpenOptions::default()).unwrap();
+    let err = ar.read_entry(0, &mut Vec::new()).unwrap_err();
+
+    // `Error::Io` here would tell the person their disk is at fault for someone
+    // else's damaged archive. Until this was fixed the promise held only for
+    // one-block cabinets: the seek was classified, the body copy was not.
+    assert!(
+        matches!(&err, Error::Corrupt(_)),
+        "ожидали «архив повреждён», получили {err:?}"
+    );
 }
 
 // ── Quantum ──────────────────────────────────────────────────────────────────
