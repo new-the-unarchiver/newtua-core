@@ -15,7 +15,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::archive::{
-    ArchiveReader, Confidence, Entry, FormatHandler, FormatId, OpenOptions, Source,
+    ArchiveReader, Confidence, Entry, EntrySink, FormatHandler, FormatId, OpenOptions, SinkStep,
+    Source,
 };
 use crate::error::{Error, Result};
 use crate::format::CabHandler;
@@ -206,6 +207,91 @@ impl ArchiveReader for MsiReader {
         }
         let (cab_idx, inner_idx) = self.routing[idx];
         self.inner_readers[cab_idx].read_entry(inner_idx, out)
+    }
+
+    /// Hand each embedded cabinet its whole share of the request at once.
+    ///
+    /// Delegating `read_entry` and not this one would quietly undo the inner
+    /// handler's work: the default implementation is a loop over `read_entry`,
+    /// so a CAB reader that knows how to cross a folder once would be asked for
+    /// one entry at a time anyway, and a big installer would go back to costing
+    /// the square of its file count.
+    ///
+    /// The indices belong to two different numbering schemes, so the sink is
+    /// wrapped to translate the inner cabinet's index back into ours before the
+    /// orchestrator ever sees it.
+    fn read_entries(&mut self, indices: &[usize], sink: &mut dyn EntrySink) -> Result<()> {
+        let mut per_cab: Vec<Vec<(usize, usize)>> = vec![Vec::new(); self.inner_readers.len()];
+        for &idx in indices {
+            let &(cab_idx, inner_idx) = self.routing.get(idx).ok_or(Error::InvalidIndex(idx))?;
+            per_cab[cab_idx].push((inner_idx, idx));
+        }
+        for (cab_idx, mut pairs) in per_cab.into_iter().enumerate() {
+            if pairs.is_empty() {
+                continue;
+            }
+            // The batch contract promises ascending, duplicate-free indices, and
+            // the inner reader is entitled to the same promise.
+            pairs.sort_unstable();
+            let inner: Vec<usize> = pairs.iter().map(|&(inner_idx, _)| inner_idx).collect();
+            let mut relay = RoutedSink {
+                sink,
+                outer_of: pairs.iter().map(|&(_, outer)| outer).collect(),
+                inner_order: inner.clone(),
+                stopped: false,
+            };
+            self.inner_readers[cab_idx].read_entries(&inner, &mut relay)?;
+            if relay.stopped {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Passes an inner cabinet's callbacks out to the real sink, renumbering the
+/// entry as it goes.
+struct RoutedSink<'a> {
+    sink: &'a mut dyn EntrySink,
+    /// `outer_of[i]` is our index for `inner_order[i]`.
+    outer_of: Vec<usize>,
+    inner_order: Vec<usize>,
+    /// The real sink asked to stop, and the remaining cabinets must not be read.
+    stopped: bool,
+}
+
+impl RoutedSink<'_> {
+    /// `inner_order` is sorted, so this is a binary search rather than a scan —
+    /// it is called twice per entry, and an installer holds tens of thousands.
+    fn outer(&self, inner_idx: usize) -> Result<usize> {
+        self.inner_order
+            .binary_search(&inner_idx)
+            .map(|pos| self.outer_of[pos])
+            .map_err(|_| Error::InvalidIndex(inner_idx))
+    }
+}
+
+impl EntrySink for RoutedSink<'_> {
+    fn begin(&mut self, idx: usize) -> Result<SinkStep> {
+        let outer = self.outer(idx)?;
+        let step = self.sink.begin(outer)?;
+        if matches!(step, SinkStep::Stop) {
+            self.stopped = true;
+        }
+        Ok(step)
+    }
+
+    fn write_body(&mut self, buf: &[u8]) -> Result<()> {
+        self.sink.write_body(buf)
+    }
+
+    fn end(&mut self, idx: usize, outcome: Result<()>) -> Result<bool> {
+        let outer = self.outer(idx)?;
+        let carry_on = self.sink.end(outer, outcome)?;
+        if !carry_on {
+            self.stopped = true;
+        }
+        Ok(carry_on)
     }
 }
 

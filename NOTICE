@@ -13,6 +13,14 @@ ported from XADMaster (© Dag Ågren and contributors, GNU LGPL). Because the
 engine links those LGPL components, newtua-core is itself distributed under the
 LGPL.
 
+Vendored third-party code. The read half of the `cab` crate
+(https://github.com/mdsteele/rust-cab, © Matthew D. Steele, MIT) is carried
+inside this crate at src/vendor/cab/ rather than depended on, because the
+one-pass folder reading the engine needs exists upstream only on an unreleased
+branch, and a crate published to crates.io may not carry a git dependency. The
+MIT licence text travels with it (src/vendor/cab/LICENSE-MIT), and
+src/vendor/cab/VENDORED.md records the release it came from and every change.
+
 The engine also depends on four forced forks of third-party crates —
 newtua-unrar, newtua-apfs, newtua-hfsplus and newtua-cdfs — which retain the
 licenses of their respective upstream projects. Each fork's README explains why it exists

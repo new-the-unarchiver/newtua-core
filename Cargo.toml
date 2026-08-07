@@ -23,7 +23,13 @@ encoding_rs = "0.8"
 chardetng = "0.1"
 flate2 = "1"
 bzip2 = "0.5"
-cab = "0.6"
+# Windows cabinets (.cab, and the payload inside .msi). The `cab` crate is NOT a
+# dependency: its read half is vendored in src/vendor/cab/ — see the VENDORED.md
+# there for why (one-pass folder reading exists upstream on `master`, in no
+# release, and a git dependency cannot be published to crates.io). These two are
+# what that vendored code needs, and nothing else in the engine uses them.
+byteorder = "1"
+lzxd = "0.2.5"
 xz2 = "0.1"
 # zip 7 adds the PPMd method (feature "ppmd", backed by `ppmd-rust`); zip 2.x
 # didn't support it at all. `ppmd-rust` is already in the tree transitively via
@@ -151,6 +157,12 @@ tempfile = "3"
 # feature set) so the resolver only ever settles on one `zip` version for the
 # whole build.
 zip = { version = "7", features = ["lzma", "bzip2", "zstd", "deflate64", "xz", "ppmd", "legacy-zip"] }
+# Here and only here: the CAB fixtures in tests/ are built by upstream `cab`'s
+# writer, while the engine reads them with the vendored reader in
+# src/vendor/cab/. That split is deliberate — a fixture built by the same code
+# that reads it can only ever prove the code agrees with itself. Upstream's
+# writer is an independent implementation, and `gcab -c -z` is the other oracle
+# (see .claude/issues/18).
 cab = "0.6"
 flate2 = "1"
 sha2 = "0.10"
