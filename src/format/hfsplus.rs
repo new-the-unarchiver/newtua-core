@@ -378,18 +378,15 @@ impl ArchiveReader for HfsPlusReader {
         // Already decodes decmpfs (zlib/LZVN/LZFSE, inline or resource-fork)
         // transparently, and still never writes a misleading empty body: an
         // undecodable file fails instead.
+        // `InvalidData` is the crate's own way of saying the volume cannot
+        // produce this file, and its message already names what went wrong;
+        // anything else came from `out` and is a plain I/O failure (a full disk,
+        // a vanished directory). `extract.rs` removes the unfinished file either
+        // way, and it reports the entry's path beside the message, so the CNID
+        // adds nothing a person can use.
         self.catalog
             .read_file_into(&*self.source, cnid, out)
-            .map_err(|e| match e.kind() {
-                // `InvalidData` is the crate's own way of saying the volume
-                // cannot produce this file; anything else came from `out` and
-                // is a plain I/O failure (a full disk, a vanished directory).
-                // `extract.rs` removes the unfinished file either way.
-                std::io::ErrorKind::InvalidData => {
-                    Error::Corrupt(format!("hfsplus: failed to read/decode cnid {cnid}: {e}"))
-                }
-                _ => Error::Io(e),
-            })
+            .map_err(crate::error::io_err_to_corrupt)
     }
 
     /// Same walk as the default, with one thing said out loud first.

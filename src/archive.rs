@@ -320,6 +320,14 @@ impl Write for SinkWriter<'_> {
 pub trait ArchiveReader {
     fn format(&self) -> FormatId;
     fn entries(&mut self) -> Result<&[Entry]>;
+    /// Write entry `idx`'s body to `out`.
+    ///
+    /// `out` should not report [`std::io::ErrorKind::InvalidData`]: handlers
+    /// read that kind as "the archive says something impossible" and turn it
+    /// into [`Error::Corrupt`], so a sink that borrows the kind for its own
+    /// validation gets its complaint reported as a damaged archive. Every sink
+    /// in this crate obeys that — `SinkWriter` returns `io::Error::other` — but
+    /// the trait is public, so it is written down rather than assumed.
     fn read_entry(&mut self, idx: usize, out: &mut dyn Write) -> Result<()>;
 
     /// Прочитать несколько записей за один проход по архиву.
