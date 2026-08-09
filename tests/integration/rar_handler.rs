@@ -44,10 +44,9 @@ fn rar_populates_mode_when_available() {
         .iter()
         .find(|e| e.path == Path::new("f.txt"))
         .expect("f.txt not found in meta.rar");
-    // The unrar crate exposes file_attr: u32 on FileHeader.
-    // For Unix-created RARs, file_attr is the full POSIX st_mode (e.g. 0o100755).
-    // We detect Unix attributes by checking the file-type nibble (S_IFREG/S_IFDIR/S_IFLNK),
-    // then mask with 0o7777 to get permission bits only.
+    // На архиве, собранном на Unix, поле атрибутов несёт полный `st_mode`
+    // (здесь 0o100755). Отличаем это от флагов FAT/NTFS по тетраде типа файла
+    // и оставляем только права — `unix_mode` в `format/rar.rs`.
     assert_eq!(f.mode, Some(0o755));
 }
 
@@ -326,8 +325,9 @@ const MV_P1: &[u8] = include_bytes!("../fixtures/mvmulti.part1.rar");
 const MV_P2: &[u8] = include_bytes!("../fixtures/mvmulti.part2.rar");
 const MV_P3: &[u8] = include_bytes!("../fixtures/mvmulti.part3.rar");
 
-/// Разложить три тома рядом друг с другом и открыть первый: libunrar ищет
-/// продолжение по соседним именам, поэтому лежать они обязаны вместе.
+/// Разложить три тома рядом друг с другом и открыть первый: продолжение
+/// набора ищется по соседним именам (`sibling_volumes`), поэтому лежать они
+/// обязаны вместе.
 fn open_multivolume() -> (tempfile::TempDir, Box<dyn ArchiveReader>) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("mvmulti.part1.rar"), MV_P1).unwrap();
@@ -352,9 +352,10 @@ fn blob(seed: u32, n: usize) -> Vec<u8> {
 
 /// Многотомный набор из нескольких файлов проходится за один обход.
 ///
-/// Один длинный проход пересекает границы томов чаще, чем прежние короткие,
-/// а именно на них `newtua-unrar` и держит свои заплатки: без них здесь был
-/// `SIGABRT`.
+/// Тела здесь режутся границами томов не по одному разу, и склеивает их обход
+/// набора. Пока RAR читался через libunrar, на этих же границах её обратный
+/// вызов ронял процесс по `SIGABRT`, и форк существовал ради трёх заплаток от
+/// этого; своего кода та беда не касается, но проверка остаётся.
 #[test]
 fn a_multivolume_set_of_several_files_is_read_in_one_pass() {
     let (_dir, mut ar) = open_multivolume();

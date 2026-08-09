@@ -263,14 +263,14 @@ const RAR_PART3: &[u8] = include_bytes!("../fixtures/mv.part3.rar");
 const EXPECTED_CONTENT: &[u8] = include_bytes!("../fixtures/mv_content.txt");
 
 /// Listing a native multi-volume RAR must succeed and return the correct entry
-/// metadata.  The unrar 0.5.8 library is able to list without crossing volume
-/// boundaries, so this should not crash.
+/// metadata: one entry, not one per fragment. The file is split across all
+/// three volumes, and a continuation is not an entry of its own.
 #[test]
 fn rar_native_multivolume_listing_works() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Write all three volumes into the same temp dir so the unrar library
-    // can locate siblings when it scans next to the first volume path.
+    // Write all three volumes into the same temp dir: the set is found by
+    // sibling names next to the first volume (`sibling_volumes`).
     std::fs::write(dir.path().join("mv.part1.rar"), RAR_PART1).unwrap();
     std::fs::write(dir.path().join("mv.part2.rar"), RAR_PART2).unwrap();
     std::fs::write(dir.path().join("mv.part3.rar"), RAR_PART3).unwrap();
@@ -295,13 +295,11 @@ fn rar_native_multivolume_listing_works() {
 /// Extraction from a native multi-volume RAR must succeed and yield bytes
 /// that exactly match the original content file.
 ///
-/// Implementation note: the in-memory `read()` path used to SIGABRT here when
-/// the payload crossed a volume boundary, and the handler had to detour through
-/// `extract_to(temp_file)` on disk. The cause — a null pointer dereferenced in
-/// the `UCM_PROCESSDATA` callback — is patched in `newtua-unrar`, so the detour
-/// is gone and this test now guards the plain path. All volume parts must exist
-/// in the same directory as part1 so that libunrar can locate them
-/// automatically.
+/// Implementation note: this test has outlived two RAR back ends. Under
+/// libunrar the in-memory path used to SIGABRT exactly here, on the volume
+/// boundary, and the handler detoured through a temp file on disk; the fork
+/// that patched it is gone with ticket 26. The engine now joins the fragments
+/// itself. All volume parts must exist in the same directory as part1.
 #[test]
 fn rar_native_multivolume_extraction_works() {
     let dir = tempfile::tempdir().unwrap();
