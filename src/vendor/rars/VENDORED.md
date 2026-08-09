@@ -177,8 +177,12 @@ meaningless with values picked out of them), `ArchiveSource::Memory` (the
 engine always has a file), and `Archive::sfx_offset` in the three families
 (filled by the parser, unread — SFX is `format/sfx.rs`'s business here).
 
-**Cost, measured:** `cargo check --lib` 1.94 s → 1.49 s; published package
-456 KiB → 391 KiB compressed.
+**Cost, measured** — two runs each way, back to back, `touch src/lib.rs`
+before every one: `cargo check --lib` **1.38 s → 1.17 s**, published package
+456 KiB → 391 KiB compressed. Worth saying plainly: the ticket expected more.
+Its figure ("0.98 s → 1.94 s") compared the tree *before* `rars` was vendored
+at all against the tree with it; against the same tree with the encoder still
+in, the saving is about a sixth of the type-check, not a half.
 
 ### What the cut cost in tests, and what replaced it
 
