@@ -260,14 +260,7 @@ const MALFORMED_OOM_FIXTURE: &[u8] = include_bytes!("../fixtures/malformed_oom.7
 // содержимое привет.txt, и всё это БЕЗ ошибки.
 const NO_STREAM_FIXTURE: &[u8] = include_bytes!("../fixtures/no_stream_entries.7z");
 
-/// sha256 в виде строки — сверяем содержимое, а не только имена и количество:
-/// проверка «записей столько, ошибок нет» этот дефект и пропустила в релиз.
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(data);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-}
+use crate::common::sha256_hex;
 
 // Путь внутри архива, размер, sha256 содержимого.
 const NO_STREAM_EXPECTED: &[(&str, usize, &str)] = &[

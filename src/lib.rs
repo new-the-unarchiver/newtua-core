@@ -24,6 +24,12 @@ mod datetime;
 ///
 /// See `src/vendor/<name>/VENDORED.md` for what each one is, why it is not a
 /// dependency, and how to compare it against its upstream.
+///
+/// The `unsafe` ban sits here rather than on any one module: neither vendored
+/// reader has a line of it today, and a rule that holds for the whole shelf
+/// keeps holding for whatever lands on it next. The crate as a whole cannot
+/// carry the ban — `datetime.rs` and `format/hfsplus.rs` need it.
+#[forbid(unsafe_code)]
 mod vendor;
 
 pub mod format;

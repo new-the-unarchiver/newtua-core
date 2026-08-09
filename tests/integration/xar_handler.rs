@@ -244,11 +244,7 @@ fn base64_name_fixture() -> &'static Path {
     ))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
-}
+use crate::common::sha256_hex;
 
 /// The fixture's four members: path, byte count, sha256 of the content.
 const BASE64_FIXTURE_MEMBERS: [(&str, usize, &str); 4] = [

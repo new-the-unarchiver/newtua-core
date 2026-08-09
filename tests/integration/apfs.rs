@@ -147,16 +147,8 @@ fn apfs_bare_decmpfs_file_reads_full_content() {
     // SHA-256 over the transparently-decompressed bytes, matching the
     // ground truth in `crates/apfs-core/tests/data/README.md` (macOS
     // `shasum -a 256` over the same file, post-decmpfs).
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let digest: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
     assert_eq!(
-        digest,
+        crate::common::sha256_hex(&body),
         "3f58a41850c1096de883ada14c98c2375a85b473c80ccbef03c9e72c113abc78"
     );
 }

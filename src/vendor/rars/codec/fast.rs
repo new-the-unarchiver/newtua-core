@@ -3,9 +3,12 @@
 //! Апстрим держит здесь две реализации каждой — векторную под флагом `fast` и
 //! обычную. Векторная требует ночной сборки Rust (`portable_simd`), а нас
 //! собирают на стабильной, поэтому здесь остались только обычные, а вместе с
-//! ними ушли `cfg` и `*_impl`-прослойки, которые между ними выбирали.
-//! Поведение то же самое: векторная ветка апстрима сверяется с этой его же
-//! тестом.
+//! ними ушли `cfg` и `*_impl`-прослойки, которые между ними выбирали. Терять
+//! было нечего: на стабильном компиляторе векторная ветка не собралась бы.
+//!
+//! Тесты апстрима вместе с ней потеряли смысл: они сверяли векторную ветку со
+//! скалярной, а без первой сверяли бы вторую сама с собой. Здесь вместо них
+//! проверяется то, что решают сами эти функции, — границы.
 
 pub(crate) fn match_length(input: &[u8], pos: usize, distance: usize, max_length: usize) -> usize {
     if distance == 0 || distance > pos {
@@ -41,69 +44,64 @@ pub(crate) fn next_x86_opcode(
 mod tests {
     use super::*;
 
-    fn reference_match_length(
-        input: &[u8],
-        pos: usize,
-        distance: usize,
-        max_length: usize,
-    ) -> usize {
-        let mut length = 0usize;
-        while length < max_length && input[pos + length] == input[pos + length - distance] {
-            length += 1;
-        }
-        length
+    #[test]
+    fn match_length_counts_until_the_first_difference() {
+        // «abcabcabX»: от позиции 3 с расстоянием 3 совпадают ровно пять байт,
+        // шестой (X против c) расходится.
+        let input = b"abcabcabX";
+
+        assert_eq!(match_length(input, 3, 3, 32), 5);
     }
 
     #[test]
-    fn match_length_matches_scalar_around_lane_boundaries() {
-        let mut input = Vec::new();
-        input.extend((0..192).map(|index| (index % 251) as u8));
-        input.extend_from_within(64..192);
+    fn match_length_refuses_a_distance_that_reaches_before_the_start() {
+        let input = b"abcabcabc";
 
-        for distance in 1..=64 {
-            let pos = 192usize;
-            let max = (input.len() - pos).min(96);
-            let expected = reference_match_length(&input, pos, distance, max);
-            assert_eq!(match_length(&input, pos, distance, max), expected);
-        }
+        assert_eq!(match_length(input, 3, 0, 8), 0, "нулевое расстояние");
+        assert_eq!(match_length(input, 3, 4, 8), 0, "ссылка левее начала");
+        assert_eq!(match_length(input, 0, 1, 8), 0, "от самого начала");
     }
 
     #[test]
-    fn match_length_stops_at_first_mismatch_in_vector_tail() {
-        let mut input = b"abcdefghijklmnopqrstuvwxyz012345".repeat(4);
-        let pos = 64;
-        input[pos + 37] ^= 0x55;
+    fn match_length_stops_at_the_end_of_the_buffer() {
+        // Просят двадцать байт, а за позицией их всего шесть: длина обязана
+        // обрезаться буфером, а не выйти за него.
+        let input = b"abcabcabc";
 
-        assert_eq!(
-            match_length(&input, pos, 32, 64),
-            reference_match_length(&input, pos, 32, 64)
-        );
+        assert_eq!(match_length(input, 3, 3, 20), 6);
     }
 
     #[test]
-    fn x86_opcode_scan_matches_scalar_for_e8_and_e8e9() {
+    fn x86_opcode_scan_resumes_and_respects_the_end() {
+        // Только 0xe8 (маска 0xff) и 0xe8 вместе с 0xe9 (маска 0xfe). Ожидания
+        // записаны числами, а не тем же условием, что и в самой функции.
         let mut data = vec![0x41u8; 96];
         for pos in [0, 31, 32, 33, 63, 64, 91] {
             data[pos] = 0xe8;
         }
         data[47] = 0xe9;
 
-        for &include_e9 in &[false, true] {
-            let cmp_mask = if include_e9 { 0xfe } else { 0xff };
-            let mut pos = 0usize;
+        let scan = |cmp_mask: u8, limit: usize| {
             let mut found = Vec::new();
-            while let Some(next) = next_x86_opcode(&data, pos, data.len() - 4, cmp_mask) {
+            let mut pos = 0usize;
+            while let Some(next) = next_x86_opcode(&data, pos, limit, cmp_mask) {
                 found.push(next);
                 pos = next + 1;
             }
+            found
+        };
 
-            let expected: Vec<_> = data
-                .iter()
-                .take(data.len() - 4)
-                .enumerate()
-                .filter_map(|(pos, &byte)| (byte & cmp_mask == 0xe8).then_some(pos))
-                .collect();
-            assert_eq!(found, expected);
-        }
+        assert_eq!(scan(0xff, 92), vec![0, 31, 32, 33, 63, 64, 91]);
+        assert_eq!(scan(0xfe, 92), vec![0, 31, 32, 33, 47, 63, 64, 91]);
+        // Граница исключающая: с limit = 91 последний байт уже не виден.
+        assert_eq!(scan(0xff, 91), vec![0, 31, 32, 33, 63, 64]);
+    }
+
+    #[test]
+    fn x86_opcode_scan_finds_nothing_in_an_empty_range() {
+        let data = vec![0xe8u8; 8];
+
+        assert_eq!(next_x86_opcode(&data, 4, 4, 0xff), None);
+        assert_eq!(next_x86_opcode(&data, 9, 16, 0xff), None);
     }
 }

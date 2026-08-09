@@ -103,16 +103,7 @@ const SPLIT_ZIP: &[u8] = include_bytes!("../fixtures/split.zip");
 const SPLIT64_Z01: &[u8] = include_bytes!("../fixtures/split64.z01");
 const SPLIT64_ZIP: &[u8] = include_bytes!("../fixtures/split64.zip");
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
+use crate::common::sha256_hex;
 
 /// Read the entry named `name` and return its bytes.
 fn body_of(ar: &mut dyn newtua_core::ArchiveReader, name: &str) -> Vec<u8> {

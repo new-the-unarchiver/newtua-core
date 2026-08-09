@@ -28,9 +28,9 @@ the LGPL. The Quantum method itself was created by David Stafford and adapted
 by Microsoft; the public description of it is Matthew Russotto's.
 
 The read half of the `rars` crate (https://github.com/bitplane/rars, © Gareth
-Davidson) is carried at src/vendor/rars/ for the same reason: the engine keeps
-its own changes to it and does not follow its weekly releases. Note a
-discrepancy that is upstream's own — release 0.4.8 declares "MIT OR Apache-2.0"
+Davidson) is carried at src/vendor/rars/ for a different reason: that release is
+published and installable, but the engine keeps changes of its own to it and
+does not follow its weekly releases. Note a discrepancy that is upstream's own — release 0.4.8 declares "MIT OR Apache-2.0"
 in Cargo.toml while the only license file in that repository is COPYING (WTFPL
 with an added "don't blame me" clause), and no MIT or Apache text ships with it.
 Both readings permit this use; the text that actually travelled with the code is
@@ -43,7 +43,9 @@ licenses of their respective upstream projects. Each fork's README explains why 
 and states the license it carries.
 
 RAR support and the UnRAR license. RAR archives are read through libunrar, by
-way of the newtua-unrar fork. The UnRAR sources are not part of this
+way of the newtua-unrar fork. That is still the shipping path: the vendored
+`rars` reader described above is in the tree but not yet wired to the RAR
+handler, so everything in this section applies unchanged until it is. The UnRAR sources are not part of this
 repository: Cargo fetches them (as unrar_sys) at build time. They carry a
 license of their own (© Alexander Roshal) that permits use in any software
 handling RAR archives, but forbids using the code to build a RAR-compatible

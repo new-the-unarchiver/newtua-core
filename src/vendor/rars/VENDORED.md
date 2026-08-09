@@ -76,6 +76,14 @@ repair one. Roughly ten thousand lines went before anything else was touched:
 
   Numbers, method and the four A/B failures that were rolled back and must not
   be retried: `.claude/perf/RARS-REPORT-2026-08-08.md`.
+
+  **Where they are, so "what here is ours" has an answer inside the package.**
+  All five sit in `codec/rar50.rs` except the CRC one: (1) and (4) are
+  `Unpack50Decoder::copy_match` and the position-tracked output buffer around
+  it; (3) is `HuffmanTable::decode` plus the wide `read_bits`; (5) is the fast
+  path in the bit reader that skips availability checks. (2) is `crc32/mod.rs`,
+  now a thin call into `crc32fast`. The `#[allow(clippy::…)]` on `copy_match`
+  and the scalar-only `codec/fast.rs` are ours too.
 - **Module paths are `crate::vendor::rars::` instead of `crate::`**, and the
   crate root became `mod.rs`. Noise in a diff against upstream; unavoidable.
 - **Edition 2024, not 2021.** One pattern needed adjusting for the stricter
