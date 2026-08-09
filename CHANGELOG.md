@@ -91,6 +91,24 @@ handed the files to you with today's date and default permissions.
   encrypted entry in these formats was not flagged, so the "fail before writing
   anything" guarantee silently did not apply to them.
 
+### RAR is read in pure Rust
+
+- **libunrar is gone.** RAR used to be decoded by a megabyte and a half of C++
+  compiled into every build, behind a fork of our own and a licence that fits
+  nothing else here. RAR 1.3 through RAR 7 are now decoded by Rust carried in
+  this crate. Nothing about what opens changes — the same archives, the same
+  bytes, checked file by file against `unar` on single-volume, multi-volume,
+  solid and password-protected samples — but the build no longer compiles C++,
+  and the UnRAR licence no longer applies to anything shipped.
+- **The date of a RAR 5 entry is now exact.** It used to be read from a field
+  with two-second resolution, so a file packed on an odd second showed up a
+  second early; the exact instant was in the archive all along and unreachable
+  through the old binding.
+- **Extracting a few files from a large RAR no longer reads the whole archive**
+  unless it has to. A solid archive still does — there the entries share one
+  compression window and there is no way around it — but an ordinary archive
+  now decompresses only what was asked for.
+
 ### Other
 
 - MSRV is **1.93**, measured rather than declared — `sevenz-rust2` 0.21 sets the

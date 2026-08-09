@@ -30,6 +30,10 @@ same crate; a pull request from here would not apply. We opened one PR upstream
 (`bitplane/rars` #30, the `copy_match` change) and told the author the rest is
 his to take from our tree if he wants it. We track nothing.
 
+**Wired to `RarHandler` on 2026-08-10** (ticket 26). Before that the module
+compiled but nothing called it; now it is the only way this engine reads RAR,
+and `newtua-unrar` is out of `Cargo.toml`.
+
 ## What was cut
 
 The engine reads and lists; it never writes an archive and never promises to
@@ -88,13 +92,40 @@ repair one. Roughly ten thousand lines went before anything else was touched:
   crate root became `mod.rs`. Noise in a diff against upstream; unavoidable.
 - **Edition 2024, not 2021.** One pattern needed adjusting for the stricter
   match ergonomics (`codec/huffman.rs`, `assign_flat_complete_code`).
-- **`dead_code`/`unused_imports` are allowed on the module declaration** until
-  ticket 26 switches `RarHandler` over. Both come off with that ticket.
+
+### Three fixes of ours, made when the handler was wired (ticket 26)
+
+Each is marked `NEWTUA:` in the source, so `grep -rn NEWTUA src/vendor/rars`
+answers "what here is not upstream's" without reading this file.
+
+1. **`rar50.rs` — the `FHEXTRA_HTIME` record is parsed.** Upstream reads the
+   modification time only from the `FHFL_MTIME` field of the file header.
+   Modern `rar` (checked on 7.22) does not set that flag at all and stores the
+   time only in the extra record, as a Windows `FILETIME`. Without this,
+   **every RAR 5 archive made in recent years lists with no timestamps at
+   all** — which is how the gap was found: an existing test went from a date
+   to `None`. We read the modification time out of it (whole seconds, Unix
+   epoch); creation and access times sit in the same record and wait for
+   ticket 15.
+2. **`rar15_40.rs` — `FileHeader::write_to` handles a stored member.** It went
+   straight to picking a codec by `unp_ver`, which for an uncompressed member
+   is the same value as for a compressed one, so a `-m0` entry was "unpacked"
+   as if it were packed. Upstream never noticed because its own whole-archive
+   walk makes that branch itself and never calls `write_to`; our fast path for
+   non-solid archives does call it.
+3. **Two decryption tests rewritten to decrypt** (`crypto/rar13.rs`,
+   `crypto/rar20.rs`). They used to encrypt a phrase, compare against a pinned
+   byte string and decrypt it back. The encryptor left with the writer; the
+   pinned bytes stayed, and the test now only decrypts them — which is a
+   better test than it was, since the input is no longer produced by the code
+   under test.
 
 ## Tests
 
 **Every unit test inside `src/` came along** — codecs, crypto, headers, CRC,
-BLAKE2sp, detection — and they run in our suite. What was dropped:
+BLAKE2sp, detection — and they run in our suite. A second wave went with the
+encoder in ticket 26; that ledger is in "The encoder inside `codec/`" below.
+What was dropped in the first pass:
 
 - **Tests that needed the writer to build their fixture.** 206 functions, cut
   mechanically: a test whose archive is produced by the code under test can only
@@ -111,31 +142,65 @@ BLAKE2sp, detection — and they run in our suite. What was dropped:
   141-row reference corpus, and byte-for-byte comparison with `unar` — see
   ticket 27.
 
-## What is still here and should not be — the encoder inside `codec/`
+## The encoder inside `codec/` — cut on 2026-08-10
 
-The writers went as whole files. **The compression side inside `codec/` did
-not**: `rar13.rs`, `rar20.rs`, `rar29.rs`, `rar50.rs` and `ppmd.rs` each hold a
-decoder and an encoder in one file, sharing tables and state. Roughly ten
-thousand lines of that are unreachable from reading and are carried dead, under
-`#[allow(dead_code)]` on the module declaration in `src/vendor/mod.rs`.
+The writers went as whole files in the first pass, but **the compression side
+inside `codec/` did not**: `rar13.rs`, `rar20.rs`, `rar29.rs`, `rar50.rs` and
+`ppmd.rs` each hold a decoder and an encoder in one file, sharing tables and
+state. It was carried dead under `#[allow(dead_code)]` until the handler was
+wired, because the reliable judge is the compiler and there was no call graph
+to judge with — cutting by function names and brace counting had been tried and
+had broken the file three times.
 
-**Why it was not cut now, and this is a decision rather than an oversight.**
-The reliable judge is the compiler: whatever the handler cannot reach is dead.
-But the handler is not switched over until ticket 26, so at this point nothing
-reaches into this module at all and *everything* reads as dead — the compiler
-cannot tell the encoder from our own reading. The alternative, cutting by
-function names and brace counting, was tried and failed three times: brace
-counting does not know a `{` inside a string literal, and it took out the
-codecs' whole `Error` type and a live `impl Read` before it was noticed. On
-someone else's decoder that is how a defect gets planted that no test names.
+With `RarHandler` on this code the call graph exists, and the cut was made by
+it: **13 400 lines gone, 30 655 → 17 241**. How, in case it has to be repeated:
 
-**So it moves to ticket 26**, where a real call graph exists, and where the
-guards that would catch a bad cut — the 141-row corpus and byte-for-byte
-comparison against `unar` — are running anyway.
+1. `cargo check --lib --message-format json` names every dead item and gives
+   its byte offset. **The offsets, not the names** — a name like `match_hash`
+   or `BitWriter` exists in four codec files at once, and matching by name
+   across files cut live code in the first attempt.
+2. A throwaway tool parses the file with `syn` and deletes the *item* that
+   contains the offset. Real boundaries from a real parser; the ban on brace
+   counting stands.
+3. The cut is **one pass over all files at once**. Dead code refers to dead
+   code across file boundaries, so cutting file by file leaves dangling
+   references (the second attempt, rolled back).
+4. What breaks afterwards is the test side, and the compiler names it: every
+   error span points at a test that only existed to exercise the encoder, and
+   the same tool deletes the item at that span. Repeat until it builds.
+5. Warnings pointing *inside* a type — an enum variant, a struct field — are
+   skipped by the tool and handled by hand. There are seven of them.
 
-The cost of waiting is small and measured: the published package is 456 KiB
-compressed (1.9 MiB unpacked) against a 10 MiB limit, and dead code is
-unreachable from any input, so it widens no attack surface.
+**No blanket allowance is left.** Four narrow ones remain, each with its reason
+in the source: `ArchiveVersion` and the `Error` enum (taxonomies of the format,
+meaningless with values picked out of them), `ArchiveSource::Memory` (the
+engine always has a file), and `Archive::sfx_offset` in the three families
+(filled by the parser, unread — SFX is `format/sfx.rs`'s business here).
+
+**Cost, measured:** `cargo check --lib` 1.94 s → 1.49 s; published package
+456 KiB → 391 KiB compressed.
+
+### What the cut cost in tests, and what replaced it
+
+**204 unit tests went** — every one of them a test that could not compile
+without the encoder, because it built its input by encoding. That is the same
+class, and the same reason, as the 206 dropped in the first pass: a test whose
+fixture is produced by the code under test can only prove the code agrees with
+itself.
+
+What each decoder is guarded by now, so this is not taken on trust:
+
+| Decoder | Guard |
+| --- | --- |
+| RAR 5 (`rar50`) | 11 unit tests (tables, slots, window bounds) + the corpus rows and our own RAR 5 fixtures |
+| RAR 2.9 (`rar29`) | 7 unit tests, including a pinned packed member decoded through the live streaming path |
+| RAR 2.0 (`rar20`) | 2 unit tests, one of them the same pinned-member decode |
+| PPMd | 18 unit tests — allocator and range decoder, all robustness |
+| RARVM | 21 unit tests |
+| RAR 1.5 (`rar13`, `Unpack15`) | **had nothing left**, so a real archive was added: `tests/fixtures/rar15.rar` (`RUN.RAR` from sembiance/file-format-samples, method 51, version 15), extracted and compared file by file against what `unar` gets from it |
+
+The RAR 1.5 case is the honest ledger of this cut: the test that went was
+self-judged, the one that replaced it is judged by `unar`.
 
 ## Licence
 

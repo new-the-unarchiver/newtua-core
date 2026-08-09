@@ -21,27 +21,6 @@ impl Rar13Cipher {
         Self { key }
     }
 
-    pub fn new_comment() -> Self {
-        Self { key: [0, 7, 77] }
-    }
-
-    pub fn encrypt_in_place(mut self, data: &mut [u8]) {
-        for byte in data {
-            *byte = self.encrypt_byte(*byte);
-        }
-    }
-
-    pub fn decrypt_in_place(mut self, data: &mut [u8]) {
-        for byte in data {
-            *byte = self.decrypt_byte(*byte);
-        }
-    }
-
-    pub fn encrypt_byte(&mut self, byte: u8) -> u8 {
-        self.advance();
-        byte.wrapping_add(self.key[0])
-    }
-
     pub fn decrypt_byte(&mut self, byte: u8) -> u8 {
         self.advance();
         byte.wrapping_sub(self.key[0])
@@ -71,20 +50,24 @@ impl<R: std::io::Read> std::io::Read for Rar13DecryptReader<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::Rar13Cipher;
+    use super::{Rar13Cipher, Rar13DecryptReader};
+    use std::io::Read;
 
+    /// NEWTUA: расшифровка RAR 1.3 сходится с закреплённым потоком байт.
+    ///
+    /// Числа — из теста апстрима, где их получали шифрованием того же текста
+    /// тут же, рядом. Шифратор ушёл вместе с писательской половиной, а числа
+    /// остались, и так даже лучше: проверяется вход извне, а не то, что наш
+    /// код согласен сам с собой.
     #[test]
-    fn rar13_cipher_matches_pinned_stream_vector() {
-        let mut data = *b"hello world";
-        Rar13Cipher::new(b"password").encrypt_in_place(&mut data);
-        assert_eq!(
-            data,
-            [
-                0x37, 0xcd, 0xaa, 0xbd, 0x10, 0x4e, 0x6f, 0x6e, 0xb5, 0x30, 0xe6
-            ]
-        );
-
-        Rar13Cipher::new(b"password").decrypt_in_place(&mut data);
-        assert_eq!(&data, b"hello world");
+    fn rar13_cipher_decrypts_a_pinned_stream() {
+        const PINNED: [u8; 11] = [
+            0x37, 0xcd, 0xaa, 0xbd, 0x10, 0x4e, 0x6f, 0x6e, 0xb5, 0x30, 0xe6,
+        ];
+        let mut out = Vec::new();
+        Rar13DecryptReader::new(&PINNED[..], Rar13Cipher::new(b"password"))
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, b"hello world");
     }
 }

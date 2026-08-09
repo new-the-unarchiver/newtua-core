@@ -16,10 +16,4 @@
 //! records the release it came from, what was cut, and every deliberate change.
 
 pub(crate) mod cab;
-// Пока `RarHandler` не переключён на этот код (тикет 26), в модуль не ведёт ни
-// один вызов, и мёртвым для компилятора выглядит всё — включая чтение. Оба
-// разрешения снимает тикет 26: там появляется живое дерево вызовов, и по нему
-// дорезается чужой кодировщик, оставшийся внутри `codec/` (см. VENDORED.md,
-// «Что осталось на этап Б»).
-#[allow(dead_code, unused_imports)]
 pub(crate) mod rars;

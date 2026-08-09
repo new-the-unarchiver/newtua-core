@@ -188,17 +188,6 @@ impl FileHeader {
         session.write_file_to(archive, self, out)
     }
 
-    pub(crate) fn decoded_data_unverified(
-        &self,
-        archive: &Archive,
-        password: Option<&[u8]>,
-    ) -> Result<Vec<u8>> {
-        let mut decoder = Unpack50Decoder::new();
-        Ok(self
-            .decoded_data_with_decoder(archive, &mut decoder, password)?
-            .data)
-    }
-
     fn decoded_data_with_decoder(
         &self,
         archive: &Archive,
@@ -435,67 +424,6 @@ fn write_repeated_chunk(
     Ok(())
 }
 
-impl Archive {
-    pub fn extract_to<F>(
-        &self,
-        options: crate::vendor::rars::ArchiveReadOptions<'_>,
-        mut open: F,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
-        self.extract_to_impl(options, &mut open, &mut |_, _| Ok(()), false)
-    }
-
-    pub fn extract_to_with_redirections<F, R>(
-        &self,
-        options: crate::vendor::rars::ArchiveReadOptions<'_>,
-        mut open: F,
-        mut redirect: R,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
-    {
-        self.extract_to_impl(options, &mut open, &mut redirect, true)
-    }
-
-    fn extract_to_impl<F, R>(
-        &self,
-        options: crate::vendor::rars::ArchiveReadOptions<'_>,
-        open: &mut F,
-        redirect: &mut R,
-        emit_redirections: bool,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
-    {
-        let buffered_decode_limit = rar50_buffered_decode_limit(options);
-        let mut session =
-            DecoderSession::new_with_password(options.password, buffered_decode_limit);
-        for file in self.files() {
-            if let Some(redirection) = &file.redirection {
-                if emit_redirections {
-                    redirect(&file.metadata(), redirection)?;
-                }
-                continue;
-            }
-            if file.is_split_before() || file.is_split_after() {
-                return Err(Error::InvalidHeader(
-                    "RAR 5 split entry requires multivolume extraction",
-                ));
-            }
-            let meta = file.metadata();
-            let mut writer = open(&meta)?;
-            if !meta.is_directory {
-                session.write_file_to(self, file, &mut writer)?;
-            }
-        }
-        Ok(())
-    }
-}
-
 struct DecodedData {
     data: Vec<u8>,
     keys: Option<Rar50Keys>,
@@ -611,18 +539,6 @@ fn rar50_buffered_decode_limit(options: crate::vendor::rars::ArchiveReadOptions<
     options
         .rar50_buffered_decode_limit
         .unwrap_or(BUFFERED_DECODE_LIMIT)
-}
-
-/// Streams a RAR 5 multivolume archive set to caller-provided writers.
-pub fn extract_volumes_to<F>(
-    volumes: &[Archive],
-    options: crate::vendor::rars::ArchiveReadOptions<'_>,
-    mut open: F,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
-    extract_volumes_to_impl(volumes, options, &mut open, &mut |_, _| Ok(()), false)
 }
 
 pub fn extract_volumes_to_with_redirections<F, R>(
@@ -1083,9 +999,9 @@ mod tests {
         HFL_SPLIT_BEFORE, MainHeader,
     };
     use super::*;
-    use std::cell::RefCell;
+
     use std::io::Cursor;
-    use std::rc::Rc;
+
     use std::sync::Arc;
 
     fn plain_file(name: &[u8], data: &[u8], hash: Option<FileHash>) -> FileHeader {
@@ -1106,66 +1022,6 @@ mod tests {
             encryption: None,
             crypto: None,
         }
-    }
-
-    #[test]
-    fn decrypting_reader_streams_rar50_blocks() {
-        let key = [3u8; 32];
-        let iv = [4u8; 16];
-        let plain = *b"0123456789abcdefRAR5 block two!!";
-        let mut encrypted = plain;
-        Rar50Cipher::new(key, iv)
-            .encrypt_in_place(&mut encrypted)
-            .unwrap();
-        let mut reader = Rar50DecryptingReader::new(Cursor::new(encrypted), key, iv);
-        let mut out = Vec::new();
-        let mut buf = [0u8; 5];
-
-        loop {
-            let count = reader.read(&mut buf).unwrap();
-            if count == 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..count]);
-        }
-
-        assert_eq!(out, plain);
-    }
-
-    #[test]
-    fn stored_split_entries_stream_fragments_to_writer() {
-        struct SharedWriter(Rc<RefCell<Vec<u8>>>);
-
-        impl Write for SharedWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.borrow_mut().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let first = b"stored ";
-        let second = b"split payload";
-        let full = [first.as_slice(), second.as_slice()].concat();
-        let expected_crc = crc32(&full);
-        let volumes = vec![
-            stored_split_archive(first, &full, expected_crc, HFL_SPLIT_AFTER),
-            stored_split_archive(second, &full, expected_crc, HFL_SPLIT_BEFORE),
-        ];
-        let captured = Rc::new(RefCell::new(Vec::new()));
-        let sink = captured.clone();
-
-        extract_volumes_to(
-            &volumes,
-            crate::vendor::rars::ArchiveReadOptions::default(),
-            move |_meta| Ok(Box::new(SharedWriter(sink.clone()))),
-        )
-        .unwrap();
-
-        assert_eq!(&*captured.borrow(), &full);
     }
 
     #[test]
@@ -1478,40 +1334,6 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
     }
 
-    fn stored_split_archive(data: &[u8], full: &[u8], crc: u32, flags: u64) -> Archive {
-        let source: Arc<[u8]> = Arc::from(data.to_vec().into_boxed_slice());
-        Archive {
-            sfx_offset: 0,
-            main: MainHeader {
-                block: empty_block(1, 0, 0..0),
-                archive_flags: 0,
-                volume_number: None,
-                extras: Vec::new(),
-            },
-            blocks: vec![Block::File(FileHeader {
-                block: empty_block(HEAD_FILE, flags, 0..data.len()),
-                file_flags: 0,
-                unpacked_size: full.len() as u64,
-                attributes: 0x20,
-                mtime: None,
-                data_crc32: Some(crc),
-                compression_info: 0,
-                host_os: 2,
-                name: b"split.txt".to_vec(),
-                hash: Some(FileHash {
-                    hash_type: 0,
-                    data: blake2sp::hash(full).to_vec(),
-                }),
-                redirection: None,
-                service_data: None,
-                encrypted: false,
-                encryption: None,
-                crypto: None,
-            })],
-            source: ArchiveSource::Memory(source),
-        }
-    }
-
     fn empty_block(
         header_type: u64,
         flags: u64,
@@ -1570,61 +1392,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_volumes_to_rejects_volume_state_violations() {
-        let empty: Vec<Archive> = Vec::new();
-        assert!(matches!(
-            extract_volumes_to(
-                &empty,
-                crate::vendor::rars::ArchiveReadOptions::default(),
-                never_open
-            ),
-            Err(Error::InvalidHeader(_))
-        ));
-
-        let only_continuation = vec![archive_with_blocks(
-            vec![Block::File(split_fragment_file(b"a.txt", HFL_SPLIT_BEFORE))],
-            Vec::new(),
-        )];
-        assert!(matches!(
-            extract_volumes_to(
-                &only_continuation,
-                crate::vendor::rars::ArchiveReadOptions::default(),
-                never_open,
-            ),
-            Err(Error::InvalidHeader(_))
-        ));
-
-        let interrupted = vec![archive_with_blocks(
-            vec![
-                Block::File(split_fragment_file(b"a.txt", HFL_SPLIT_AFTER)),
-                Block::File(plain_file(b"other.txt", b"", None)),
-            ],
-            Vec::new(),
-        )];
-        assert!(matches!(
-            extract_volumes_to(
-                &interrupted,
-                crate::vendor::rars::ArchiveReadOptions::default(),
-                never_open,
-            ),
-            Err(Error::InvalidHeader(_))
-        ));
-
-        let incomplete = vec![archive_with_blocks(
-            vec![Block::File(split_fragment_file(b"a.txt", HFL_SPLIT_AFTER))],
-            Vec::new(),
-        )];
-        assert!(matches!(
-            extract_volumes_to(
-                &incomplete,
-                crate::vendor::rars::ArchiveReadOptions::default(),
-                never_open,
-            ),
-            Err(Error::InvalidHeader(_))
-        ));
-    }
-
-    #[test]
     fn validate_split_fragment_rejects_directories_and_demands_password_for_encrypted() {
         let mut dir = split_fragment_file(b"d", HFL_SPLIT_AFTER);
         dir.file_flags = 0x0001;
@@ -1672,80 +1439,6 @@ mod tests {
 
         let same = split_fragment_file(b"a.txt", HFL_SPLIT_BEFORE);
         validate_split_continuation_refs(&pending, &same, None).unwrap();
-    }
-
-    #[test]
-    fn archive_extract_to_rejects_split_entries_in_single_volume_archive() {
-        let split = split_fragment_file(b"a.txt", HFL_SPLIT_AFTER);
-        let archive = archive_with_blocks(vec![Block::File(split)], Vec::new());
-        let err = archive
-            .extract_to(
-                crate::vendor::rars::ArchiveReadOptions::default(),
-                never_open,
-            )
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidHeader(msg) if msg.contains("requires multivolume")),
-            "expected multivolume error, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn archive_extract_to_skips_redirection_entries_without_opening_writer() {
-        let mut redirect = plain_file(b"link", b"", None);
-        redirect.redirection = Some(super::super::FileRedirection {
-            redirection_type: 1,
-            flags: 0,
-            target_name: b"target".to_vec(),
-        });
-        let archive = archive_with_blocks(vec![Block::File(redirect)], Vec::new());
-        archive
-            .extract_to(
-                crate::vendor::rars::ArchiveReadOptions::default(),
-                never_open,
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn archive_extract_to_with_redirections_reports_redirection_entries() {
-        let mut redirect = plain_file(b"link", b"", None);
-        redirect.redirection = Some(super::super::FileRedirection {
-            redirection_type: 1,
-            flags: 0,
-            target_name: b"target".to_vec(),
-        });
-        let archive = archive_with_blocks(vec![Block::File(redirect)], Vec::new());
-        let mut seen = Vec::new();
-        archive
-            .extract_to_with_redirections(
-                crate::vendor::rars::ArchiveReadOptions::default(),
-                never_open,
-                |meta, redirection| {
-                    seen.push((meta.name.clone(), redirection.target_name.clone()));
-                    Ok(())
-                },
-            )
-            .unwrap();
-
-        assert_eq!(seen, vec![(b"link".to_vec(), b"target".to_vec())]);
-    }
-
-    #[test]
-    fn extract_volumes_to_skips_redirection_entries_without_opening_writer() {
-        let mut redirect = plain_file(b"link", b"", None);
-        redirect.redirection = Some(super::super::FileRedirection {
-            redirection_type: 1,
-            flags: 0,
-            target_name: b"target".to_vec(),
-        });
-        let volumes = vec![archive_with_blocks(vec![Block::File(redirect)], Vec::new())];
-        extract_volumes_to(
-            &volumes,
-            crate::vendor::rars::ArchiveReadOptions::default(),
-            never_open,
-        )
-        .unwrap();
     }
 
     #[test]
@@ -1896,33 +1589,6 @@ mod tests {
             .decoded_data_with_mode(&archive, &mut decoder, None, DecodeMode::LzNoFilters)
             .unwrap();
         assert_eq!(decoded.data, payload);
-    }
-
-    #[test]
-    fn decoded_data_unverified_returns_stored_payload_without_crc_check() {
-        let payload = b"decoded_data_unverified stored payload";
-        let mut file = plain_file(b"a.txt", payload, None);
-        file.block.data_range = 0..payload.len();
-        file.block.data_size = Some(payload.len() as u64);
-        file.unpacked_size = payload.len() as u64;
-        // Set wrong CRC — unverified path must not check it.
-        file.data_crc32 = Some(crc32(payload).wrapping_add(1));
-
-        let archive = archive_with_blocks(vec![Block::File(file.clone())], payload.to_vec());
-        let decoded = file.decoded_data_unverified(&archive, None).unwrap();
-        assert_eq!(decoded, payload);
-    }
-
-    #[test]
-    fn decoded_data_unverified_accepts_empty_compressed_member() {
-        let mut file = plain_file(b"empty.txt", b"", None);
-        file.compression_info = 5 << 7;
-        file.data_crc32 = Some(0);
-
-        let archive = archive_with_blocks(vec![Block::File(file.clone())], Vec::new());
-        let decoded = file.decoded_data_unverified(&archive, None).unwrap();
-
-        assert!(decoded.is_empty());
     }
 
     #[test]

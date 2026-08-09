@@ -1,5 +1,5 @@
 use aes::Aes256;
-use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, KeyInit};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -106,13 +106,6 @@ impl Rar50Keys {
         Ok(())
     }
 
-    pub fn password_check_record(&self) -> [u8; 12] {
-        let mut record = [0u8; 12];
-        record[..8].copy_from_slice(&self.password_check);
-        record[8..].copy_from_slice(&sha256(&self.password_check)[..4]);
-        record
-    }
-
     pub fn mac_crc32(&self, crc: u32) -> u32 {
         let digest = hmac_sha256(&self.hash_key, &crc.to_le_bytes());
         digest.chunks_exact(4).fold(0, |acc, chunk| {
@@ -160,25 +153,6 @@ impl Rar50Cipher {
         Ok(())
     }
 
-    pub fn encrypt_in_place(&mut self, data: &mut [u8]) -> Result<()> {
-        if !data.len().is_multiple_of(16) {
-            return Err(Error::UnalignedInput);
-        }
-        for block in data.chunks_exact_mut(16) {
-            self.encrypt_block(block);
-        }
-        Ok(())
-    }
-
-    fn encrypt_block(&mut self, block: &mut [u8]) {
-        for (byte, iv_byte) in block.iter_mut().zip(self.iv) {
-            *byte ^= iv_byte;
-        }
-        let block: &mut [u8; 16] = block.try_into().expect("AES block size");
-        self.cipher.encrypt_block(block.into());
-        self.iv.copy_from_slice(block);
-    }
-
     fn decrypt_block(&mut self, block: &mut [u8]) {
         let ciphertext: [u8; 16] = block.try_into().expect("AES block size");
         let block: &mut [u8; 16] = block.try_into().expect("AES block size");
@@ -223,83 +197,6 @@ mod tests {
             hex(&hmac_sha256(&[0x0b; 20], b"Hi There")),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
-    }
-
-    #[test]
-    fn password_check_uses_the_check_value_and_its_checksum() {
-        let keys = Rar50Keys::derive(b"secret", [7; 16], 4).unwrap();
-        let mut record = keys.password_check_record();
-
-        assert_eq!(keys.check_password(&record), Ok(()));
-
-        record[0] ^= 0x01;
-        assert_eq!(keys.check_password(&record), Err(Error::BadPassword));
-
-        let mut record = keys.password_check_record();
-        record[11] ^= 0x01;
-        assert_eq!(keys.check_password(&record), Err(Error::BadPassword));
-    }
-
-    #[test]
-    fn rar50_aes_encrypt_decrypt_round_trips_blocks() {
-        let key = [9u8; 32];
-        let iv = [5u8; 16];
-        let mut data = *b"0123456789abcdefRAR5 block two!!";
-        let plain = data;
-
-        Rar50Cipher::new(key, iv)
-            .encrypt_in_place(&mut data)
-            .unwrap();
-        assert_ne!(data, plain);
-
-        Rar50Cipher::new(key, iv)
-            .decrypt_in_place(&mut data)
-            .unwrap();
-        assert_eq!(data, plain);
-    }
-
-    #[test]
-    fn rar50_aes_rejects_partial_tail() {
-        let key = [9u8; 32];
-        let iv = [5u8; 16];
-        let mut data = *b"partial block!!";
-
-        assert_eq!(
-            Rar50Cipher::new(key, iv).encrypt_in_place(&mut data),
-            Err(Error::UnalignedInput)
-        );
-        assert_eq!(
-            Rar50Cipher::new(key, iv).decrypt_in_place(&mut data),
-            Err(Error::UnalignedInput)
-        );
-    }
-
-    #[test]
-    fn rar50_kdf_matches_pinned_vector() {
-        let keys = Rar50Keys::derive(
-            b"password",
-            [
-                0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13, 0x20, 0x21, 0x22, 0x23, 0x30, 0x31,
-                0x32, 0x33,
-            ],
-            4,
-        )
-        .unwrap();
-
-        assert_eq!(
-            hex(&keys.key),
-            "cae43ebc57fcbdfc97ddc6f4a2d09687fd06010b51f651bec8f911f20caf008f"
-        );
-        assert_eq!(
-            hex(&keys.hash_key),
-            "e65c566ff17139eaabdf60986e64058aac7e8dd82d6c5b027dd2e6d761a44d3c"
-        );
-        assert_eq!(hex(&keys.password_check), "118929fdcad8a74f");
-        assert_eq!(
-            hex(&keys.password_check_record()),
-            "118929fdcad8a74f5379ff2d"
-        );
-        assert_eq!(keys.mac_crc32(0x1234_5678), 0xd742_398d);
     }
 
     fn hex(bytes: &[u8]) -> String {

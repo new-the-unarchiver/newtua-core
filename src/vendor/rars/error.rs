@@ -24,6 +24,12 @@ impl PartialEq for IoError {
 
 impl Eq for IoError {}
 
+/// NEWTUA: `allow(dead_code)` — два значения (`UnsupportedVersion`,
+/// `UnsupportedFamilyFeature`) после ухода писательской половины никто не
+/// создаёт, но `format/rar.rs` их называет при переводе ошибок в наши. Это
+/// разметка причин отказа: выкинутое значение пришлось бы возвращать, как
+/// только его начнёт создавать чтение.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {

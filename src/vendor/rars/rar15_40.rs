@@ -1,4 +1,3 @@
-use crate::vendor::rars::ArchiveVersion;
 use crate::vendor::rars::codec::rar13::Unpack15;
 use crate::vendor::rars::codec::rar20::Unpack20;
 use crate::vendor::rars::codec::rar29::Unpack29;
@@ -6,11 +5,9 @@ use crate::vendor::rars::crc32::{Crc32, crc32};
 use crate::vendor::rars::crypto::rar15::Rar15Cipher;
 use crate::vendor::rars::crypto::rar20::Rar20Cipher;
 use crate::vendor::rars::crypto::rar30::{Error as Rar30Error, Rar30Cipher};
-use crate::vendor::rars::detect::{
-    ArchiveSignature, RAR15_SIGNATURE, SFX_SCAN_LIMIT, find_archive_start,
-};
+use crate::vendor::rars::detect::{ArchiveSignature, RAR15_SIGNATURE};
 use crate::vendor::rars::error::{Error, Result};
-use crate::vendor::rars::features::FeatureSet;
+
 use crate::vendor::rars::io_util::{align16 as checked_align16, read_exact_at, read_u16, read_u32};
 pub(crate) use crate::vendor::rars::source::ArchiveSource;
 use crate::vendor::rars::version::ArchiveFamily;
@@ -36,10 +33,9 @@ const LONG_BLOCK: u16 = 0x8000;
 const MHD_VOLUME: u16 = 0x0001;
 const MHD_COMMENT: u16 = 0x0002;
 const MHD_SOLID: u16 = 0x0008;
-const MHD_NEWNUMBERING: u16 = 0x0010;
-const MHD_PROTECT: u16 = 0x0040;
+
 const MHD_PASSWORD: u16 = 0x0080;
-const MHD_FIRSTVOLUME: u16 = 0x0100;
+
 const MHD_ENCRYPTVER: u16 = 0x0200;
 
 const FHD_SPLIT_BEFORE: u16 = 0x0001;
@@ -56,6 +52,12 @@ const FHD_DIRECTORY_MASK: u16 = 0x00e0;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Archive {
+    /// NEWTUA: `allow(dead_code)` — где кончилась самораспаковывающая
+    /// заглушка. Разбор это поле заполняет, движок его не читает: за
+    /// самораспаковку у нас отвечает `format/sfx.rs`, а сюда архив приходит
+    /// уже целым файлом. Убрать поле — значит потерять единственное место,
+    /// где смещение вообще сохранено.
+    #[allow(dead_code)]
     pub sfx_offset: usize,
     pub main: MainHeader,
     pub blocks: Vec<Block>,
@@ -74,10 +76,6 @@ pub struct MainHeader {
 }
 
 impl MainHeader {
-    pub fn has_archive_comment(&self) -> bool {
-        self.flags & MHD_COMMENT != 0
-    }
-
     pub fn is_volume(&self) -> bool {
         self.flags & MHD_VOLUME != 0
     }
@@ -86,20 +84,8 @@ impl MainHeader {
         self.flags & MHD_SOLID != 0
     }
 
-    pub fn uses_new_numbering(&self) -> bool {
-        self.flags & MHD_NEWNUMBERING != 0
-    }
-
-    pub fn has_recovery_record(&self) -> bool {
-        self.flags & MHD_PROTECT != 0
-    }
-
     pub fn has_encrypted_headers(&self) -> bool {
         self.flags & MHD_PASSWORD != 0
-    }
-
-    pub fn is_first_volume(&self) -> bool {
-        self.flags & MHD_FIRSTVOLUME != 0
     }
 }
 
@@ -181,69 +167,6 @@ pub enum NewSubKind {
     Unknown(Vec<u8>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct WriterOptions {
-    pub target: ArchiveVersion,
-    pub features: FeatureSet,
-    pub compression_level: Option<u8>,
-    pub dictionary_size: Option<usize>,
-}
-
-impl WriterOptions {
-    pub const fn new(target: ArchiveVersion, features: FeatureSet) -> Self {
-        Self {
-            target,
-            features,
-            compression_level: None,
-            dictionary_size: None,
-        }
-    }
-
-    pub const fn with_compression_level(mut self, level: u8) -> Self {
-        self.compression_level = Some(level);
-        self
-    }
-
-    pub const fn with_dictionary_size(mut self, size: usize) -> Self {
-        self.dictionary_size = Some(size);
-        self
-    }
-}
-
-impl Default for WriterOptions {
-    fn default() -> Self {
-        Self {
-            target: ArchiveVersion::Rar15,
-            features: FeatureSet::store_only(),
-            compression_level: None,
-            dictionary_size: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StoredEntry<'a> {
-    pub name: &'a [u8],
-    pub data: &'a [u8],
-    pub file_time: u32,
-    pub file_attr: u32,
-    pub host_os: u8,
-    pub password: Option<&'a [u8]>,
-    pub file_comment: Option<&'a [u8]>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileEntry<'a> {
-    pub name: &'a [u8],
-    pub data: &'a [u8],
-    pub file_time: u32,
-    pub file_attr: u32,
-    pub host_os: u8,
-    pub password: Option<&'a [u8]>,
-    pub file_comment: Option<&'a [u8]>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExtractedEntryMeta {
@@ -255,17 +178,6 @@ pub struct ExtractedEntryMeta {
 }
 
 impl FileHeader {
-    pub fn name_bytes(&self) -> &[u8] {
-        &self.name
-    }
-
-    /// Returns the file name with invalid UTF-8 replaced for display only.
-    ///
-    /// Use [`Self::name_bytes`] when exact archive bytes matter.
-    pub fn name_lossy(&self) -> String {
-        String::from_utf8_lossy(&self.name).into_owned()
-    }
-
     pub fn is_split_before(&self) -> bool {
         self.block.flags & FHD_SPLIT_BEFORE != 0
     }
@@ -286,159 +198,12 @@ impl FileHeader {
         self.block.flags & FHD_DIRECTORY_MASK == FHD_DIRECTORY_MASK
     }
 
-    pub fn has_ext_time(&self) -> bool {
-        self.block.flags & FHD_EXTTIME != 0
-    }
-
     pub fn has_file_comment(&self) -> bool {
         self.block.flags & FHD_COMMENT != 0 && !self.file_comment.is_empty()
     }
 
-    pub fn file_comment(&self) -> Result<Option<Vec<u8>>> {
-        if !self.has_file_comment() {
-            return Ok(None);
-        }
-        let size = read_u16(&self.file_comment, 0)? as usize;
-        let start = 2usize;
-        let end = start
-            .checked_add(size)
-            .ok_or(Error::InvalidHeader("RAR 1.5 file comment size overflows"))?;
-        let comment = self.file_comment.get(start..end).ok_or(Error::TooShort)?;
-        Ok(Some(comment.to_vec()))
-    }
-
     pub fn is_stored(&self) -> bool {
         self.method == 0x30
-    }
-
-    pub fn packed_data(&self, archive: &Archive) -> Result<Vec<u8>> {
-        archive.read_range(self.packed_range.clone())
-    }
-
-    pub fn write_packed_data(&self, archive: &Archive, out: &mut impl Write) -> Result<()> {
-        archive.copy_range_to(self.packed_range.clone(), out)
-    }
-
-    pub(crate) fn stored_data(&self, archive: &Archive) -> Result<Vec<u8>> {
-        self.stored_data_with_password(archive, None)
-    }
-
-    pub(crate) fn stored_data_with_password(
-        &self,
-        archive: &Archive,
-        password: Option<&[u8]>,
-    ) -> Result<Vec<u8>> {
-        if !self.is_stored() {
-            return Err(self.unsupported_compression());
-        }
-        if !self.is_encrypted() && self.pack_size != self.unp_size {
-            return Err(Error::InvalidHeader(
-                "RAR 1.5 stored file has mismatched packed and unpacked sizes",
-            ));
-        }
-        let mut data = self.packed_data_for_decode(archive, password)?;
-        if self.is_encrypted() {
-            data.truncate(
-                usize::try_from(self.unp_size)
-                    .map_err(|_| Error::InvalidHeader("RAR 1.5 unpacked size overflows usize"))?,
-            );
-        }
-        Ok(data)
-    }
-
-    pub(crate) fn unpacked_data(&self, archive: &Archive) -> Result<Vec<u8>> {
-        if self.is_stored() {
-            return self.stored_data(archive);
-        }
-        let mut session = DecoderSession::new(false);
-        session.decode_file_data(archive, self)
-    }
-
-    pub(crate) fn unpacked_data_with_rar29(
-        &self,
-        archive: &Archive,
-        decoder: &mut Unpack29,
-        solid: bool,
-    ) -> Result<Vec<u8>> {
-        if self.is_stored() {
-            return self.stored_data(archive);
-        }
-        if self.is_encrypted() {
-            return Err(self.unsupported_encryption());
-        }
-        if self.unp_ver < 29 {
-            return Err(self.unsupported_compression());
-        }
-        let packed = self.packed_data(archive)?;
-        let target = usize::try_from(self.unp_size)
-            .map_err(|_| Error::InvalidHeader("RAR 2.9 unpacked size overflows usize"))?;
-        if solid {
-            decoder.decode_member(&packed, target)
-        } else {
-            decoder.decode_non_solid_member(&packed, target)
-        }
-        .map_err(Into::into)
-    }
-
-    pub(crate) fn unpacked_data_with_unpack15(
-        &self,
-        archive: &Archive,
-        decoder: &mut Unpack15,
-        solid: bool,
-    ) -> Result<Vec<u8>> {
-        if self.is_stored() {
-            return self.stored_data(archive);
-        }
-        if self.is_encrypted() {
-            return Err(self.unsupported_encryption());
-        }
-        if self.unp_ver != 15 {
-            return Err(self.unsupported_compression());
-        }
-        decoder
-            .decode_member(
-                &self.packed_data(archive)?,
-                usize::try_from(self.unp_size)
-                    .map_err(|_| Error::InvalidHeader("RAR 1.5 unpacked size overflows usize"))?,
-                solid,
-            )
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn unpacked_data_with_unpack20(
-        &self,
-        archive: &Archive,
-        decoder: &mut Unpack20,
-        password: Option<&[u8]>,
-    ) -> Result<Vec<u8>> {
-        if self.is_stored() {
-            return self.stored_data_with_password(archive, password);
-        }
-        if self.unp_ver != 20 && self.unp_ver != 26 {
-            return Err(self.unsupported_compression());
-        }
-        let mut packed = self.packed_reader_for_decode(archive, password)?;
-        let mut out = Vec::new();
-        decoder
-            .decode_member_from_reader(
-                &mut packed,
-                usize::try_from(self.unp_size)
-                    .map_err(|_| Error::InvalidHeader("RAR 2.0 unpacked size overflows usize"))?,
-                &mut out,
-            )
-            .map(|_| out)
-            .map_err(Into::into)
-    }
-
-    fn packed_data_for_decode(
-        &self,
-        archive: &Archive,
-        password: Option<&[u8]>,
-    ) -> Result<Vec<u8>> {
-        let mut reader = self.packed_reader_for_decode(archive, password)?;
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data)?;
-        Ok(data)
     }
 
     pub(super) fn packed_reader_for_decode<'a>(
@@ -468,18 +233,6 @@ impl FileHeader {
         )?))
     }
 
-    pub fn verify_crc32(&self, data: &[u8]) -> Result<()> {
-        let actual = crc32(data);
-        if actual == self.file_crc {
-            Ok(())
-        } else {
-            Err(Error::Crc32Mismatch {
-                expected: self.file_crc,
-                actual,
-            })
-        }
-    }
-
     pub fn metadata(&self) -> ExtractedEntryMeta {
         ExtractedEntryMeta {
             name: self.name.clone(),
@@ -498,6 +251,14 @@ impl FileHeader {
     ) -> Result<()> {
         if self.is_directory() {
             return Ok(());
+        }
+        // NEWTUA: ветка для несжатой записи. Без неё `write_to` уводило
+        // `-m0` в выбор кодека по `unp_ver` — а он у несжатой записи такой
+        // же, как у сжатой, — и запись «распаковывалась» как сжатая. Обход
+        // всего архива (`extract_to`) эту развилку делает у себя, поэтому
+        // наружу порок не вылезал: `write_to` там не зовётся.
+        if self.is_stored() {
+            return self.write_stored_to(archive, password, out);
         }
         let mut session = DecoderSession::new_with_password(false, password);
         session.write_file_to(archive, self, out)
@@ -742,121 +503,7 @@ impl FileHeader {
     }
 }
 
-impl NewSubHeader {
-    pub fn name_bytes(&self) -> &[u8] {
-        self.file.name_bytes()
-    }
-
-    /// Returns the service-block name with invalid UTF-8 replaced for display only.
-    ///
-    /// Use [`Self::name_bytes`] when exact archive bytes matter.
-    pub fn name_lossy(&self) -> String {
-        self.file.name_lossy()
-    }
-}
-
-impl CommentHeader {
-    fn packed_data(&self, archive: &Archive) -> Result<Vec<u8>> {
-        archive.read_range(self.packed_range.clone())
-    }
-
-    fn unpacked_data(&self, archive: &Archive) -> Result<Vec<u8>> {
-        let target = usize::from(self.unp_size);
-        let data = if self.method == 0x30 {
-            let data = self.packed_data(archive)?;
-            if data.len() != target {
-                return Err(Error::InvalidHeader(
-                    "RAR 1.5 stored comment has mismatched packed and unpacked sizes",
-                ));
-            }
-            data
-        } else if self.unp_ver == 15 {
-            Unpack15::default().decode_member(&self.packed_data(archive)?, target, false)?
-        } else {
-            return Err(Error::UnsupportedCompression {
-                family: "RAR 1.5 comment",
-                unpack_version: self.unp_ver,
-                method: self.method,
-            });
-        };
-        let actual = (crc32(&data) & 0xffff) as u16;
-        if actual == self.comment_crc {
-            Ok(data)
-        } else {
-            Err(Error::CrcMismatch {
-                expected: self.comment_crc,
-                actual,
-            })
-        }
-    }
-}
-
 impl Archive {
-    pub fn parse(input: &[u8]) -> Result<Self> {
-        Self::parse_with_options(input, crate::vendor::rars::ArchiveReadOptions::default())
-    }
-
-    pub fn parse_owned(input: Vec<u8>) -> Result<Self> {
-        Self::parse_owned_with_options(input, crate::vendor::rars::ArchiveReadOptions::default())
-    }
-
-    pub fn parse_with_options(
-        input: &[u8],
-        options: crate::vendor::rars::ArchiveReadOptions<'_>,
-    ) -> Result<Self> {
-        let data: Arc<[u8]> = Arc::from(input.to_vec().into_boxed_slice());
-        Self::parse_shared(data, options.password)
-    }
-
-    pub fn parse_owned_with_options(
-        input: Vec<u8>,
-        options: crate::vendor::rars::ArchiveReadOptions<'_>,
-    ) -> Result<Self> {
-        Self::parse_shared(Arc::from(input.into_boxed_slice()), options.password)
-    }
-
-    pub fn parse_with_password(input: &[u8], password: Option<&[u8]>) -> Result<Self> {
-        Self::parse_with_options(
-            input,
-            crate::vendor::rars::ArchiveReadOptions::with_optional_password(password),
-        )
-    }
-
-    pub fn parse_owned_with_password(input: Vec<u8>, password: Option<&[u8]>) -> Result<Self> {
-        Self::parse_owned_with_options(
-            input,
-            crate::vendor::rars::ArchiveReadOptions::with_optional_password(password),
-        )
-    }
-
-    pub fn parse_path(path: impl AsRef<Path>) -> Result<Self> {
-        Self::parse_path_with_options(path, crate::vendor::rars::ArchiveReadOptions::default())
-    }
-
-    pub fn parse_path_with_options(
-        path: impl AsRef<Path>,
-        options: crate::vendor::rars::ArchiveReadOptions<'_>,
-    ) -> Result<Self> {
-        Self::parse_path_with_password(path, options.password)
-    }
-
-    pub fn parse_path_with_password(
-        path: impl AsRef<Path>,
-        password: Option<&[u8]>,
-    ) -> Result<Self> {
-        let path = Arc::new(path.as_ref().to_path_buf());
-        let mut file = File::open(path.as_ref())?;
-        let len = file.metadata()?.len();
-        let scan_len = len.min(SFX_SCAN_LIMIT as u64) as usize;
-        let mut scan = vec![0; scan_len];
-        file.read_exact(&mut scan)?;
-        let sig = find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
-        if sig.family != ArchiveFamily::Rar15To40 {
-            return Err(Error::UnsupportedSignature);
-        }
-        Self::parse_seekable(file, len, sig.offset, ArchiveSource::File(path), password)
-    }
-
     pub fn parse_path_with_signature(
         path: impl AsRef<Path>,
         signature: ArchiveSignature,
@@ -883,108 +530,6 @@ impl Archive {
             ArchiveSource::File(path),
             password,
         )
-    }
-
-    fn parse_shared(input: Arc<[u8]>, password: Option<&[u8]>) -> Result<Self> {
-        let sig = find_archive_start(&input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
-        if sig.family != ArchiveFamily::Rar15To40 {
-            return Err(Error::UnsupportedSignature);
-        }
-
-        let archive = &input[sig.offset..];
-        if !archive.starts_with(RAR15_SIGNATURE) {
-            return Err(Error::UnsupportedSignature);
-        }
-
-        let marker = parse_block_header(archive, 0)?;
-        if marker.head_type != MARK_HEAD || marker.head_size != RAR15_SIGNATURE.len() as u16 {
-            return Err(Error::InvalidHeader("RAR 1.5 marker block is invalid"));
-        }
-
-        let main_block = parse_block_header(archive, marker.head_size as usize)?;
-        if main_block.head_type != MAIN_HEAD {
-            return Err(Error::InvalidHeader("RAR 1.5 main header is missing"));
-        }
-        let main = parse_main_header(archive, &main_block)?;
-        let mut pos = main_block.offset + main_block.head_size as usize;
-        let mut blocks = Vec::new();
-        let mut encrypted_header_ciphers = EncryptedHeaderCipherCache::default();
-
-        while pos < archive.len() {
-            if archive.len() - pos < 7 {
-                break;
-            }
-            let (block, header, total) = if main.has_encrypted_headers() {
-                let password = password.ok_or(Error::NeedPassword)?;
-                let encrypted = decrypt_encrypted_header_at(
-                    archive,
-                    pos,
-                    password,
-                    &mut encrypted_header_ciphers,
-                )?;
-                (encrypted.block, encrypted.header, encrypted.total_size)
-            } else {
-                let block = parse_block_header(archive, pos)?;
-                let total = block_total_size(&block)?;
-                let header = archive[pos..pos + block.head_size as usize].to_vec();
-                (block, header, total)
-            };
-            match block.head_type {
-                FILE_HEAD => {
-                    let mut file = parse_file_like_header(&header, relative_block(&block), 0)?;
-                    let total = file_block_total_size(&block, total, file.pack_size)?;
-                    let next = checked_block_next(&block, total, archive.len())?;
-                    file.block.offset = block.offset;
-                    file.packed_range =
-                        packed_range(sig.offset, block.offset, total, file.pack_size)?;
-                    blocks.push(Block::File(file));
-                    pos = next;
-                }
-                NEWSUB_HEAD => {
-                    let mut file = parse_file_like_header(&header, relative_block(&block), 0)?;
-                    let total = file_block_total_size(&block, total, file.pack_size)?;
-                    let next = checked_block_next(&block, total, archive.len())?;
-                    file.block.offset = block.offset;
-                    file.packed_range =
-                        packed_range(sig.offset, block.offset, total, file.pack_size)?;
-                    let kind = classify_new_sub(&file.name);
-                    blocks.push(Block::NewSub(NewSubHeader { file, kind }));
-                    pos = next;
-                }
-                COMM_HEAD => {
-                    let next = checked_block_next(&block, total, archive.len())?;
-                    let mut comment = parse_comment_header(&header, relative_block(&block))?;
-                    comment.block.offset = block.offset;
-                    comment.packed_range =
-                        sig.offset + block.offset + 13..sig.offset + block.offset + total;
-                    blocks.push(Block::Comment(comment));
-                    pos = next;
-                }
-                PROTECT_HEAD => {
-                    let next = checked_block_next(&block, total, archive.len())?;
-                    let protect = parse_protect_header(&header, &block, sig.offset, total)?;
-                    blocks.push(Block::Protect(protect));
-                    pos = next;
-                }
-                ENDARC_HEAD => {
-                    let _next = checked_block_next(&block, total, archive.len())?;
-                    blocks.push(Block::End(block));
-                    break;
-                }
-                _ => {
-                    let next = checked_block_next(&block, total, archive.len())?;
-                    blocks.push(Block::Unknown(block));
-                    pos = next;
-                }
-            }
-        }
-
-        Ok(Self {
-            sfx_offset: sig.offset,
-            main,
-            blocks,
-            source: ArchiveSource::Memory(input),
-        })
     }
 
     fn parse_seekable(
@@ -1095,14 +640,6 @@ impl Archive {
         })
     }
 
-    fn read_range(&self, range: Range<usize>) -> Result<Vec<u8>> {
-        self.source.read_range(range)
-    }
-
-    fn copy_range_to(&self, range: Range<usize>, out: &mut impl Write) -> Result<()> {
-        self.source.copy_range_to(range, out)
-    }
-
     fn range_reader(&self, range: Range<usize>) -> Result<Box<dyn Read + '_>> {
         self.source.range_reader(range)
     }
@@ -1112,96 +649,6 @@ impl Archive {
             Block::File(file) => Some(file),
             _ => None,
         })
-    }
-
-    pub fn new_subs(&self) -> impl Iterator<Item = &NewSubHeader> {
-        self.blocks.iter().filter_map(|block| match block {
-            Block::NewSub(sub) => Some(sub),
-            _ => None,
-        })
-    }
-
-    pub fn protect_records(&self) -> impl Iterator<Item = &ProtectHeader> {
-        self.blocks.iter().filter_map(|block| match block {
-            Block::Protect(protect) => Some(protect),
-            _ => None,
-        })
-    }
-
-    fn source_bytes(&self) -> Result<Vec<u8>> {
-        self.source.bytes()
-    }
-
-    pub fn repair_protect_head(&self) -> Result<Vec<u8>> {
-        if let Some(recovery) = self
-            .new_subs()
-            .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
-        {
-            return repair_newsub_recovery_bytes(
-                &self.source_bytes()?,
-                self.sfx_offset,
-                self,
-                recovery,
-            );
-        }
-        let protect = self.protect_records().next().ok_or(Error::InvalidHeader(
-            "RAR 2.x archive does not contain a PROTECT_HEAD recovery record",
-        ))?;
-        repair_protect_head_bytes(&self.source_bytes()?, self.sfx_offset, protect)
-    }
-
-    /// Streams extracted entries to caller-provided writers.
-    pub fn extract_to<F>(
-        &self,
-        options: crate::vendor::rars::ArchiveReadOptions<'_>,
-        mut open: F,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
-        let password = options.password;
-        let mut session = DecoderSession::new_with_password(self.main.is_solid(), password);
-        for file in self.files() {
-            if file.is_split_before() || file.is_split_after() {
-                return Err(Error::InvalidHeader(
-                    "RAR 1.5 split entry requires multivolume extraction",
-                ));
-            }
-            let meta = file.metadata();
-            if meta.is_directory {
-                let _ = open(&meta)?;
-                continue;
-            }
-            let mut writer = open(&meta)?;
-            if file.is_stored() {
-                file.write_stored_to(self, password, &mut writer)
-                    .map_err(|error| file.entry_error("extracting", error))?;
-            } else {
-                session
-                    .write_file_to(self, file, &mut writer)
-                    .map_err(|error| file.entry_error("extracting", error))?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn archive_comment(&self) -> Result<Option<Vec<u8>>> {
-        if let Some(comment) = self.blocks.iter().find_map(|block| match block {
-            Block::Comment(comment) => Some(comment),
-            _ => None,
-        }) {
-            return comment.unpacked_data(self).map(Some);
-        }
-
-        let Some(comment) = self
-            .new_subs()
-            .find(|sub| sub.kind == NewSubKind::ArchiveComment)
-        else {
-            return Ok(None);
-        };
-        let data = comment.file.unpacked_data(self)?;
-        comment.file.verify_crc32(&data)?;
-        Ok(Some(data))
     }
 }
 
@@ -1306,281 +753,6 @@ fn parse_protect_header(
     })
 }
 
-fn repair_protect_head_bytes(
-    source: &[u8],
-    sfx_offset: usize,
-    protect: &ProtectHeader,
-) -> Result<Vec<u8>> {
-    if protect.rec_sectors == 0 {
-        return Err(Error::InvalidHeader(
-            "RAR 2.x recovery record has no parity sectors",
-        ));
-    }
-    if protect.mark != *b"Protect!" {
-        return Err(Error::InvalidHeader("RAR 2.x recovery mark is invalid"));
-    }
-    let protected_start = sfx_offset;
-    let protected_len = usize::try_from(protect.total_blocks)
-        .ok()
-        .and_then(|blocks| blocks.checked_mul(512))
-        .ok_or(Error::InvalidHeader(
-            "RAR 2.x protected sector size overflows",
-        ))?;
-    let protected_end = protected_start
-        .checked_add(protected_len)
-        .ok_or(Error::InvalidHeader(
-            "RAR 2.x protected sector range overflows",
-        ))?;
-    if protected_end > source.len() {
-        return Err(Error::InvalidHeader(
-            "RAR 2.x protected sector range is invalid",
-        ));
-    }
-    let recovery_data = source
-        .get(protect.data_range.clone())
-        .ok_or(Error::TooShort)?;
-    let declared_blocks = usize::try_from(protect.total_blocks).map_err(|_| {
-        Error::InvalidHeader("RAR 2.x recovery protected sector count overflows usize")
-    })?;
-    let tag_len = declared_blocks
-        .checked_mul(2)
-        .ok_or(Error::InvalidHeader("RAR 2.x recovery tag size overflows"))?;
-    let parity_len =
-        usize::from(protect.rec_sectors)
-            .checked_mul(512)
-            .ok_or(Error::InvalidHeader(
-                "RAR 2.x recovery parity size overflows",
-            ))?;
-    if recovery_data.len() != tag_len + parity_len {
-        return Err(Error::InvalidHeader(
-            "RAR 2.x recovery data size is invalid",
-        ));
-    }
-    let tags = &recovery_data[..tag_len];
-    let parity = &recovery_data[tag_len..];
-    // RAR 2.50 records may declare a final sector that starts before
-    // PROTECT_HEAD but overlaps the recovery block. Only complete sectors
-    // before the recovery block are safely repairable.
-    let repairable_blocks = declared_blocks.min(protect.block.offset / 512);
-
-    let mut damaged = Vec::new();
-    for index in 0..repairable_blocks {
-        let sector_start = protected_start + index * 512;
-        let sector = &source[sector_start..sector_start + 512];
-        let actual = (!crc32(sector) & 0xffff) as u16;
-        let expected = read_u16(tags, index * 2)?;
-        if actual != expected {
-            damaged.push(index);
-        }
-    }
-    if damaged.is_empty() {
-        return Ok(source.to_vec());
-    }
-    if damaged.len() > usize::from(protect.rec_sectors) {
-        return Err(Error::InvalidHeader(
-            "RAR 2.x recovery damage exceeds parity sector count",
-        ));
-    }
-
-    let mut used_slots = vec![false; usize::from(protect.rec_sectors)];
-    for &index in &damaged {
-        let slot = index % usize::from(protect.rec_sectors);
-        if used_slots[slot] {
-            return Err(Error::InvalidHeader(
-                "RAR 2.x recovery cannot repair multiple sectors in the same parity group",
-            ));
-        }
-        used_slots[slot] = true;
-    }
-
-    let mut repaired = source.to_vec();
-    for &missing_index in &damaged {
-        let slot = missing_index % usize::from(protect.rec_sectors);
-        let mut sector = parity[slot * 512..slot * 512 + 512].to_vec();
-        for index in (slot..repairable_blocks).step_by(usize::from(protect.rec_sectors)) {
-            if index == missing_index {
-                continue;
-            }
-            let sector_start = protected_start + index * 512;
-            for (out, byte) in sector
-                .iter_mut()
-                .zip(&repaired[sector_start..sector_start + 512])
-            {
-                *out ^= *byte;
-            }
-        }
-        let sector_start = protected_start + missing_index * 512;
-        repaired[sector_start..sector_start + 512].copy_from_slice(&sector);
-        let actual = (!crc32(&sector) & 0xffff) as u16;
-        let expected = u16::from_le_bytes(
-            tags[missing_index * 2..missing_index * 2 + 2]
-                .try_into()
-                .unwrap(),
-        );
-        if actual != expected {
-            return Err(Error::CrcMismatch { expected, actual });
-        }
-    }
-    Ok(repaired)
-}
-
-fn repair_newsub_recovery_bytes(
-    source: &[u8],
-    sfx_offset: usize,
-    archive: &Archive,
-    recovery: &NewSubHeader,
-) -> Result<Vec<u8>> {
-    let recovery_data = newsub_recovery_data(archive, recovery)?;
-    let expected_unpacked = usize::try_from(recovery.file.unp_size)
-        .map_err(|_| Error::InvalidHeader("RAR 3.x recovery unpacked size overflows usize"))?;
-    if recovery_data.len() != expected_unpacked {
-        return Err(Error::InvalidHeader(
-            "RAR 3.x recovery data size does not match unpacked size",
-        ));
-    }
-    let protected_start = sfx_offset;
-    let protected_end =
-        sfx_offset
-            .checked_add(recovery.file.block.offset)
-            .ok_or(Error::InvalidHeader(
-                "RAR 3.x recovery protected range overflows",
-            ))?;
-    if protected_end > source.len() || protected_start > protected_end {
-        return Err(Error::InvalidHeader(
-            "RAR 3.x recovery protected range is invalid",
-        ));
-    }
-    let protected_len = protected_end - protected_start;
-    let protected_sectors = protected_len.div_ceil(512);
-    if protected_sectors == 0 {
-        return Err(Error::InvalidHeader(
-            "RAR 3.x recovery record has no protected sectors",
-        ));
-    }
-    let tag_len = protected_sectors
-        .checked_mul(2)
-        .ok_or(Error::InvalidHeader("RAR 3.x recovery tag size overflows"))?;
-    if recovery_data.len() <= tag_len || !(recovery_data.len() - tag_len).is_multiple_of(512) {
-        return Err(Error::InvalidHeader(
-            "RAR 3.x recovery data size is invalid",
-        ));
-    }
-    let parity_sectors = (recovery_data.len() - tag_len) / 512;
-    if parity_sectors == 0 {
-        return Err(Error::InvalidHeader(
-            "RAR 3.x recovery record has no parity sectors",
-        ));
-    }
-    let tags = &recovery_data[..tag_len];
-    let parity = &recovery_data[tag_len..];
-
-    let mut damaged = Vec::new();
-    for index in 0..protected_sectors {
-        let sector = protected_sector(source, protected_start, protected_len, index)?;
-        let actual = (!crc32(&sector) & 0xffff) as u16;
-        let expected = read_u16(tags, index * 2)?;
-        if actual != expected {
-            damaged.push(index);
-        }
-    }
-    if damaged.is_empty() {
-        return Ok(source.to_vec());
-    }
-    if damaged.len() > parity_sectors {
-        return Err(Error::InvalidHeader(
-            "RAR 3.x recovery damage exceeds parity sector count",
-        ));
-    }
-
-    let mut used_slots = vec![false; parity_sectors];
-    for &index in &damaged {
-        let slot = index % parity_sectors;
-        if used_slots[slot] {
-            return Err(Error::InvalidHeader(
-                "RAR 3.x recovery cannot repair multiple sectors in the same parity group",
-            ));
-        }
-        used_slots[slot] = true;
-    }
-
-    let mut repaired = source.to_vec();
-    for &missing_index in &damaged {
-        let slot = missing_index % parity_sectors;
-        let mut sector = parity[slot * 512..slot * 512 + 512].to_vec();
-        for index in (slot..protected_sectors).step_by(parity_sectors) {
-            if index == missing_index {
-                continue;
-            }
-            let other = protected_sector(&repaired, protected_start, protected_len, index)?;
-            for (out, byte) in sector.iter_mut().zip(other) {
-                *out ^= byte;
-            }
-        }
-        let actual = (!crc32(&sector) & 0xffff) as u16;
-        let expected = u16::from_le_bytes(
-            tags[missing_index * 2..missing_index * 2 + 2]
-                .try_into()
-                .unwrap(),
-        );
-        if actual != expected {
-            return Err(Error::CrcMismatch { expected, actual });
-        }
-        let sector_start = protected_start + missing_index * 512;
-        let write_len = 512.min(protected_end - sector_start);
-        repaired[sector_start..sector_start + write_len].copy_from_slice(&sector[..write_len]);
-    }
-
-    Ok(repaired)
-}
-
-fn newsub_recovery_data(archive: &Archive, recovery: &NewSubHeader) -> Result<Vec<u8>> {
-    if recovery.file.is_encrypted() {
-        return Err(Error::UnsupportedFeature {
-            version: ArchiveVersion::Rar30,
-            feature: "encrypted RAR 3.x NEWSUB recovery record",
-        });
-    }
-    if recovery.file.method == 0x30 {
-        if recovery.file.pack_size != recovery.file.unp_size {
-            return Err(Error::InvalidHeader(
-                "RAR 3.x recovery record packed size does not match unpacked size",
-            ));
-        }
-        return recovery.file.stored_data(archive);
-    }
-    let mut session = DecoderSession::new(false);
-    session.decode_file_data(archive, &recovery.file)
-}
-
-fn protected_sector(
-    source: &[u8],
-    protected_start: usize,
-    protected_len: usize,
-    index: usize,
-) -> Result<[u8; 512]> {
-    let sector_offset = index.checked_mul(512).ok_or(Error::InvalidHeader(
-        "RAR 3.x recovery sector offset overflows",
-    ))?;
-    if sector_offset >= protected_len {
-        return Err(Error::InvalidHeader(
-            "RAR 3.x recovery sector offset is invalid",
-        ));
-    }
-    let sector_start = protected_start
-        .checked_add(sector_offset)
-        .ok_or(Error::InvalidHeader(
-            "RAR 3.x recovery sector range overflows",
-        ))?;
-    let available = 512.min(protected_len - sector_offset);
-    let mut sector = [0u8; 512];
-    sector[..available].copy_from_slice(
-        source
-            .get(sector_start..sector_start + available)
-            .ok_or(Error::TooShort)?,
-    );
-    Ok(sector)
-}
-
 struct EncryptedHeader {
     block: BlockHeader,
     header: Vec<u8>,
@@ -1610,59 +782,6 @@ impl EncryptedHeaderCipherCache {
 
 fn map_rar30_crypto_error(error: Rar30Error) -> Error {
     Error::from(error)
-}
-
-fn decrypt_encrypted_header_at(
-    archive: &[u8],
-    offset: usize,
-    password: &[u8],
-    cipher_cache: &mut EncryptedHeaderCipherCache,
-) -> Result<EncryptedHeader> {
-    let salt = read_header_salt(archive, offset)?;
-    let first_ciphertext = archive
-        .get(offset + 8..offset + 24)
-        .ok_or(Error::TooShort)?;
-    let mut cipher = cipher_cache.cipher(password, salt)?;
-    let mut first_block = [0u8; 16];
-    first_block.copy_from_slice(first_ciphertext);
-    cipher
-        .decrypt_in_place(&mut first_block)
-        .map_err(map_rar30_crypto_error)?;
-    let head_size = read_u16(&first_block, 5)? as usize;
-    if head_size < 7 {
-        return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
-    }
-    let encrypted_header_size = checked_align16(head_size, "RAR 1.5 block size overflows usize")?;
-    let encrypted_start = offset
-        .checked_add(8)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
-    let encrypted_end = encrypted_start
-        .checked_add(encrypted_header_size)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    let encrypted_rest = archive
-        .get(offset + 24..encrypted_end)
-        .ok_or(Error::TooShort)?;
-    let mut header = Vec::with_capacity(encrypted_header_size);
-    header.extend_from_slice(&first_block);
-    header.extend_from_slice(encrypted_rest);
-    cipher
-        .decrypt_in_place(&mut header[16..])
-        .map_err(map_rar30_crypto_error)?;
-    header.truncate(head_size);
-
-    let mut block = parse_block_header(&header, 0)?;
-    block.offset = offset;
-    let payload_size = usize::try_from(block.add_size.unwrap_or(0))
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    let total_size = 8usize
-        .checked_add(encrypted_header_size)
-        .and_then(|size| size.checked_add(payload_size))
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    Ok(EncryptedHeader {
-        block,
-        header,
-        total_size,
-    })
 }
 
 fn read_encrypted_header_at(
@@ -2120,17 +1239,6 @@ fn file_block_total_size(
         .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))
 }
 
-fn checked_block_next(block: &BlockHeader, total: usize, archive_len: usize) -> Result<usize> {
-    let next = block
-        .offset
-        .checked_add(total)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    if next > archive_len {
-        return Err(Error::TooShort);
-    }
-    Ok(next)
-}
-
 fn checked_file_block_next(
     sfx_offset: usize,
     block: &BlockHeader,
@@ -2171,22 +1279,6 @@ fn packed_range(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_write_main_header(out: &mut Vec<u8>, flags: u16) {
-        let start = out.len();
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.push(MAIN_HEAD);
-        out.extend_from_slice(&flags.to_le_bytes());
-        out.extend_from_slice(&13u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        test_write_header_crc(out, start);
-    }
-
-    fn test_write_header_crc(out: &mut [u8], start: usize) {
-        let crc = (crc32(&out[start + 2..]) & 0xffff) as u16;
-        out[start..start + 2].copy_from_slice(&crc.to_le_bytes());
-    }
 
     fn legacy_auth_block(head_type: u8, head_size: u16) -> Vec<u8> {
         let mut block = vec![0; head_size as usize];
@@ -2268,35 +1360,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fhd_large_archive_extent_uses_high_packed_size_without_underflowing() {
-        let name = b"large-zero-low.bin";
-        let head_size = 32 + 8 + name.len();
-        let mut archive = Vec::from(RAR15_SIGNATURE);
-        test_write_main_header(&mut archive, 0);
-
-        let start = archive.len();
-        archive.extend_from_slice(&0u16.to_le_bytes());
-        archive.push(FILE_HEAD);
-        archive.extend_from_slice(&(LONG_BLOCK | FHD_LARGE).to_le_bytes());
-        archive.extend_from_slice(&(head_size as u16).to_le_bytes());
-        archive.extend_from_slice(&0u32.to_le_bytes());
-        archive.extend_from_slice(&0u32.to_le_bytes());
-        archive.push(3);
-        archive.extend_from_slice(&0u32.to_le_bytes());
-        archive.extend_from_slice(&0x5a21_0000u32.to_le_bytes());
-        archive.push(29);
-        archive.push(0x35);
-        archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        archive.extend_from_slice(&0x20u32.to_le_bytes());
-        archive.extend_from_slice(&1u32.to_le_bytes());
-        archive.extend_from_slice(&1u32.to_le_bytes());
-        archive.extend_from_slice(name);
-        test_write_header_crc(&mut archive, start);
-
-        assert!(matches!(Archive::parse(&archive), Err(Error::TooShort)));
-    }
-
     fn block_header_with(flags: u16) -> BlockHeader {
         BlockHeader {
             head_crc: 0,
@@ -2325,155 +1388,6 @@ mod tests {
             ext_time: Vec::new(),
             packed_range: 0..0,
         }
-    }
-
-    fn main_header_with(flags: u16) -> MainHeader {
-        MainHeader {
-            head_crc: 0,
-            flags,
-            head_size: 13,
-            reserved1: 0,
-            reserved2: 0,
-            encrypt_version: None,
-        }
-    }
-
-    #[test]
-    fn main_header_predicates_match_each_flag_bit() {
-        let cases = [
-            (MHD_VOLUME, MainHeader::is_volume as fn(&MainHeader) -> bool),
-            (MHD_COMMENT, MainHeader::has_archive_comment),
-            (MHD_SOLID, MainHeader::is_solid),
-            (MHD_NEWNUMBERING, MainHeader::uses_new_numbering),
-            (MHD_PROTECT, MainHeader::has_recovery_record),
-            (MHD_PASSWORD, MainHeader::has_encrypted_headers),
-            (MHD_FIRSTVOLUME, MainHeader::is_first_volume),
-        ];
-        let zero = main_header_with(0);
-        for (bit, predicate) in cases {
-            assert!(
-                !predicate(&zero),
-                "expected false when bit {bit:#x} is clear"
-            );
-            let one = main_header_with(bit);
-            assert!(predicate(&one), "expected true when bit {bit:#x} is set");
-        }
-    }
-
-    #[test]
-    fn file_header_flag_predicates_track_each_bit() {
-        let cases = [
-            (
-                FHD_SPLIT_BEFORE,
-                FileHeader::is_split_before as fn(&FileHeader) -> bool,
-            ),
-            (FHD_SPLIT_AFTER, FileHeader::is_split_after),
-            (FHD_PASSWORD, FileHeader::is_encrypted),
-            (FHD_SOLID, FileHeader::is_solid),
-            (FHD_EXTTIME, FileHeader::has_ext_time),
-        ];
-        let zero = file_header_with(0);
-        for (bit, predicate) in cases {
-            assert!(
-                !predicate(&zero),
-                "expected false on FileHeader for bit {bit:#x}"
-            );
-            let one = file_header_with(bit);
-            assert!(
-                predicate(&one),
-                "expected true on FileHeader for bit {bit:#x}"
-            );
-        }
-
-        let directory = file_header_with(FHD_DIRECTORY_MASK);
-        assert!(directory.is_directory());
-        assert!(!file_header_with(0).is_directory());
-
-        let stored = file_header_with(0);
-        assert!(stored.is_stored());
-        let mut packed = file_header_with(0);
-        packed.method = 0x33;
-        assert!(!packed.is_stored());
-    }
-
-    #[test]
-    fn file_header_comment_extracts_payload_after_two_byte_size_prefix() {
-        let mut without_flag = file_header_with(0);
-        without_flag.file_comment = vec![3, 0, b'a', b'b', b'c'];
-        assert!(!without_flag.has_file_comment());
-        assert_eq!(without_flag.file_comment().unwrap(), None);
-
-        let mut with_flag = file_header_with(FHD_COMMENT);
-        with_flag.file_comment = vec![3, 0, b'h', b'e', b'y'];
-        assert!(with_flag.has_file_comment());
-        assert_eq!(with_flag.file_comment().unwrap().unwrap(), b"hey");
-
-        let mut empty_flagged = file_header_with(FHD_COMMENT);
-        empty_flagged.file_comment.clear();
-        assert!(!empty_flagged.has_file_comment());
-
-        let mut truncated = file_header_with(FHD_COMMENT);
-        truncated.file_comment = vec![10, 0, b'a'];
-        assert!(matches!(truncated.file_comment(), Err(Error::TooShort)));
-    }
-
-    #[test]
-    fn file_header_name_metadata_and_crc_helpers_describe_entry() {
-        let mut header = file_header_with(0);
-        header.name = b"r\xc3\xa9sum\xc3\xa9.txt".to_vec();
-        header.file_crc = crc32(b"hello");
-        header.attr = 0x20;
-        header.host_os = 3;
-        header.file_time = 0x5a21_0000;
-
-        assert_eq!(header.name_bytes(), b"r\xc3\xa9sum\xc3\xa9.txt");
-        assert_eq!(header.name_lossy(), "résumé.txt");
-        let meta = header.metadata();
-        assert_eq!(meta.name, header.name);
-        assert_eq!(meta.attr, 0x20);
-        assert_eq!(meta.host_os, 3);
-        assert_eq!(meta.file_time, 0x5a21_0000);
-        assert!(!meta.is_directory);
-
-        header.verify_crc32(b"hello").unwrap();
-        match header.verify_crc32(b"different") {
-            Err(Error::Crc32Mismatch { expected, actual }) => {
-                assert_eq!(expected, header.file_crc);
-                assert_ne!(actual, expected);
-            }
-            other => panic!("expected Crc32Mismatch, got {other:?}"),
-        }
-
-        let directory = file_header_with(FHD_DIRECTORY_MASK);
-        assert!(directory.metadata().is_directory);
-
-        // Garbage bytes still produce a String through lossy decoding.
-        let mut garbage = file_header_with(0);
-        garbage.name = vec![0xff, 0xfe, b'/', 0x80, b'x'];
-        let lossy = garbage.name_lossy();
-        assert!(lossy.ends_with("/\u{fffd}x"), "got {lossy:?}");
-    }
-
-    #[test]
-    fn newsub_header_name_lossy_delegates_to_inner_file_header() {
-        let mut file = file_header_with(0);
-        file.name = b"CMT".to_vec();
-        let sub = NewSubHeader {
-            file,
-            kind: NewSubKind::ArchiveComment,
-        };
-        assert_eq!(sub.name_lossy(), "CMT");
-    }
-
-    #[test]
-    fn writer_options_constructor_and_default_match_documented_targets() {
-        let default = WriterOptions::default();
-        assert_eq!(default.target, ArchiveVersion::Rar15);
-        assert_eq!(default.features, FeatureSet::store_only());
-
-        let explicit = WriterOptions::new(ArchiveVersion::Rar20, FeatureSet::store_only());
-        assert_eq!(explicit.target, ArchiveVersion::Rar20);
-        assert_eq!(explicit.features, FeatureSet::store_only());
     }
 
     #[test]

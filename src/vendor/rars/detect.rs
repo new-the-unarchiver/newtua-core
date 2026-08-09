@@ -20,10 +20,6 @@ pub struct ArchiveSignature {
     pub length: usize,
 }
 
-pub fn detect_archive_family(input: &[u8]) -> Option<ArchiveSignature> {
-    detect_at(input, 0)
-}
-
 const SIGNATURES: &[&[u8]] = &[RAR50_SIGNATURE, RAR15_SIGNATURE, RAR13_SIGNATURE];
 const MAX_SIGNATURE_LEN: usize = {
     let mut max_len = 0;
@@ -85,53 +81,9 @@ pub fn find_archive_start(input: &[u8], max_scan: usize) -> Option<ArchiveSignat
     first_rar13.filter(|sig| sig.offset <= max_scan)
 }
 
-fn detect_at(input: &[u8], offset: usize) -> Option<ArchiveSignature> {
-    let tail = input.get(offset..)?;
-
-    if tail.starts_with(RAR50_SIGNATURE) {
-        Some(ArchiveSignature {
-            family: ArchiveFamily::Rar50Plus,
-            offset,
-            length: RAR50_SIGNATURE.len(),
-        })
-    } else if tail.starts_with(RAR15_SIGNATURE) {
-        Some(ArchiveSignature {
-            family: ArchiveFamily::Rar15To40,
-            offset,
-            length: RAR15_SIGNATURE.len(),
-        })
-    } else if tail.starts_with(RAR13_SIGNATURE) {
-        Some(ArchiveSignature {
-            family: ArchiveFamily::Rar13,
-            offset,
-            length: RAR13_SIGNATURE.len(),
-        })
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detects_all_known_signatures() {
-        assert_eq!(
-            detect_archive_family(b"RE~^").unwrap().family,
-            ArchiveFamily::Rar13
-        );
-        assert_eq!(
-            detect_archive_family(b"Rar!\x1a\x07\x00").unwrap().family,
-            ArchiveFamily::Rar15To40
-        );
-        assert_eq!(
-            detect_archive_family(b"Rar!\x1a\x07\x01\x00")
-                .unwrap()
-                .family,
-            ArchiveFamily::Rar50Plus
-        );
-    }
 
     #[test]
     fn finds_sfx_prefixed_archive() {
@@ -145,14 +97,6 @@ mod tests {
         let sig = find_archive_start(b"stub RE~^ bytes Rar!\x1a\x07\x00payload", 128).unwrap();
         assert_eq!(sig.family, ArchiveFamily::Rar15To40);
         assert_eq!(sig.offset, 16);
-    }
-
-    #[test]
-    fn rejects_unknown_and_truncated_signatures() {
-        assert_eq!(detect_archive_family(b""), None);
-        assert_eq!(detect_archive_family(b"RAR!"), None);
-        assert_eq!(detect_archive_family(b"Rar!\x1a\x07"), None);
-        assert_eq!(find_archive_start(b"not an archive", 128), None);
     }
 
     #[test]

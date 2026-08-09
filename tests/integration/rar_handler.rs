@@ -109,19 +109,24 @@ fn verify_password_with_correct_password_is_ok() {
 
 // ── Timestamps ───────────────────────────────────────────────────────────────
 
-/// RAR's date reaches the entry, read as local time.
+/// RAR 5 хранит момент времени, и он доходит до записи точно.
 ///
-/// `meta.rar` stores the packed MS-DOS pair `0x5CD538A6` — 2026-06-21 07:05:12
-/// on the wall, with no timezone attached, exactly like zip's identical field.
-/// So the instant depends on the machine running the test, and the assertions
-/// are stated in a way that does not: the wall clock has to land within a
-/// plausible zone offset of its UTC reading, and the seconds have to stay even.
+/// Не «часы на стене», как MS-DOS в zip и в RAR 4, а мгновение: `rar` 7.22
+/// кладёт его в расширенную запись заголовка `FHEXTRA_HTIME` восьмибайтовым
+/// `FILETIME`. Поэтому и ожидание здесь — одно число, не зависящее от того, в
+/// каком поясе гоняют тесты.
 ///
-/// `unar` reports 02:05:13Z for the same file — one second later — because RAR 5
-/// *also* stores an exact instant, which the DOS field cannot express and which
-/// we cannot reach; see the note in `format/rar.rs`.
+/// Судья не наш код: `unrar lt` (утилита самой libunrar, из Homebrew) на этой
+/// же фикстуре говорит `2026-06-21 02:05:13,308719877` при `TZ=UTC`, то есть
+/// 1782007513 секунд от эпохи. То же мгновение показывает и `unar`.
+///
+/// До тикета 26 здесь стояла обратная проверка — «секунда обязана быть
+/// чётной». Читалось только слово MS-DOS с шагом в две секунды, потому что
+/// биндинг libunrar не отдавал наружу ничего точнее, и файл, упакованный на
+/// нечётной секунде, показывался на секунду раньше правды. Своему
+/// распаковщику это поле доступно.
 #[test]
-fn rar_reports_the_stored_modification_time_as_local() {
+fn rar5_reports_the_exact_stored_instant() {
     let (_tmp, mut ar) = open_fixture(META_FIXTURE, &OpenOptions::default());
     let e = &ar.entries().unwrap()[0];
 
@@ -132,18 +137,9 @@ fn rar_reports_the_stored_modification_time_as_local() {
         .expect("post-epoch")
         .as_secs();
 
-    // 2026-06-21T07:05:12Z — the wall clock read as if it were UTC. A real
-    // timezone moves this by at most fourteen hours in either direction.
-    let wall_as_utc: i64 = 1_782_025_512;
-    let offset = wall_as_utc - secs as i64;
-    assert!(
-        offset.abs() <= 14 * 3600,
-        "expected the stored wall clock read locally; off by {offset} s"
-    );
     assert_eq!(
-        secs % 2,
-        0,
-        "the DOS field resolves to two seconds, so an odd second means a bug"
+        secs, 1_782_007_513,
+        "2026-06-21T02:05:13Z, как у `unrar lt`"
     );
 }
 
@@ -382,4 +378,72 @@ fn a_multivolume_set_reads_a_subset() {
     let mut sink = Collector::default();
     ar.read_entries(&[2], &mut sink).unwrap();
     assert_eq!(sink.body(2), blob(3, 12_000));
+}
+
+// ── RAR 1.5: настоящий архив эпохи, судья — `unar` ───────────────────────────
+
+// rar15.rar — образец `RUN.RAR` из набора sembiance/file-format-samples,
+// семь батников с BBS 1995 года. Метод 51 (`-m3`), версия распаковщика 15:
+// это `Unpack15`, самый старый живой декодер в наборе, и создать такой архив
+// сегодня нечем — `rar` 7.22 выкинул даже `-ma4`.
+//
+// Ожидаемое взято **не у нас**: суммы посчитаны с того, что распаковал `unar`
+// из этого же файла. Пока RAR читался через libunrar, ту же ветку сторожил
+// юнит-тест вендоренного кода, но он сам себе был судьёй — паковал нашим же
+// кодировщиком и тут же распаковывал. Кодировщик ушёл в тикете 26, и хорошо:
+// проверка от этого стала честнее.
+const RAR15: &[u8] = include_bytes!("../fixtures/rar15.rar");
+
+#[test]
+fn rar15_matches_unar_byte_for_byte() {
+    let (_tmp, mut ar) = open_fixture(RAR15, &OpenOptions::default());
+    let names: Vec<String> = ar
+        .entries()
+        .unwrap()
+        .iter()
+        .map(|e| e.path.to_string_lossy().into_owned())
+        .collect();
+
+    let expected: [(&str, &str); 7] = [
+        (
+            "EXEBBS.BAT",
+            "43a61403a7d1f8896cb2b6393c46f1517cf9acc3948a395b5b4baa8ba6bf0d56",
+        ),
+        (
+            "1.BAT",
+            "09c18ec9c9d0cbd4fe4b096b912bb33145899c468d0cf16e867beaaf2c4d8c79",
+        ),
+        (
+            "RUN.BAT",
+            "8302b778be24b58e9981f383e722d6d2e68113b005f551fba94e779bced57117",
+        ),
+        (
+            "RUN0.BAT",
+            "800dad3d7496f721d0f672fb94633a8390de4a08c96ea7aa2f072919e5cef44d",
+        ),
+        (
+            "DOBBS0.BAT",
+            "82cd99cbacfb310fd4f88189628dee0b72f7007d97d77f11b8e3acd11bbabfef",
+        ),
+        (
+            "DOBBS.BAT",
+            "5bb51f4f59667ed7492f07a0b37688de56b36ff0395c8cd67188db5b1948f3db",
+        ),
+        (
+            "DOBBS1.BAT",
+            "92b1e64e95f1be6a13c3c1f9d7d0789cf9d6a5e02e9c4bfc9a222fcf0150d37e",
+        ),
+    ];
+    assert_eq!(names.len(), expected.len(), "записей в архиве: {names:?}");
+
+    for (idx, (name, digest)) in expected.iter().enumerate() {
+        assert_eq!(&names[idx], name, "запись {idx} — не та");
+        let mut out = Vec::new();
+        ar.read_entry(idx, &mut out).unwrap();
+        assert_eq!(
+            &crate::common::sha256_hex(&out),
+            digest,
+            "тело {name} разошлось с тем, что достаёт `unar`"
+        );
+    }
 }

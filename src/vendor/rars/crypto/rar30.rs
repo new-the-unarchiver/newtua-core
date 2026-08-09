@@ -1,5 +1,5 @@
 use aes::Aes128;
-use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, KeyInit};
 use sha1::{Digest, Sha1 as FastSha1};
 use std::str;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -48,25 +48,6 @@ impl Rar30Cipher {
             self.decrypt_block(block);
         }
         Ok(())
-    }
-
-    pub fn encrypt_in_place(&mut self, data: &mut [u8]) -> Result<()> {
-        if !data.len().is_multiple_of(16) {
-            return Err(Error::UnalignedInput);
-        }
-        for block in data.chunks_exact_mut(16) {
-            self.encrypt_block(block);
-        }
-        Ok(())
-    }
-
-    fn encrypt_block(&mut self, block: &mut [u8]) {
-        for (byte, iv_byte) in block.iter_mut().zip(self.iv) {
-            *byte ^= iv_byte;
-        }
-        let block: &mut [u8; 16] = block.try_into().expect("AES block size");
-        self.cipher.encrypt_block(block.into());
-        self.iv.copy_from_slice(block);
     }
 
     fn decrypt_block(&mut self, block: &mut [u8]) {
@@ -193,80 +174,6 @@ mod tests {
             raw.extend_from_slice(&salt);
         }
         raw
-    }
-
-    #[test]
-    fn rar30_aes_encrypt_decrypt_round_trips_blocks() {
-        let salt = Some([1, 2, 3, 4, 5, 6, 7, 8]);
-        let mut data = *b"0123456789abcdefRAR AES CBC data";
-        let plain = data;
-
-        Rar30Cipher::new(b"password", salt)
-            .unwrap()
-            .encrypt_in_place(&mut data)
-            .unwrap();
-        assert_eq!(
-            data,
-            [
-                0x5e, 0x59, 0xce, 0xa1, 0x16, 0xca, 0xa2, 0x1d, 0x4d, 0xc5, 0x05, 0xeb, 0xa9, 0x3f,
-                0x7b, 0xcd, 0x0d, 0x04, 0xff, 0xea, 0x60, 0x67, 0x3d, 0xaf, 0x6a, 0x8f, 0x02, 0xb2,
-                0x03, 0xc8, 0x7d, 0xde,
-            ]
-        );
-
-        Rar30Cipher::new(b"password", salt)
-            .unwrap()
-            .decrypt_in_place(&mut data)
-            .unwrap();
-        assert_eq!(data, plain);
-    }
-
-    #[test]
-    fn rar30_aes_round_trips_with_long_password_slow_path() {
-        // Password long enough that utf-16(password) + 8-byte salt >= 64,
-        // forcing derive_key_iv to use the RAR3 password-buffer mutation path
-        // instead of derive_key_iv_fast.
-        let password = b"this-password-is-deliberately-long-enough-to-exceed-64-bytes-utf16";
-        let salt = Some(*b"longsalt");
-        let mut data = *b"0123456789abcdefRAR AES CBC data";
-        let plain = data;
-
-        Rar30Cipher::new(password, salt)
-            .unwrap()
-            .encrypt_in_place(&mut data)
-            .unwrap();
-        assert_eq!(
-            data,
-            [
-                0xb9, 0xa7, 0xac, 0x4b, 0x81, 0x0a, 0x5c, 0xf1, 0x6e, 0xd4, 0x5a, 0x4c, 0xbc, 0x1e,
-                0x2e, 0xef, 0x53, 0x7b, 0x89, 0x63, 0x7a, 0xc5, 0x7a, 0x1e, 0xfc, 0x43, 0x3c, 0x18,
-                0xea, 0xfd, 0x54, 0xed,
-            ]
-        );
-
-        Rar30Cipher::new(password, salt)
-            .unwrap()
-            .decrypt_in_place(&mut data)
-            .unwrap();
-        assert_eq!(data, plain);
-    }
-
-    #[test]
-    fn rar30_aes_rejects_partial_tail() {
-        let mut data = *b"partial block!!";
-
-        assert_eq!(
-            Rar30Cipher::new(b"password", None)
-                .unwrap()
-                .encrypt_in_place(&mut data),
-            Err(Error::UnalignedInput)
-        );
-        assert_eq!(
-            Rar30Cipher::new(b"password", None)
-                .unwrap()
-                .decrypt_in_place(&mut data),
-            Err(Error::UnalignedInput)
-        );
     }
 
     #[test]

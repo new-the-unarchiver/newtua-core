@@ -63,16 +63,6 @@ impl Rar20Cipher {
         Ok(())
     }
 
-    pub fn encrypt_in_place(&mut self, data: &mut [u8]) -> Result<()> {
-        if !data.len().is_multiple_of(16) {
-            return Err(Error::UnalignedInput);
-        }
-        for block in data.chunks_exact_mut(16) {
-            self.encrypt_block(block);
-        }
-        Ok(())
-    }
-
     fn set_key(&mut self, password: &[u8]) {
         for j in 0..=255u32 {
             for i in (0..password.len()).step_by(2) {
@@ -179,43 +169,32 @@ fn write_block(block: &mut [u8], a: u32, b: u32, c: u32, d: u32) {
 mod tests {
     use super::{Error, Rar20Cipher};
 
+    /// NEWTUA: расшифровка RAR 2.0 сходится с закреплёнными двумя блоками.
+    ///
+    /// Как и у RAR 1.3: числа из теста апстрима, шифратор к ним больше не
+    /// нужен.
     #[test]
-    fn rar20_encrypt_decrypt_round_trips_blocks() {
-        let mut encrypted = *b"0123456789abcdefRAR2.0 block pad";
-        let original = encrypted;
-
+    fn rar20_cipher_decrypts_a_pinned_block_pair() {
+        let mut data = [
+            0xb7, 0x14, 0x54, 0x5a, 0x55, 0x8b, 0xca, 0xf7, 0xbc, 0x18, 0x38, 0x17, 0x1d, 0x9e,
+            0x31, 0xab, 0x81, 0x40, 0x72, 0xfe, 0x02, 0x76, 0x76, 0x65, 0x4a, 0xa5, 0x3f, 0x4b,
+            0xb3, 0x0c, 0xad, 0x07,
+        ];
         Rar20Cipher::new(b"password")
-            .encrypt_in_place(&mut encrypted)
+            .decrypt_in_place(&mut data)
             .unwrap();
-        assert_eq!(
-            encrypted,
-            [
-                0xb7, 0x14, 0x54, 0x5a, 0x55, 0x8b, 0xca, 0xf7, 0xbc, 0x18, 0x38, 0x17, 0x1d, 0x9e,
-                0x31, 0xab, 0x81, 0x40, 0x72, 0xfe, 0x02, 0x76, 0x76, 0x65, 0x4a, 0xa5, 0x3f, 0x4b,
-                0xb3, 0x0c, 0xad, 0x07,
-            ]
-        );
-
-        Rar20Cipher::new(b"password")
-            .decrypt_in_place(&mut encrypted)
-            .unwrap();
-        assert_eq!(encrypted, original);
+        assert_eq!(&data, b"0123456789abcdefRAR2.0 block pad");
     }
 
+    /// NEWTUA: хвост не в размер блока — отказ, и данные не тронуты.
     #[test]
-    fn rar20_cipher_rejects_partial_tail() {
+    fn rar20_cipher_rejects_a_partial_tail() {
         let mut data = *b"0123456789abcdef!";
         let original = data;
-
-        assert_eq!(
-            Rar20Cipher::new(b"password").encrypt_in_place(&mut data),
-            Err(Error::UnalignedInput)
-        );
-        assert_eq!(data, original);
         assert_eq!(
             Rar20Cipher::new(b"password").decrypt_in_place(&mut data),
             Err(Error::UnalignedInput)
         );
-        assert_eq!(data, original);
+        assert_eq!(data, original, "отказ не должен ничего испортить");
     }
 }

@@ -30,32 +30,26 @@ by Microsoft; the public description of it is Matthew Russotto's.
 The read half of the `rars` crate (https://github.com/bitplane/rars, © Gareth
 Davidson) is carried at src/vendor/rars/ for a different reason: that release is
 published and installable, but the engine keeps changes of its own to it and
-does not follow its weekly releases. Note a discrepancy that is upstream's own — release 0.4.8 declares "MIT OR Apache-2.0"
+does not follow its weekly releases. This is what decodes RAR today, from
+RAR 1.3 through RAR 7, in pure Rust. Note a discrepancy that is upstream's own — release 0.4.8 declares "MIT OR Apache-2.0"
 in Cargo.toml while the only license file in that repository is COPYING (WTFPL
 with an added "don't blame me" clause), and no MIT or Apache text ships with it.
 Both readings permit this use; the text that actually travelled with the code is
 beside it at src/vendor/rars/COPYING, and src/vendor/rars/VENDORED.md records
 the release, everything removed, and every change of ours.
 
-The engine also depends on four forced forks of third-party crates —
-newtua-unrar, newtua-apfs, newtua-hfsplus and newtua-cdfs — which retain the
+The engine also depends on three forced forks of third-party crates —
+newtua-apfs, newtua-hfsplus and newtua-cdfs — which retain the
 licenses of their respective upstream projects. Each fork's README explains why it exists
 and states the license it carries.
 
-RAR support and the UnRAR license. RAR archives are read through libunrar, by
-way of the newtua-unrar fork. That is still the shipping path: the vendored
-`rars` reader described above is in the tree but not yet wired to the RAR
-handler, so everything in this section applies unchanged until it is. The UnRAR sources are not part of this
-repository: Cargo fetches them (as unrar_sys) at build time. They carry a
-license of their own (© Alexander Roshal) that permits use in any software
-handling RAR archives, but forbids using the code to build a RAR-compatible
-archiver.
-
-That restriction reaches no user of this software. newtua never creates
-archives — it extracts and lists only — so no RAR compressor can be derived
-from it. Where a build does combine the two, the result is conveyed under
-section 4 of the LGPL v3, which permits a Combined Work under other terms
-provided the library is identified and its license supplied. Binary artifacts
-published by this project ship the UnRAR license text alongside this notice.
+RAR support and the UnRAR license. There is no longer anything here to which
+that license applies. RAR archives used to be read through libunrar, by way of
+a fourth forced fork (newtua-unrar); its sources were fetched at build time and
+carried a license of their own (© Alexander Roshal) permitting use in any
+software that handles RAR archives while forbidding the building of a
+RAR-compatible archiver. Since the vendored `rars` reader was wired to the RAR
+handler, that dependency is gone from the build entirely: RAR is decoded in
+pure Rust, and nothing in this crate is governed by the UnRAR license.
 
 SPDX-License-Identifier: LGPL-3.0-or-later

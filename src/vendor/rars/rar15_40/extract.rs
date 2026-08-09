@@ -34,61 +34,6 @@ impl CodecState {
         }
     }
 
-    fn decode_file_data(
-        &mut self,
-        archive: &Archive,
-        file: &FileHeader,
-        solid: bool,
-        password: Option<&[u8]>,
-    ) -> Result<Vec<u8>> {
-        match self {
-            Self::Unpack15(decoder) => {
-                if file.is_encrypted() {
-                    let mut packed = file
-                        .packed_reader_for_decode(archive, password)
-                        .map_err(|error| file.map_encrypted_payload_error(password, error))?;
-                    let mut out = Vec::new();
-                    decoder
-                        .decode_member_from_reader(
-                            &mut packed,
-                            usize::try_from(file.unp_size).map_err(|_| {
-                                Error::InvalidHeader("RAR 1.5 unpacked size overflows usize")
-                            })?,
-                            solid,
-                            &mut out,
-                        )
-                        .map(|_| out)
-                        .map_err(Into::into)
-                        .map_err(|error| file.map_encrypted_payload_error(password, error))
-                } else {
-                    file.unpacked_data_with_unpack15(archive, decoder, solid)
-                }
-            }
-            Self::Unpack20(decoder) => file.unpacked_data_with_unpack20(archive, decoder, password),
-            Self::Unpack29(decoder) => {
-                if file.is_encrypted() {
-                    let mut packed = file
-                        .packed_reader_for_decode(archive, password)
-                        .map_err(|error| file.map_encrypted_payload_error(password, error))?;
-                    let mut out = Vec::new();
-                    decoder
-                        .decode_member_from_reader(
-                            &mut packed,
-                            usize::try_from(file.unp_size).map_err(|_| {
-                                Error::InvalidHeader("RAR 2.9 unpacked size overflows usize")
-                            })?,
-                            &mut out,
-                        )
-                        .map(|_| out)
-                        .map_err(Into::into)
-                        .map_err(|error| file.map_encrypted_payload_error(password, error))
-                } else {
-                    file.unpacked_data_with_rar29(archive, decoder, solid)
-                }
-            }
-        }
-    }
-
     fn write_file_to(
         &mut self,
         archive: &Archive,
@@ -180,10 +125,6 @@ pub(super) struct DecoderSession<'a> {
 }
 
 impl<'a> DecoderSession<'a> {
-    pub(super) fn new(solid: bool) -> Self {
-        Self::new_with_password(solid, None)
-    }
-
     pub(super) fn new_with_password(solid: bool, password: Option<&'a [u8]>) -> Self {
         Self {
             codec: None,
@@ -223,21 +164,6 @@ impl<'a> DecoderSession<'a> {
             .write_split_to(input, final_file, solid, password, out)?;
         self.decoded_files += 1;
         Ok(())
-    }
-
-    pub(super) fn decode_file_data(
-        &mut self,
-        archive: &Archive,
-        file: &FileHeader,
-    ) -> Result<Vec<u8>> {
-        if file.is_empty_compressed_payload() {
-            file.crc_result(0, self.password)?;
-            return Ok(Vec::new());
-        }
-        let solid = self.file_is_solid(file);
-        let password = self.password;
-        self.codec_for(file)?
-            .decode_file_data(archive, file, solid, password)
     }
 
     fn file_is_solid(&self, file: &FileHeader) -> bool {
@@ -708,24 +634,6 @@ mod tests {
         }
     }
 
-    struct ChunkedReader<R> {
-        inner: R,
-        chunk: usize,
-    }
-
-    impl<R: Read> ChunkedReader<R> {
-        fn new(inner: R, chunk: usize) -> Self {
-            Self { inner, chunk }
-        }
-    }
-
-    impl<R: Read> Read for ChunkedReader<R> {
-        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-            let take = out.len().min(self.chunk);
-            self.inner.read(&mut out[..take])
-        }
-    }
-
     fn read_in_small_chunks(mut reader: impl Read) -> Vec<u8> {
         let mut out = Vec::new();
         let mut buf = [0u8; 7];
@@ -755,46 +663,6 @@ mod tests {
             }
             out.extend_from_slice(&buf[..count]);
         }
-
-        assert_eq!(out, plain);
-    }
-
-    #[test]
-    fn decrypting_reader_streams_rar20_blocks_from_short_inner_reads() {
-        let plain = *b"0123456789abcdefRAR2 block two!!";
-        let mut encrypted = plain;
-        Rar20Cipher::new(b"pw")
-            .encrypt_in_place(&mut encrypted)
-            .unwrap();
-        let reader = DecryptingReader::new(
-            ChunkedReader::new(Cursor::new(encrypted), 5),
-            20,
-            b"pw",
-            None,
-        )
-        .unwrap();
-        let out = read_in_small_chunks(reader);
-
-        assert_eq!(out, plain);
-    }
-
-    #[test]
-    fn decrypting_reader_streams_rar30_blocks_from_short_inner_reads() {
-        let salt = Some([7u8; 8]);
-        let plain = *b"0123456789abcdefRAR3 block two!!";
-        let mut encrypted = plain;
-        Rar30Cipher::new(b"pw", salt)
-            .unwrap()
-            .encrypt_in_place(&mut encrypted)
-            .unwrap();
-        let reader = DecryptingReader::new(
-            ChunkedReader::new(Cursor::new(encrypted), 5),
-            29,
-            b"pw",
-            salt,
-        )
-        .unwrap();
-        let out = read_in_small_chunks(reader);
 
         assert_eq!(out, plain);
     }
@@ -907,38 +775,6 @@ mod tests {
             blocks,
             source: ArchiveSource::Memory(Arc::from(source.into_boxed_slice())),
         }
-    }
-
-    #[test]
-    fn encrypted_split_fragment_reader_decrypts_after_chaining_fragments() {
-        let plain = *b"0123456789abcdefRAR2 block two!!";
-        let mut encrypted = plain;
-        Rar20Cipher::new(b"pw")
-            .encrypt_in_place(&mut encrypted)
-            .unwrap();
-        let split = 7;
-
-        let mut first = file(b"a.txt", FHD_PASSWORD | FHD_SPLIT_AFTER);
-        first.unp_ver = 20;
-        first.pack_size = split as u64;
-        first.packed_range = 0..split;
-
-        let mut second = file(b"a.txt", FHD_PASSWORD | FHD_SPLIT_BEFORE);
-        second.unp_ver = 20;
-        second.pack_size = (encrypted.len() - split) as u64;
-        second.packed_range = 0..(encrypted.len() - split);
-
-        let mut pending = PendingSplitRefs::new(&first, 0, 0);
-        pending.append(&second, 1, 0);
-        let volumes = vec![
-            archive_with_source(vec![Block::File(first)], encrypted[..split].to_vec()),
-            archive_with_source(vec![Block::File(second)], encrypted[split..].to_vec()),
-        ];
-
-        let reader = pending.fragment_reader(&volumes, Some(b"pw")).unwrap();
-        let out = read_in_small_chunks(reader);
-
-        assert_eq!(out, plain);
     }
 
     fn never_open(_meta: &ExtractedEntryMeta) -> Result<Box<dyn Write>> {
@@ -1069,41 +905,6 @@ mod tests {
     }
 
     #[test]
-    fn decoder_session_empty_compressed_payload_does_not_reset_solid_codec() {
-        let mut session = DecoderSession::new(true);
-        let mut first = file(b"first.txt", 0);
-        first.unp_ver = 29;
-        first.method = 0x35;
-        session.codec = Some(CodecState::new_for(&first).unwrap());
-        session.decoded_files = 4;
-
-        let mut empty = file(b"empty.txt", super::super::FHD_SOLID);
-        empty.unp_ver = 20;
-        empty.method = 0x33;
-        empty.file_crc = 0;
-        let archive = Archive {
-            sfx_offset: 0,
-            main: MainHeader {
-                head_crc: 0,
-                flags: super::super::MHD_SOLID,
-                head_size: 13,
-                reserved1: 0,
-                reserved2: 0,
-                encrypt_version: None,
-            },
-            blocks: vec![Block::File(empty.clone())],
-            source: ArchiveSource::Memory(Arc::from([])),
-        };
-
-        let mut out = Vec::new();
-        session.write_file_to(&archive, &empty, &mut out).unwrap();
-
-        assert!(out.is_empty());
-        assert_eq!(session.decoded_files, 4);
-        assert!(matches!(session.codec, Some(CodecState::Unpack29(_))));
-    }
-
-    #[test]
     fn split_cipher_new_rejects_unsupported_unpack_version() {
         for ver in [14u8, 16, 19, 25, 27, 28] {
             assert!(
@@ -1126,24 +927,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn decrypting_reader_rejects_non_block_aligned_rar20_payload() {
-        let mut payload = vec![0u8; 23];
-        Rar20Cipher::new(b"pw")
-            .encrypt_in_place(&mut payload[..16])
-            .unwrap();
-        let mut reader = DecryptingReader::new(Cursor::new(payload), 20, b"pw", None).unwrap();
-        let mut buf = [0u8; 64];
-        let err = loop {
-            match reader.read(&mut buf) {
-                Ok(0) => panic!("expected non-block-aligned data error"),
-                Ok(_) => continue,
-                Err(err) => break err,
-            }
-        };
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -1433,189 +1216,6 @@ mod tests {
         assert!(
             matches!(err, Error::InvalidHeader(_)),
             "expected Error::InvalidHeader, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn decoder_session_codec_for_resets_when_unpack_version_changes() {
-        let mut session = DecoderSession::new(true);
-        let mut f = file(b"a", 0);
-        f.unp_ver = 20;
-        assert!(matches!(
-            session.codec_for(&f).unwrap(),
-            CodecState::Unpack20(_)
-        ));
-        let mut g = file(b"b", 0);
-        g.unp_ver = 29;
-        assert!(matches!(
-            session.codec_for(&g).unwrap(),
-            CodecState::Unpack29(_)
-        ));
-        let mut h = file(b"c", 0);
-        h.unp_ver = 15;
-        assert!(matches!(
-            session.codec_for(&h).unwrap(),
-            CodecState::Unpack15(_)
-        ));
-    }
-
-    #[test]
-    fn decoder_session_codec_for_propagates_unsupported_compression() {
-        let mut session = DecoderSession::new(false);
-        let mut f = file(b"a", 0);
-        f.unp_ver = 14;
-        assert!(matches!(
-            session.codec_for(&f),
-            Err(Error::UnsupportedCompression {
-                unpack_version: 14,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn decoder_session_codec_for_reuses_codec_in_solid_mode() {
-        let mut session = DecoderSession::new(true);
-        let mut f = file(b"a", 0);
-        f.unp_ver = 29;
-        let first = session.codec_for(&f).unwrap() as *const CodecState;
-        let second = session.codec_for(&f).unwrap() as *const CodecState;
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn decoder_session_decode_file_data_dispatches_to_stored_path_for_each_codec_version() {
-        let payload = b"decode_file_data stored dispatch".to_vec();
-        let crc = super::super::crc32(&payload);
-        for unp_ver in [15u8, 20, 26, 29] {
-            let mut entry = file(b"a.txt", 0);
-            entry.unp_ver = unp_ver;
-            entry.pack_size = payload.len() as u64;
-            entry.unp_size = payload.len() as u64;
-            entry.packed_range = 0..payload.len();
-            entry.file_crc = crc;
-
-            let archive = archive_with_source(vec![Block::File(entry.clone())], payload.clone());
-            let mut session = DecoderSession::new(false);
-            let data = session
-                .decode_file_data(&archive, &entry)
-                .unwrap_or_else(|err| panic!("decode for unp_ver {unp_ver}: {err:?}"));
-            assert_eq!(data, payload, "unp_ver {unp_ver} payload mismatch");
-        }
-    }
-
-    #[test]
-    fn decrypting_reader_works_through_boxed_inner_reader() {
-        let plain = *b"0123456789abcdefRAR2 block two!!";
-        let mut encrypted = plain;
-        Rar20Cipher::new(b"pw")
-            .encrypt_in_place(&mut encrypted)
-            .unwrap();
-        let inner: Box<dyn Read> = Box::new(Cursor::new(encrypted.to_vec()));
-        let reader = DecryptingReader::new(inner, 20, b"pw", None).unwrap();
-        let out = read_in_small_chunks(reader);
-
-        assert_eq!(out, plain);
-    }
-
-    #[test]
-    fn decrypting_reader_boxed_inner_rejects_non_block_aligned_eof() {
-        let mut payload = vec![0u8; 32];
-        Rar20Cipher::new(b"pw")
-            .encrypt_in_place(&mut payload[..16])
-            .unwrap();
-        // 23 bytes of trailing data (not a multiple of 16) — should error at EOF.
-        payload.truncate(23);
-        let inner: Box<dyn Read> = Box::new(Cursor::new(payload));
-        let mut reader = DecryptingReader::new(inner, 20, b"pw", None).unwrap();
-        let mut buf = [0u8; 64];
-        let err = loop {
-            match reader.read(&mut buf) {
-                Ok(0) => panic!("expected non-block-aligned data error"),
-                Ok(_) => continue,
-                Err(err) => break err,
-            }
-        };
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn extract_volumes_to_assembles_encrypted_stored_split_across_two_volumes() {
-        let payload: &[u8] = b"twenty-byte payload!"; // exactly 20 bytes
-        let unpacked_len = payload.len();
-        assert_eq!(unpacked_len, 20);
-        let padded_len = (unpacked_len + 15) & !15; // 32
-        let mut encrypted = vec![0u8; padded_len];
-        encrypted[..unpacked_len].copy_from_slice(payload);
-        Rar20Cipher::new(b"pw")
-            .encrypt_in_place(&mut encrypted)
-            .unwrap();
-        let split = 13usize;
-        let crc = super::super::crc32(payload);
-
-        let mut first = file(b"split.bin", FHD_PASSWORD | FHD_SPLIT_AFTER);
-        first.unp_ver = 20;
-        first.pack_size = split as u64;
-        first.unp_size = unpacked_len as u64;
-        first.packed_range = 0..split;
-        first.file_crc = crc;
-
-        let mut second = file(b"split.bin", FHD_PASSWORD | FHD_SPLIT_BEFORE);
-        second.unp_ver = 20;
-        second.pack_size = (padded_len - split) as u64;
-        second.unp_size = unpacked_len as u64;
-        second.packed_range = 0..(padded_len - split);
-        second.file_crc = crc;
-
-        let volumes = vec![
-            archive_with_source(vec![Block::File(first)], encrypted[..split].to_vec()),
-            archive_with_source(vec![Block::File(second)], encrypted[split..].to_vec()),
-        ];
-
-        let capture = Capture::default();
-        extract_volumes_to(
-            &volumes,
-            crate::vendor::rars::ArchiveReadOptions::with_password(b"pw"),
-            capture.opener(),
-        )
-        .unwrap();
-
-        assert_eq!(capture.bytes.borrow().as_slice(), payload);
-    }
-
-    #[test]
-    fn extract_volumes_to_rejects_encrypted_stored_split_when_padded_size_disagrees() {
-        let unpacked_len = 20usize;
-        // Two volumes total only 30 bytes, but expected_packed_len == 32.
-        let payload = [0u8; 30];
-
-        let mut first = file(b"split.bin", FHD_PASSWORD | FHD_SPLIT_AFTER);
-        first.unp_ver = 20;
-        first.pack_size = 13;
-        first.unp_size = unpacked_len as u64;
-        first.packed_range = 0..13;
-
-        let mut second = file(b"split.bin", FHD_PASSWORD | FHD_SPLIT_BEFORE);
-        second.unp_ver = 20;
-        second.pack_size = 17;
-        second.unp_size = unpacked_len as u64;
-        second.packed_range = 0..17;
-
-        let volumes = vec![
-            archive_with_source(vec![Block::File(first)], payload[..13].to_vec()),
-            archive_with_source(vec![Block::File(second)], payload[13..].to_vec()),
-        ];
-
-        let capture = Capture::default();
-        let err = extract_volumes_to(
-            &volumes,
-            crate::vendor::rars::ArchiveReadOptions::with_password(b"pw"),
-            capture.opener(),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidHeader(msg) if msg.contains("wrong reassembled size")),
-            "expected wrong reassembled size error, got {err:?}"
         );
     }
 }

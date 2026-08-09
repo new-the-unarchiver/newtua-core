@@ -10,19 +10,6 @@
 //! скалярной, а без первой сверяли бы вторую сама с собой. Здесь вместо них
 //! проверяется то, что решают сами эти функции, — границы.
 
-pub(crate) fn match_length(input: &[u8], pos: usize, distance: usize, max_length: usize) -> usize {
-    if distance == 0 || distance > pos {
-        return 0;
-    }
-
-    let max_length = max_length.min(input.len().saturating_sub(pos));
-    let mut length = 0usize;
-    while length < max_length && input[pos + length] == input[pos + length - distance] {
-        length += 1;
-    }
-    length
-}
-
 pub(crate) fn next_x86_opcode(
     data: &[u8],
     start: usize,
@@ -43,33 +30,6 @@ pub(crate) fn next_x86_opcode(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn match_length_counts_until_the_first_difference() {
-        // «abcabcabX»: от позиции 3 с расстоянием 3 совпадают ровно пять байт,
-        // шестой (X против c) расходится.
-        let input = b"abcabcabX";
-
-        assert_eq!(match_length(input, 3, 3, 32), 5);
-    }
-
-    #[test]
-    fn match_length_refuses_a_distance_that_reaches_before_the_start() {
-        let input = b"abcabcabc";
-
-        assert_eq!(match_length(input, 3, 0, 8), 0, "нулевое расстояние");
-        assert_eq!(match_length(input, 3, 4, 8), 0, "ссылка левее начала");
-        assert_eq!(match_length(input, 0, 1, 8), 0, "от самого начала");
-    }
-
-    #[test]
-    fn match_length_stops_at_the_end_of_the_buffer() {
-        // Просят двадцать байт, а за позицией их всего шесть: длина обязана
-        // обрезаться буфером, а не выйти за него.
-        let input = b"abcabcabc";
-
-        assert_eq!(match_length(input, 3, 3, 20), 6);
-    }
 
     #[test]
     fn x86_opcode_scan_resumes_and_respects_the_end() {

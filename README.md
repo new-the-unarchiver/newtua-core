@@ -207,10 +207,15 @@ promise of their own.
 
 ## Dependencies
 
-The engine depends on four **forced forks** — `newtua-unrar`,
-`newtua-apfs`, `newtua-hfsplus` and `newtua-cdfs`. We do not develop them and
+The engine depends on three **forced forks** — `newtua-apfs`,
+`newtua-hfsplus` and `newtua-cdfs`. We do not develop them and
 will drop them as soon as the upstream crates meet our requirements. Each
 fork's README explains why it exists.
+
+There used to be a fourth, `newtua-unrar`, wrapping libunrar. RAR is now
+decoded in pure Rust by the vendored read half of `rars`
+([`src/vendor/rars/`](src/vendor/rars/VENDORED.md)), so the fork is gone and
+with it the last C++ in the build and the UnRAR license.
 
 None of them requires a system library. That is largely the point of
 `newtua-cdfs`: upstream `cdfs` would otherwise make every Linux build depend on
