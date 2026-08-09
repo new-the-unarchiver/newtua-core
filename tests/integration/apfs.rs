@@ -150,9 +150,13 @@ fn apfs_bare_decmpfs_file_reads_full_content() {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(&body);
-    let digest = hasher.finalize();
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     assert_eq!(
-        format!("{digest:x}"),
+        digest,
         "3f58a41850c1096de883ada14c98c2375a85b473c80ccbef03c9e72c113abc78"
     );
 }

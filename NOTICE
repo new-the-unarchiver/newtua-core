@@ -27,6 +27,16 @@ lineage described above, and one more reason this engine is distributed under
 the LGPL. The Quantum method itself was created by David Stafford and adapted
 by Microsoft; the public description of it is Matthew Russotto's.
 
+The read half of the `rars` crate (https://github.com/bitplane/rars, © Gareth
+Davidson) is carried at src/vendor/rars/ for the same reason: the engine keeps
+its own changes to it and does not follow its weekly releases. Note a
+discrepancy that is upstream's own — release 0.4.8 declares "MIT OR Apache-2.0"
+in Cargo.toml while the only license file in that repository is COPYING (WTFPL
+with an added "don't blame me" clause), and no MIT or Apache text ships with it.
+Both readings permit this use; the text that actually travelled with the code is
+beside it at src/vendor/rars/COPYING, and src/vendor/rars/VENDORED.md records
+the release, everything removed, and every change of ours.
+
 The engine also depends on four forced forks of third-party crates —
 newtua-unrar, newtua-apfs, newtua-hfsplus and newtua-cdfs — which retain the
 licenses of their respective upstream projects. Each fork's README explains why it exists
