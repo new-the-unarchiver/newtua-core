@@ -6,7 +6,7 @@ use crate::vendor::rars::crc32::{Crc32, crc32};
 use crate::vendor::rars::crypto::rar50::{Rar50Cipher, Rar50Keys};
 use crate::vendor::rars::error::{Error, Result};
 use crate::vendor::rars::volume_extract::{ChainedReader, SplitVolumeState, SplitVolumeStep};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 
 // Filtered RAR5 members still need whole-member byte transforms. Members at or
 // below this boundary use the buffered path, while larger members stream once
@@ -222,8 +222,8 @@ impl FileHeader {
 
     /// Распаковать сжатую запись, читая упакованное тело потоком.
     ///
-    /// NEWTUA: близнец `decode_packed_with_decoder_mode` без ветки «хранимой»
-    /// записи — та требует всего упакованного тела сразу и сюда не приходит.
+    /// NEWTUA: сюда сведён общий хвост распаковки — и с потока, и из памяти.
+    /// «Хранимая» запись остаётся у соседа: ей нужно тело целиком.
     fn decode_packed_reader_with_decoder_mode(
         &self,
         packed: &mut impl Read,
@@ -252,12 +252,11 @@ impl FileHeader {
         }
     }
 
-    /// Распаковать «хранимую» запись: у неё упакованное тело и есть выход,
-    /// и проверки длины требуют его целиком.
+    /// Распаковать запись, упакованное тело которой уже в памяти.
     ///
     /// NEWTUA: сжатая запись сюда больше не приходит — она читается потоком
-    /// (`decode_packed_reader_with_decoder_mode`). Ветки LZ ниже остались
-    /// достижимы через ту же дверь только у апстрима.
+    /// (`decode_packed_reader_with_decoder_mode`). Осталась «хранимая»: её
+    /// проверки длины и набивки требуют тела целиком.
     fn decode_packed_with_decoder_mode(
         &self,
         packed: &[u8],
@@ -291,23 +290,10 @@ impl FileHeader {
         if self.unpacked_size == 0 && packed.is_empty() {
             return Ok(Vec::new());
         }
-
-        let info = self.decoded_compression_info()?;
-        let dictionary_size = usize::try_from(info.dictionary_size).map_err(|_| {
-            Error::InvalidHeader("RAR 5 dictionary size overflows host address size")
-        })?;
-        let output_size = checked_unpacked_size(self.unpacked_size)?;
-        match decoder.decode_member_with_dictionary(
-            packed,
-            info.algorithm_version,
-            output_size,
-            dictionary_size,
-            info.solid,
-            mode,
-        ) {
-            Ok(data) => Ok(data),
-            Err(error) => self.map_truncated_unverified_payload(error),
-        }
+        // NEWTUA: дальше — общий с потоковым близнецом хвост. Двух путей
+        // распаковки тут нет и у апстрима: его `decode_member_with_dictionary`
+        // сама заворачивает срез в `Cursor` и зовёт версию для потока.
+        self.decode_packed_reader_with_decoder_mode(&mut Cursor::new(packed), decoder, mode)
     }
 
     fn map_truncated_unverified_payload(

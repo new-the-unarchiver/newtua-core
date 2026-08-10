@@ -591,22 +591,15 @@ struct Walker<'a> {
     /// ходоку приёмник нужен на границах записей. Одновременно в него никто не
     /// пишет — писарь предыдущей записи умирает раньше, чем обход спросит
     /// следующую.
-    shared: Rc<RefCell<Shared<'a>>>,
+    ///
+    /// Это тот же `SinkWriter`, что и на быстром пути (`read_each`): он и есть
+    /// мост к приёмнику, и он же хранит его отказ отдельно от ошибки перелива.
+    shared: Rc<RefCell<SinkWriter<'a>>>,
     /// Запись, чьё тело льётся прямо сейчас.
     open: Option<usize>,
     /// Отказ приёмника: наружу он уходит как есть, а проход обрывается.
     fatal: Option<Error>,
     stop: bool,
-}
-
-/// Приёмник и отказ, который он выдал на куске тела.
-///
-/// Отказ хранится отдельно по той же причине, что и в `SinkWriter`: наружу
-/// обход отдаёт безликую ошибку ввода-вывода, а `end` должен получить нашу — по
-/// ней решают, отменили распаковку или архив сломан.
-struct Shared<'a> {
-    sink: &'a mut dyn EntrySink,
-    err: Option<Error>,
 }
 
 impl<'a> Walker<'a> {
@@ -615,11 +608,25 @@ impl<'a> Walker<'a> {
             want,
             next: 0,
             pos: 0,
-            shared: Rc::new(RefCell::new(Shared { sink, err: None })),
+            shared: Rc::new(RefCell::new(SinkWriter::new(sink))),
             open: None,
             fatal: None,
             stop: false,
         }
+    }
+
+    /// Приёмнику сказать, что начинается запись `idx`.
+    ///
+    /// Отдельным методом, а не строчкой на месте: заём ячейки надо отпустить
+    /// **до** разбора ответа, иначе ветки разбора не смогут тронуть самого
+    /// ходока.
+    fn sink_begin(&self, idx: usize) -> Result<SinkStep> {
+        self.shared.borrow_mut().sink().begin(idx)
+    }
+
+    /// Приёмнику сказать, чем кончилась запись `idx`.
+    fn sink_end(&self, idx: usize, outcome: Result<()>) -> Result<bool> {
+        self.shared.borrow_mut().sink().end(idx, outcome)
     }
 
     fn exhausted(&self) -> bool {
@@ -653,8 +660,7 @@ impl<'a> Walker<'a> {
         if pos != self.want[self.next] {
             return Ok(false);
         }
-        let step = self.shared.borrow_mut().sink.begin(pos);
-        match step {
+        match self.sink_begin(pos) {
             Ok(SinkStep::Body) => {
                 self.open = Some(pos);
                 Ok(true)
@@ -682,13 +688,9 @@ impl<'a> Walker<'a> {
         let Some(idx) = self.open.take() else {
             return Ok(());
         };
-        let outcome = match self.shared.borrow_mut().err.take() {
-            Some(e) => Err(e),
-            None => outcome,
-        };
+        let outcome = self.shared.borrow_mut().outcome(outcome);
         self.next += 1;
-        let ended = self.shared.borrow_mut().sink.end(idx, outcome);
-        match ended {
+        match self.sink_end(idx, outcome) {
             Ok(true) => Ok(()),
             Ok(false) => {
                 self.stop = true;
@@ -732,15 +734,13 @@ impl<'a> Walker<'a> {
         while !self.exhausted() {
             let idx = self.want[self.next];
             self.next += 1;
-            let step = self.shared.borrow_mut().sink.begin(idx)?;
-            match step {
+            match self.sink_begin(idx)? {
                 SinkStep::Stop => break,
                 SinkStep::Skip => continue,
                 SinkStep::Body => {}
             }
             let why = Error::Corrupt(format!("rar: заголовки кончились на записи {idx}"));
-            let ended = self.shared.borrow_mut().sink.end(idx, Err(why))?;
-            if !ended {
+            if !self.sink_end(idx, Err(why))? {
                 break;
             }
         }
@@ -748,25 +748,20 @@ impl<'a> Walker<'a> {
     }
 }
 
-/// Писарь, льющий тело записи прямо приёмнику.
+/// Писарь, льющий тело записи прямо приёмнику: тот же `SinkWriter`, только
+/// владеемый, а не одолженный.
 ///
-/// Время жизни у него от приёмника: подпись обхода в вендоренном коде правлена
-/// под это (`Box<dyn Write + 'w>`, метка `NEWTUA`). До тикета 29 писаря
-/// требовали `'static`, и тело приходилось копить целиком в памяти.
+/// Обход в вендоренном коде требует писаря, пережившего вызов замыкания, —
+/// отсюда владение и ячейка. Время жизни у него от приёмника: подпись обхода
+/// правлена под это (`Box<dyn Write + 'w>`, метка `NEWTUA`). До тикета 29
+/// писаря требовали `'static`, и тело приходилось копить целиком в памяти.
 struct BodyWriter<'a> {
-    shared: Rc<RefCell<Shared<'a>>>,
+    shared: Rc<RefCell<SinkWriter<'a>>>,
 }
 
 impl Write for BodyWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut shared = self.shared.borrow_mut();
-        match shared.sink.write_body(buf) {
-            Ok(()) => Ok(buf.len()),
-            Err(e) => {
-                shared.err = Some(e);
-                Err(std::io::Error::other("entry sink rejected the body"))
-            }
-        }
+        self.shared.borrow_mut().write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {

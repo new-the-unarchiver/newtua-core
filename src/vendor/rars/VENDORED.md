@@ -138,14 +138,24 @@ each is marked `NEWTUA:` in the source.
 2. **`rar50/extract.rs` — the packed body is no longer read into memory whole.**
    Upstream called `read_to_end` and so kept the *packed* member alongside the
    unpacked one. The decoder reads a stream perfectly well; the buffered path
-   now feeds it one (`decode_packed_reader_with_decoder_mode`). A stored member
-   still takes the old route — its length checks need the whole payload — and it
-   has its own streaming path anyway (`write_stored_to`).
-3. **`codec/rar50.rs` — the dictionary window only takes its own tail.**
-   Upstream appended the *entire* output to the history and only then trimmed it
-   to the dictionary size, so a 300 MB file with a 32 MiB dictionary grew the
-   history to 300 MB for nothing. What ends up in the window is unchanged: a
-   filtered member still contributes its unfiltered output.
+   now feeds it one (`decode_packed_reader_with_decoder_mode`), and the
+   slice-taking twin delegates to it through a `Cursor` — which is exactly what
+   upstream's own decoder does one level down, so there is one decode tail here,
+   not two. A stored member still takes the old route: its length and padding
+   checks need the whole payload, and it has its own streaming path anyway
+   (`write_stored_to`).
+3. **`codec/rar50.rs` — the dictionary window only takes its own tail, and
+   takes it as a tail.** Upstream first cloned the *whole* unfiltered output,
+   then appended all of it to the history, and only then trimmed the history to
+   the dictionary size — two spare copies of the member at the peak, so a 300 MB
+   file with a 32 MiB dictionary grew twice to 300 MB for nothing. Measured on a
+   196 MB executable inside a solid archive — the case where filters actually
+   fire: **peak 502 → 272 MB**. What ends up in the window is unchanged: a
+   filtered member still contributes its unfiltered bytes, and `apply_filters`
+   cannot change the length, so the tail before filters is the tail after.
+   `Unpack50Decoder::decode_member_with_dictionary` lost its last caller as part
+   of fix 2 and carries an `allow(dead_code)` with the reason on it; the method
+   itself is untouched.
 4. **`source.rs` — the file reader is buffered.** Upstream handed out a bare
    descriptor, which was tolerable while the packed body arrived in one
    `read_to_end`. Fix 2 made it a stream, and RAR 5 block parsing reads two and
@@ -156,14 +166,11 @@ Fixes 2 and 3 together: **peak 751 → 414 MB** on a 300 MB member.
 
 **What is deliberately left.** A member below `BUFFERED_DECODE_LIMIT` (512 MiB)
 is still decoded into a `Vec` whole, so its peak stays at about 1.4× the
-member's size. Removing that means routing everything through the streaming
-path, and that path costs two things today, both measured: it is **×1.49 slower**
-(1.47 s against 2.20 s of CPU time on the same 300 MB, paired, three runs), and
-it **does not implement RAR 5 filters** at all — a filtered member above the
-limit does not extract today, so lowering the limit without teaching the stream
-filters would take extraction away from files that currently work. Both point at
-the same code the roadmap's stage Е is about to profile, so the human's call on
-2026-08-10 was to come back to it after Е rather than rewrite the hot loop twice.
+member's size. Routing everything through the streaming path would fix that but
+costs two measured things — ×1.49 of CPU time, and no RAR 5 filter support at
+all — and both live in the hot loop that stage Е is about to profile. Why it
+waits for Е, and the order to follow when it comes back: ticket 29 and
+`.claude/ROADMAP-RAR.md`.
 
 ## Tests
 

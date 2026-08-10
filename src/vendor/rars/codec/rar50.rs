@@ -231,6 +231,12 @@ impl Unpack50Decoder {
         }
     }
 
+    /// NEWTUA: `allow(dead_code)` — распаковка из среза больше не зовётся.
+    /// Упакованное тело у нас приходит потоком (тикет 29), а «хранимой» записи
+    /// декодер не нужен вовсе, так что единственный вызывающий отпал. Метод —
+    /// апстримовский и остаётся дословным: это `Cursor` плюс версия для
+    /// потока, и удалять его значило бы разойтись с апстримом ради трёх строк.
+    #[allow(dead_code)]
     pub fn decode_member_with_dictionary(
         &mut self,
         input: &[u8],
@@ -384,31 +390,30 @@ impl Unpack50Decoder {
 
         if pos == output_size {
             output.truncate(output_size);
+            // NEWTUA: в окно уходит только хвост длиной со словарь, и берётся
+            // он тоже хвостом. Апстрим сперва клонировал **весь**
+            // нефильтрованный выход, потом дописывал в историю его целиком и
+            // лишь затем обрезал её до словаря — на файле в 300 МБ со словарём
+            // в 32 МиБ это два лишних экземпляра записи в пике (тикет 29).
+            // Что именно попадает в окно, не меняется: у фильтрованной записи
+            // это по-прежнему нефильтрованные байты, а `apply_filters` длину
+            // не меняет, так что хвост до фильтров равен хвосту после.
+            let tail_start = output.len().saturating_sub(dictionary_size);
             let history_output = if mode.applies_filters() && !filters.is_empty() {
-                Some(output.clone())
+                Some(output[tail_start..].to_vec())
             } else {
                 None
             };
             if mode.applies_filters() {
                 apply_filters(&mut output, &filters)?;
             }
-            // NEWTUA: в окно уходит только его хвост. Апстрим дописывал в
-            // историю **весь** выход и лишь потом обрезал её до словаря —
-            // то есть на файле в 300 МБ со словарём в 32 МиБ история на миг
-            // вырастала до 300 МБ впустую (тикет 29). Что именно попадает в
-            // окно, не меняется: у фильтрованной записи это по-прежнему
-            // нефильтрованный выход.
-            let source = history_output.as_deref().unwrap_or(&output);
-            if source.len() >= dictionary_size {
-                self.history.clear();
-                self.history
-                    .extend_from_slice(&source[source.len() - dictionary_size..]);
-            } else {
-                self.history.extend_from_slice(source);
-                if self.history.len() > dictionary_size {
-                    let discard = self.history.len() - dictionary_size;
-                    self.history.drain(..discard);
-                }
+            let tail = history_output
+                .as_deref()
+                .unwrap_or_else(|| &output[tail_start..]);
+            self.history.extend_from_slice(tail);
+            if self.history.len() > dictionary_size {
+                let discard = self.history.len() - dictionary_size;
+                self.history.drain(..discard);
             }
             Ok(output)
         } else {
