@@ -9,7 +9,8 @@ use std::fs::File;
 use std::io::Read;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use zeroize::Zeroizing;
 
 mod blake2sp;
 mod extract;
@@ -65,6 +66,69 @@ pub struct Archive {
     pub main: MainHeader,
     pub blocks: Vec<Block>,
     source: ArchiveSource,
+    /// NEWTUA: кэш выведенного ключа шифрования, тикет 33. Живёт на архиве, а
+    /// не на записи, потому что соль и число итераций в архиве одни на всех, а
+    /// вывод ключа стоит 32 768 раундов HMAC.
+    key_cache: Rar50KeyCache,
+}
+
+/// NEWTUA (тикет 33): один выведенный ключ, запомненный на весь архив.
+///
+/// PBKDF2 у RAR 5 стоит `2^kdf_count` раундов HMAC-SHA256 — при обычном
+/// `kdf_count = 15` это 32 768 раундов и около 6 мс. Соль и число итераций
+/// лежат в заголовке **каждой** записи, но в одном архиве совпадают, поэтому
+/// без кэша сплошной архив из 4000 файлов выводил один и тот же ключ 4000 раз
+/// и шёл 17 с против 0,16 с у libunrar.
+///
+/// Ключ кэша — тройка «пароль + соль + число итераций», и промах по любой её
+/// части выводит ключ заново: архив с разными солями законен, и отдать ему
+/// чужой ключ значит расшифровать мусор. Пароль входит в ключ кэша потому, что
+/// вызывающий вправе перебирать пароли на одном и том же архиве.
+///
+/// `Mutex` внутри `Arc`, а не `RefCell`: `Archive` доезжает до вызывающего
+/// внутри `Box<dyn ArchiveReader>`, и `Send`/`Sync` у него отнимать нельзя.
+/// Списано с `EncryptedHeaderCipherCache` для RAR 3 (`rar15_40.rs`).
+#[derive(Default, Clone)]
+pub(crate) struct Rar50KeyCache {
+    entry: Arc<Mutex<Option<CachedKey>>>,
+}
+
+struct CachedKey {
+    password: Zeroizing<Vec<u8>>,
+    salt: [u8; 16],
+    kdf_count: u8,
+    keys: Rar50Keys,
+}
+
+impl std::fmt::Debug for Rar50KeyCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Ни ключа, ни пароля в отладочной печати: `Rar50Keys` поступает так же.
+        f.debug_struct("Rar50KeyCache").finish_non_exhaustive()
+    }
+}
+
+impl Rar50KeyCache {
+    /// Выводит ключ или отдаёт запомненный. Проверку пароля по `check_value`
+    /// делает вызывающий: она стоит одного SHA-256 и обязана идти и на
+    /// попадании в кэш тоже, иначе путь «неверный пароль» изменился бы.
+    fn derive(&self, password: &[u8], salt: [u8; 16], kdf_count: u8) -> Result<Rar50Keys> {
+        let mut slot = self.entry.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(cached) = slot.as_ref()
+            && cached.salt == salt
+            && cached.kdf_count == kdf_count
+            && cached.password.as_slice() == password
+        {
+            return Ok(cached.keys.clone());
+        }
+        let keys = Rar50Keys::derive(password, salt, kdf_count).map_err(map_rar50_crypto_error)?;
+        *slot = Some(CachedKey {
+            password: Zeroizing::new(password.to_vec()),
+            salt,
+            kdf_count,
+            keys: keys.clone(),
+        });
+        Ok(keys)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,9 +350,11 @@ impl Archive {
         }
 
         let file_cell = std::cell::RefCell::new(file);
+        let key_cache = Rar50KeyCache::default();
         let (main, blocks) = parse_archive_blocks(
             archive_len,
             password,
+            &key_cache,
             |offset| {
                 read_block_header_at(&mut file_cell.borrow_mut(), offset, archive_len, sfx_offset)
             },
@@ -308,6 +374,7 @@ impl Archive {
             main,
             blocks,
             source,
+            key_cache,
         })
     }
 
@@ -575,6 +642,7 @@ fn parse_file_encryption_record(input: &[u8], range: Range<usize>) -> Result<Fil
 fn parse_archive_encryption_header(
     parsed: &ParsedBlockHeader,
     password: Option<&[u8]>,
+    key_cache: &Rar50KeyCache,
 ) -> Result<Rar50Keys> {
     let password = password.ok_or(Error::NeedPassword)?;
     let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone())?;
@@ -598,7 +666,10 @@ fn parse_archive_encryption_header(
             "RAR 5 archive encryption header has trailing bytes",
         ));
     }
-    let keys = Rar50Keys::derive(password, salt, kdf_count).map_err(map_rar50_crypto_error)?;
+    // NEWTUA (тикет 33): через тот же кэш. У архива с зашифрованными
+    // заголовками (`rar a -hp`) соль здесь и соль в записях совпадают, так что
+    // на весь архив остаётся один вывод ключа, а не два.
+    let keys = key_cache.derive(password, salt, kdf_count)?;
     if let Some(check_value) = check_value {
         keys.check_password(&check_value)
             .map_err(map_rar50_crypto_error)?;
@@ -606,7 +677,11 @@ fn parse_archive_encryption_header(
     Ok(keys)
 }
 
-fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<()> {
+fn attach_file_crypto(
+    file: &mut FileHeader,
+    password: Option<&[u8]>,
+    key_cache: &Rar50KeyCache,
+) -> Result<()> {
     if !file.encrypted || file.crypto.is_some() {
         return Ok(());
     }
@@ -622,8 +697,10 @@ fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<
             feature: "RAR 5 unknown file encryption version",
         });
     }
-    let keys = Rar50Keys::derive(password, encryption.salt, encryption.kdf_count)
-        .map_err(map_rar50_crypto_error)?;
+    // NEWTUA (тикет 33): через кэш. Разбор архива с зашифрованными заголовками
+    // (`rar a -hp`) выводил ключ на каждый заголовок — та же болезнь, что и на
+    // распаковке, только в разборе.
+    let keys = key_cache.derive(password, encryption.salt, encryption.kdf_count)?;
     if let Some(check_value) = encryption.check_value {
         keys.check_password(&check_value)
             .map_err(map_rar50_crypto_error)?;
@@ -635,7 +712,11 @@ fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<
     Ok(())
 }
 
-fn attach_service_crypto(service: &mut FileHeader, password: Option<&[u8]>) -> Result<()> {
+fn attach_service_crypto(
+    service: &mut FileHeader,
+    password: Option<&[u8]>,
+    key_cache: &Rar50KeyCache,
+) -> Result<()> {
     // WinRAR can emit encrypted QO metadata whose service-local password
     // check does not validate with the archive password. QuickOpen is an
     // optional cache, so keep archive parsing and file extraction independent
@@ -643,7 +724,7 @@ fn attach_service_crypto(service: &mut FileHeader, password: Option<&[u8]>) -> R
     if service.name == b"QO" {
         return Ok(());
     }
-    attach_file_crypto(service, password)
+    attach_file_crypto(service, password, key_cache)
 }
 
 fn map_rar50_crypto_error(error: crate::vendor::rars::crypto::rar50::Error) -> Error {
@@ -672,6 +753,7 @@ fn read_array_at<const N: usize>(input: &[u8], pos: &mut usize, end: usize) -> R
 fn parse_archive_blocks<F, G>(
     archive_len: usize,
     password: Option<&[u8]>,
+    key_cache: &Rar50KeyCache,
     mut read_block: F,
     mut read_encrypted_block: G,
 ) -> Result<(MainHeader, Vec<Block>)>
@@ -683,7 +765,9 @@ where
     let first = read_block(pos).map_err(|error| error.at_archive_offset(pos))?;
     let header_keys = if first.block.header_type == HEAD_CRYPT {
         pos = first.next_offset;
-        Some(parse_archive_encryption_header(&first, password)?)
+        Some(parse_archive_encryption_header(
+            &first, password, key_cache,
+        )?)
     } else {
         None
     };
@@ -715,14 +799,14 @@ where
             HEAD_FILE => {
                 let mut file = parse_file_header_bytes(&parsed)
                     .map_err(|error| error.at_archive_offset(pos))?;
-                attach_file_crypto(&mut file, password)
+                attach_file_crypto(&mut file, password, key_cache)
                     .map_err(|error| error.at_archive_offset(pos))?;
                 blocks.push(Block::File(file));
             }
             HEAD_SERVICE => {
                 let mut service = parse_file_header_bytes(&parsed)
                     .map_err(|error| error.at_archive_offset(pos))?;
-                attach_service_crypto(&mut service, password)
+                attach_service_crypto(&mut service, password, key_cache)
                     .map_err(|error| error.at_archive_offset(pos))?;
                 blocks.push(Block::Service(service));
             }
@@ -1160,5 +1244,49 @@ mod tests {
                 "RAR 5 file redirection record has trailing bytes"
             ))
         ));
+    }
+
+    // NEWTUA (тикет 33): кэш ключа обязан промахиваться по любой части своего
+    // ключа. Промах — правильный ответ, а не потеря скорости: архив с разными
+    // солями законен, и чужой ключ расшифровал бы мусор.
+    //
+    // `kdf_count` здесь маленький нарочно: боевые 15 — это 32 768 раундов HMAC
+    // на каждый вывод, тест на них стоил бы десятков миллисекунд.
+    #[test]
+    fn key_cache_returns_the_same_key_and_misses_on_a_different_salt() {
+        let cache = Rar50KeyCache::default();
+        let salt = [7u8; 16];
+        let other_salt = [9u8; 16];
+
+        let first = cache.derive(b"pw", salt, 1).unwrap();
+        let hit = cache.derive(b"pw", salt, 1).unwrap();
+        assert_eq!(first, hit);
+        assert_eq!(first, Rar50Keys::derive(b"pw", salt, 1).unwrap());
+
+        let other = cache.derive(b"pw", other_salt, 1).unwrap();
+        assert_ne!(first, other);
+        assert_eq!(other, Rar50Keys::derive(b"pw", other_salt, 1).unwrap());
+
+        // Прежняя соль после вытеснения выводится заново, а не берётся из
+        // занятой ячейки.
+        assert_eq!(first, cache.derive(b"pw", salt, 1).unwrap());
+    }
+
+    #[test]
+    fn key_cache_misses_on_a_different_password_or_kdf_count() {
+        let cache = Rar50KeyCache::default();
+        let salt = [3u8; 16];
+
+        let first = cache.derive(b"pw", salt, 1).unwrap();
+        let other_password = cache.derive(b"other", salt, 1).unwrap();
+        assert_ne!(first, other_password);
+        assert_eq!(
+            other_password,
+            Rar50Keys::derive(b"other", salt, 1).unwrap()
+        );
+
+        let other_count = cache.derive(b"pw", salt, 2).unwrap();
+        assert_ne!(first, other_count);
+        assert_eq!(other_count, Rar50Keys::derive(b"pw", salt, 2).unwrap());
     }
 }

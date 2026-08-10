@@ -1,4 +1,4 @@
-use super::{Archive, ExtractedEntryMeta, FileHeader, FileRedirection, blake2sp};
+use super::{Archive, ExtractedEntryMeta, FileHeader, FileRedirection, Rar50KeyCache, blake2sp};
 use crate::vendor::rars::codec::rar50::{
     DecodeMode, DecodedChunk, StreamDecodeError, Unpack50Decoder,
 };
@@ -29,7 +29,11 @@ const BUFFERED_DECODE_LIMIT: u64 = 1024 * 1024;
 const BUFFERED_DECODE_LIMIT: u64 = 1024;
 
 impl FileHeader {
-    fn crypto_with_password(&self, password: Option<&[u8]>) -> Result<Option<Rar50Keys>> {
+    fn crypto_with_password(
+        &self,
+        key_cache: &Rar50KeyCache,
+        password: Option<&[u8]>,
+    ) -> Result<Option<Rar50Keys>> {
         if !self.encrypted {
             return Ok(None);
         }
@@ -46,8 +50,11 @@ impl FileHeader {
                 feature: "RAR 5 unknown file encryption version",
             });
         }
-        let keys = Rar50Keys::derive(password, encryption.salt, encryption.kdf_count)
-            .map_err(super::map_rar50_crypto_error)?;
+        // NEWTUA (тикет 33): ключ выводится один раз на архив, а не на запись.
+        // Оглавление читается сперва без пароля (`format/rar.rs`), поэтому
+        // `self.crypto` выше почти всегда пуст, и до кэша дело доходило каждый
+        // раз заново.
+        let keys = key_cache.derive(password, encryption.salt, encryption.kdf_count)?;
         if let Some(check_value) = encryption.check_value {
             keys.check_password(&check_value)
                 .map_err(super::map_rar50_crypto_error)?;
@@ -93,7 +100,7 @@ impl FileHeader {
             ));
         }
         let keys = self
-            .crypto_with_password(password)?
+            .crypto_with_password(&archive.key_cache, password)?
             .ok_or(Error::InvalidHeader(
                 "RAR 5 encrypted file is missing encryption keys",
             ))?;
@@ -852,7 +859,7 @@ impl PendingSplitRefs {
             .nth(file_index)
             .ok_or(Error::InvalidHeader("RAR 5 split entry is missing"))?;
         let keys = file
-            .crypto_with_password(password)?
+            .crypto_with_password(&archive.key_cache, password)?
             .ok_or(Error::InvalidHeader(
                 "RAR 5 encrypted split file is missing encryption keys",
             ))?;
@@ -1223,18 +1230,24 @@ mod tests {
 
     #[test]
     fn crypto_with_password_short_circuits_for_unencrypted_or_unsupported_versions() {
+        let cache = Rar50KeyCache::default();
         let plain = plain_file(b"a.txt", b"", None);
-        assert!(plain.crypto_with_password(None).unwrap().is_none());
-        assert!(plain.crypto_with_password(Some(b"pw")).unwrap().is_none());
+        assert!(plain.crypto_with_password(&cache, None).unwrap().is_none());
+        assert!(
+            plain
+                .crypto_with_password(&cache, Some(b"pw"))
+                .unwrap()
+                .is_none()
+        );
 
         let mut missing = plain_file(b"a.txt", b"", None);
         missing.encrypted = true;
         assert!(matches!(
-            missing.crypto_with_password(None),
+            missing.crypto_with_password(&cache, None),
             Err(Error::NeedPassword)
         ));
         assert!(matches!(
-            missing.crypto_with_password(Some(b"pw")),
+            missing.crypto_with_password(&cache, Some(b"pw")),
             Err(Error::InvalidHeader(_))
         ));
 
@@ -1249,7 +1262,7 @@ mod tests {
             check_value: None,
         });
         assert!(matches!(
-            bad_version.crypto_with_password(Some(b"pw")),
+            bad_version.crypto_with_password(&cache, Some(b"pw")),
             Err(Error::UnsupportedFeature { .. })
         ));
     }
@@ -1266,7 +1279,12 @@ mod tests {
             iv: [0u8; 16],
             check_value: None,
         });
-        assert!(file.crypto_with_password(Some(b"pw")).unwrap().is_some());
+        let cache = Rar50KeyCache::default();
+        assert!(
+            file.crypto_with_password(&cache, Some(b"pw"))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1440,6 +1458,7 @@ mod tests {
             },
             blocks,
             source: ArchiveSource::Memory(bytes),
+            key_cache: Rar50KeyCache::default(),
         }
     }
 

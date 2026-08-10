@@ -354,6 +354,36 @@ its bytes are already gone. Worth knowing: **`unrar` has no such retry either**
 — it applies filters and checks the CRC — so the shrinking coverage is a
 divergence from upstream `rars`, not from the oracle.
 
+### The encryption key was derived once per member (ticket 33)
+
+RAR 5 derives its key with PBKDF2-HMAC-SHA256, and `rar`'s default `kdf_count`
+of 15 means `2^15` = 32 768 HMAC rounds — about 6 ms — per derivation. Salt and
+count live in **every member's** header, but within one archive they are the
+same value repeated, so the work is the same key computed again and again.
+Upstream derived it per member on extraction, and per header on parsing when the
+archive has encrypted headers (`rar a -hp`).
+
+`Archive` now carries `Rar50KeyCache`: one derived key, keyed on the triple
+`(password, salt, kdf_count)`, `Mutex` inside `Arc` so `ArchiveSource` keeps
+`Send`/`Sync`. A miss on any part of that triple derives again — an archive with
+different salts per member is legal, and handing it a key derived from another
+salt would decrypt garbage. Modelled on `EncryptedHeaderCipherCache`, the same
+cache RAR 3 already had for its headers.
+
+Measured on a solid archive of 4000 small files, paired against libunrar:
+
+| archive | before | after | libunrar |
+|---|---|---|---|
+| `rar a -s -p` (encrypted bodies) | 17.0 s, **×108** | 0.031 s, **×0.20** | 0.16 s |
+| `rar a -s -hp` (encrypted headers too) | 20.2 s, **×40** | 0.037 s, **×0.09** | 0.41 s |
+
+A probe inside the derivation counted **4000 derivations with one distinct salt**
+before, and **one per archive** after. The password check (`check_value`) still
+runs on every member, cache hit or not — it is one SHA-256, and skipping it would
+change the wrong-password path. That path was compared before and after on four
+cases (wrong password and no password, on both archives): identical message,
+identical exit code.
+
 ## Tests
 
 **Every unit test inside `src/` came along** — codecs, crypto, headers, CRC,

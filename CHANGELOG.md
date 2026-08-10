@@ -148,6 +148,20 @@ handed the files to you with today's date and default permissions.
   both now need about 79 MB, which is the archive's dictionary — the same figure
   for a member of any size. Extraction did not get slower for it: measured
   against the old path it is between a tenth faster and exactly even.
+- **A password-protected RAR of many files is no longer hundreds of times slower
+  than the same archive without a password.** Turning a password into a key is
+  deliberately expensive — 32 768 rounds of hashing, about 6 ms — and the engine
+  was paying it for every single file, although one archive uses one key
+  throughout. A folder of 4000 small files under a password took **17 seconds**
+  where the same archive without one took 0.03 s; with the names encrypted too
+  (`rar -hp`) it took **20 seconds**. The key is derived once per archive now:
+  both take about **0.03 s**, which is five times faster than libunrar on the
+  first and ten times on the second. An archive that really does use a different
+  salt per file still gets a fresh key for each — the wrong key would produce
+  garbage, so the check is by value, not by assumption. Wrong and missing
+  passwords are refused exactly as before, and the extracted bytes, permissions
+  and timestamps still match `unar` on 8001 files across three encrypted
+  archives.
 
 ### Other
 
