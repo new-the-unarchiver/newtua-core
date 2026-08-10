@@ -8,11 +8,23 @@ use crate::vendor::rars::error::{Error, Result};
 use crate::vendor::rars::volume_extract::{ChainedReader, SplitVolumeState, SplitVolumeStep};
 use std::io::{Cursor, Read, Write};
 
-// Filtered RAR5 members still need whole-member byte transforms. Members at or
-// below this boundary use the buffered path, while larger members stream once
-// and reject filtered streams through the codec's typed sentinel.
+// NEWTUA: порог сменил смысл (тикет 34). Он больше не значит «выше этой черты
+// фильтры не работают» — теперь работают на обоих путях. Он значит только «ниже
+// этой черты держим запись в памяти целиком», и держим ради одного: повторной
+// распаковки без фильтров от точки отката, если целостность не сошлась
+// (`write_file_to`). У потокового пути такой сети нет и быть не может — байты
+// уже ушли приёмнику.
+//
+// Мегабайт выбран числом. Парно, один и тот же код с двумя порогами: на
+// крупной записи поток стоит **+2…3 % процессорного времени** (и до +10 % по
+// стене), а пик памяти на записи в 300 МБ падает с 347 до 79 МБ — вчетверо за
+// три процента. На тысячах мелких записей поток, наоборот, быстрее (×0,86…
+// ×0,92), но они и так остаются ниже черты. Что ниже черты — стоит не больше
+// полутора мегабайт.
 #[cfg(not(test))]
-const BUFFERED_DECODE_LIMIT: u64 = 512 * 1024 * 1024;
+const BUFFERED_DECODE_LIMIT: u64 = 1024 * 1024;
+// Тесты держат порог крошечным нарочно: иначе потоковый путь в них почти не
+// исполнялся бы, а он — половина кода распаковки RAR 5.
 #[cfg(test)]
 const BUFFERED_DECODE_LIMIT: u64 = 1024;
 
@@ -85,7 +97,8 @@ impl FileHeader {
             .ok_or(Error::InvalidHeader(
                 "RAR 5 encrypted file is missing encryption keys",
             ))?;
-        let reader = Rar50DecryptingReader::new(reader, keys.key, self.encryption_iv()?);
+        let reader =
+            Rar50DecryptingReader::new(reader, keys.key, self.encryption_iv()?, self.packed_size());
         Ok((Box::new(reader), Some(keys)))
     }
 
@@ -314,7 +327,6 @@ impl FileHeader {
         packed: &mut R,
         keys: Option<&Rar50Keys>,
         decoder: &mut Unpack50Decoder,
-        buffered_decode_limit: u64,
         writer: &mut dyn Write,
     ) -> Result<()> {
         if self.is_stored() {
@@ -353,10 +365,6 @@ impl FileHeader {
             )
             .map_err(|error| match error {
                 StreamDecodeError::Decode(error) => Error::from(error),
-                StreamDecodeError::FilteredMember => Error::Rar50BufferedDecodeLimitExceeded {
-                    limit: buffered_decode_limit,
-                    required: self.unpacked_size,
-                },
                 StreamDecodeError::Sink(error) => Error::from(error),
             })?;
         self.verify_streaming_integrity(crc, hash, keys)
@@ -481,25 +489,32 @@ impl<'a> DecoderSession<'a> {
         if file.should_stream_decode(self.buffered_decode_limit) {
             return self.stream_file_to(archive, file, writer);
         }
-        let checkpoint = self.decoder.clone();
+        // NEWTUA: точка отката вместо копии декодера (тикет 30). Апстрим брал
+        // здесь `self.decoder.clone()`, а декодер носит внутри словарное окно —
+        // на сплошном архиве это копия окна перед **каждой** записью и
+        // квадратичный рост по их числу. Откат нужен почти никогда, а платился
+        // всегда.
+        let checkpoint = self.decoder.checkpoint();
         let decoded = self
             .decoded_file_data(archive, file)
             .map_err(|error| file.entry_error("decoding", error))?;
         let decoded = match file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref()) {
-            Ok(()) => decoded,
+            Ok(()) => {
+                self.decoder.forget_checkpoint();
+                decoded
+            }
             Err(filtered_error) => {
-                let mut unfiltered_decoder = checkpoint;
+                self.decoder.roll_back(checkpoint);
                 let unfiltered = file
                     .decoded_data_with_mode(
                         archive,
-                        &mut unfiltered_decoder,
+                        &mut self.decoder,
                         self.password,
                         DecodeMode::LzNoFilters,
                     )
                     .map_err(|error| file.entry_error("decoding", error))?;
                 file.verify_integrity_with_keys(&unfiltered.data, unfiltered.keys.as_ref())
                     .map_err(|_| file.entry_error("verifying", filtered_error))?;
-                self.decoder = unfiltered_decoder;
                 unfiltered
             }
         };
@@ -515,20 +530,16 @@ impl<'a> DecoderSession<'a> {
         file: &FileHeader,
         writer: &mut dyn Write,
     ) -> Result<()> {
-        let mut streaming_decoder = self.decoder.clone();
+        // NEWTUA: копии декодера здесь больше нет (тикет 34). Она страховала от
+        // неудачи посреди записи, а стоила копии словарного окна на **каждую**
+        // запись — при опущенном пороге это делало сплошной архив из мелких
+        // файлов в 48 раз медленнее. Окно теперь возвращается декодеру и при
+        // неудаче тоже, внутри самого кодека.
         let (mut packed, keys) = file
             .packed_reader_with_password(archive, self.password)
             .map_err(|error| file.entry_error("reading", error))?;
-        file.stream_packed_with_decoder(
-            &mut packed,
-            keys.as_ref(),
-            &mut streaming_decoder,
-            self.buffered_decode_limit,
-            writer,
-        )
-        .map_err(|error| file.entry_error("decoding", error))?;
-        self.decoder = streaming_decoder;
-        Ok(())
+        file.stream_packed_with_decoder(&mut packed, keys.as_ref(), &mut self.decoder, writer)
+            .map_err(|error| file.entry_error("decoding", error))
     }
 
     fn decoded_file_data(&mut self, archive: &Archive, file: &FileHeader) -> Result<DecodedData> {
@@ -857,6 +868,7 @@ impl PendingSplitRefs {
         decryptor: Option<&SplitDecryptor>,
     ) -> Result<Box<dyn Read + 'a>> {
         let mut readers = Vec::with_capacity(self.fragments.len());
+        let mut packed_size = 0u64;
         for &(volume_index, file_index) in &self.fragments {
             let archive = volumes
                 .get(volume_index)
@@ -865,6 +877,7 @@ impl PendingSplitRefs {
                 .files()
                 .nth(file_index)
                 .ok_or(Error::InvalidHeader("RAR 5 split entry is missing"))?;
+            packed_size = packed_size.saturating_add(file.packed_size());
             readers.push(archive.range_reader(file.block.data_range.clone())?);
         }
         let chained = ChainedReader::new(readers);
@@ -873,6 +886,7 @@ impl PendingSplitRefs {
                 chained,
                 decryptor.keys.key,
                 decryptor.iv,
+                packed_size,
             )))
         } else {
             Ok(Box::new(chained))
@@ -957,48 +971,64 @@ impl FileHeader {
     }
 }
 
+/// NEWTUA: расшифровка идёт целым буфером, а не блоком AES (тикет 30, Е5).
+///
+/// Апстрим держал здесь ровно 16 байт и на каждые 64 КиБ упакованного тела
+/// делал 4096 заходов в `fill_buffer`. Читатель этот стоит **снаружи** буфера
+/// источника, так что буфер его не спасал. `decrypt_in_place` принимает любую
+/// длину, кратную 16, и в режиме CBC цепочка от длины куска не зависит: разбор
+/// на блоки внутри неё тот же самый.
+const DECRYPT_BUFFER_SIZE: usize = 16 * 1024;
+
 struct Rar50DecryptingReader<R> {
     inner: R,
     cipher: Rar50Cipher,
-    buffer: [u8; 16],
+    buffer: Vec<u8>,
     pos: usize,
     len: usize,
 }
 
 impl<R: Read> Rar50DecryptingReader<R> {
-    fn new(inner: R, key: [u8; 32], iv: [u8; 16]) -> Self {
+    fn new(inner: R, key: [u8; 32], iv: [u8; 16], packed_size: u64) -> Self {
+        // NEWTUA: буфер не крупнее самого тела. У сплошного зашифрованного
+        // архива запись — это сотня-другая байт, а полный буфер выделялся бы
+        // (и обнулялся) под каждую.
+        let size = usize::try_from(packed_size)
+            .unwrap_or(DECRYPT_BUFFER_SIZE)
+            .clamp(16, DECRYPT_BUFFER_SIZE);
         Self {
             inner,
             cipher: Rar50Cipher::new(key, iv),
-            buffer: [0; 16],
+            buffer: vec![0; size.next_multiple_of(16)],
             pos: 0,
             len: 0,
         }
     }
 
     fn fill_buffer(&mut self) -> std::io::Result<bool> {
-        let mut encrypted = [0; 16];
         let mut read = 0;
-        while read < encrypted.len() {
-            let count = self.inner.read(&mut encrypted[read..])?;
+        while read < self.buffer.len() {
+            let count = self.inner.read(&mut self.buffer[read..])?;
             if count == 0 {
-                if read == 0 {
-                    return Ok(false);
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "truncated RAR 5 encrypted stream",
-                ));
+                break;
             }
             read += count;
         }
-        self.buffer = encrypted;
+        if read == 0 {
+            return Ok(false);
+        }
+        if !read.is_multiple_of(16) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated RAR 5 encrypted stream",
+            ));
+        }
         self.cipher
-            .decrypt_in_place(&mut self.buffer)
+            .decrypt_in_place(&mut self.buffer[..read])
             .map_err(super::map_rar50_crypto_error)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         self.pos = 0;
-        self.len = self.buffer.len();
+        self.len = read;
         Ok(true)
     }
 }
@@ -1502,7 +1532,6 @@ mod tests {
                 &mut Cursor::new(Vec::<u8>::new()),
                 None,
                 &mut decoder,
-                BUFFERED_DECODE_LIMIT,
                 &mut out,
             )
             .unwrap_err();

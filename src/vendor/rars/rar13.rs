@@ -7,7 +7,7 @@ use crate::vendor::rars::io_util::{read_exact_at, read_u16, read_u32};
 pub(crate) use crate::vendor::rars::source::ArchiveSource;
 use crate::vendor::rars::version::ArchiveFamily;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,7 +18,6 @@ const MHD_VOLUME: u8 = 0x01;
 
 const MHD_SOLID: u8 = 0x08;
 
-const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const LHD_SPLIT_BEFORE: u8 = 0x01;
 const LHD_SPLIT_AFTER: u8 = 0x02;
 const LHD_PASSWORD: u8 = 0x04;
@@ -178,7 +177,7 @@ impl Archive {
         let path = Arc::new(path.as_ref().to_path_buf());
         let file = File::open(path.as_ref())?;
         let len = file.metadata()?.len();
-        Self::parse_seekable(file, len, signature.offset, ArchiveSource::File(path))
+        Self::parse_seekable(file, len, signature.offset, ArchiveSource::file(path))
     }
 
     fn parse_seekable(
@@ -237,35 +236,20 @@ impl Archive {
     fn copy_decrypted_range_to(
         &self,
         range: Range<usize>,
-        mut cipher: Rar13Cipher,
+        cipher: Rar13Cipher,
         out: &mut impl Write,
     ) -> Result<()> {
-        let mut buffer = [0u8; COPY_BUFFER_SIZE];
-        match &self.source {
-            ArchiveSource::Memory(data) => {
-                let data = data.get(range).ok_or(Error::TooShort)?;
-                for chunk in data.chunks(COPY_BUFFER_SIZE) {
-                    buffer[..chunk.len()].copy_from_slice(chunk);
-                    for byte in &mut buffer[..chunk.len()] {
-                        *byte = cipher.decrypt_byte(*byte);
-                    }
-                    out.write_all(&buffer[..chunk.len()])?;
-                }
-            }
-            ArchiveSource::File(path) => {
-                let mut file = File::open(path.as_ref())?;
-                file.seek(SeekFrom::Start(range.start as u64))?;
-                let mut remaining = range.len();
-                while remaining > 0 {
-                    let to_read = remaining.min(buffer.len());
-                    file.read_exact(&mut buffer[..to_read])?;
-                    for byte in &mut buffer[..to_read] {
-                        *byte = cipher.decrypt_byte(*byte);
-                    }
-                    out.write_all(&buffer[..to_read])?;
-                    remaining -= to_read;
-                }
-            }
+        // NEWTUA: и разветвление по виду источника, и свой цикл расшифровки
+        // отсюда ушли (тикет 30, этап Е3; довершено `/simplify`). Обе ветки
+        // делали одно — читать диапазон кусками и расшифровывать, — а диапазон
+        // умеет отдать сам источник, расшифровку же по дороге делает
+        // `Rar13DecryptReader`, которым этот файл пользуется и в двух других
+        // местах. Обрыв посреди диапазона остаётся отказом: считаем байты.
+        let expected = range.len() as u64;
+        let reader = self.source.range_reader(range)?;
+        let mut reader = Rar13DecryptReader::new(reader, cipher);
+        if std::io::copy(&mut reader, out)? != expected {
+            return Err(Error::TooShort);
         }
         Ok(())
     }

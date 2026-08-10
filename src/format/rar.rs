@@ -793,8 +793,7 @@ fn map_err(e: rars::Error) -> Error {
         | R::UnsupportedFeature { .. }
         | R::UnsupportedFamilyFeature { .. }
         | R::UnsupportedCompression { .. }
-        | R::UnsupportedEncryption { .. }
-        | R::Rar50BufferedDecodeLimitExceeded { .. } => Error::Unsupported {
+        | R::UnsupportedEncryption { .. } => Error::Unsupported {
             format: "rar".into(),
             feature: e.to_string(),
         },

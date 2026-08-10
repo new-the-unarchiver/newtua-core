@@ -124,6 +124,30 @@ handed the files to you with today's date and default permissions.
   still decoded in one piece, but it too got lighter — a 300 MB one went from
   751 MB to 414 MB, and a 196 MB executable, where RAR's filters actually run,
   from 502 MB to 272 MB.
+- **A solid RAR of many small files no longer gets slower the more files it
+  holds.** This is the commonest shape a RAR comes in — a folder of thousands of
+  small files packed as one stream — and the wait used to grow faster than the
+  archive: 8000 files took 1.7 s where 1000 took 0.03 s, so 20 000 would have
+  meant tens of seconds. The engine was copying the whole compression window
+  before every single file, and reopening the archive file for every single file
+  on top of that. Both are gone. The same 8000 files now take **0.06 s**, the
+  wait grows in step with the number of files, and the result is about **twice
+  as fast as libunrar** across the whole range — where before it was fourteen
+  times slower at 8000 files. Nothing about the output changed: every byte,
+  permission and timestamp still matches `unar` on the reference archives.
+- **A packed executable extracts about a tenth faster**, and the same for a
+  large file read as a stream: the byte-at-a-time loops that scanned for x86
+  instructions and copied repeated runs now work in blocks.
+- **A large executable inside a RAR could fail to extract at all.** RAR
+  transforms x86 code and uncompressed audio before packing them, and a member
+  over 512 MiB carrying such a transform was refused outright — from the outside
+  it looked like a broken archive. It extracts now. The engine had two ways of
+  decoding, and only the slower one knew about those transforms; now both do.
+- **The memory a RAR member costs no longer depends on how big it is.** A 300 MB
+  file inside an archive needed 347 MB of RAM, a 196 MB executable needed 272 MB;
+  both now need about 79 MB, which is the archive's dictionary — the same figure
+  for a member of any size. Extraction did not get slower for it: measured
+  against the old path it is between a tenth faster and exactly even.
 
 ### Other
 

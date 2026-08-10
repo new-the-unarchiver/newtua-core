@@ -321,7 +321,6 @@ impl FileHeader {
             Error::UnsupportedSignature
             | Error::UnsupportedVersion(_)
             | Error::UnsupportedFeature { .. }
-            | Error::Rar50BufferedDecodeLimitExceeded { .. }
             | Error::UnsupportedFamilyFeature { .. }
             | Error::UnsupportedCompression { .. }
             | Error::UnsupportedEncryption { .. }
@@ -527,7 +526,7 @@ impl Archive {
             file,
             len,
             signature.offset,
-            ArchiveSource::File(path),
+            ArchiveSource::file(path),
             password,
         )
     }

@@ -37,9 +37,11 @@ pub struct ArchiveReadOptions<'a> {
     pub password: Option<&'a [u8]>,
     /// Optional RAR 5 whole-member buffered decode limit.
     ///
-    /// Filtered RAR 5 members need whole-member transforms. Compressed members
-    /// above this limit use the streaming path and reject filtered streams
-    /// with an unsupported-feature error instead of buffering the full member.
+    /// NEWTUA: what this limit means changed with ticket 34. Both paths apply
+    /// filters now, so it no longer decides whether a filtered member can be
+    /// read at all — only whether the member is decoded into memory whole.
+    /// Below the limit it is, which keeps the retry that re-decodes without
+    /// filters when integrity fails; above it the member streams.
     pub rar50_buffered_decode_limit: Option<u64>,
 }
 

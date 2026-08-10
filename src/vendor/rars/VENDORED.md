@@ -164,13 +164,195 @@ each is marked `NEWTUA:` in the source.
 
 Fixes 2 and 3 together: **peak 751 → 414 MB** on a 300 MB member.
 
-**What is deliberately left.** A member below `BUFFERED_DECODE_LIMIT` (512 MiB)
-is still decoded into a `Vec` whole, so its peak stays at about 1.4× the
-member's size. Routing everything through the streaming path would fix that but
-costs two measured things — ×1.49 of CPU time, and no RAR 5 filter support at
-all — and both live in the hot loop that stage Е is about to profile. Why it
-waits for Е, and the order to follow when it comes back: ticket 29 and
-`.claude/ROADMAP-RAR.md`.
+**Closed by ticket 34** (below): the streaming path applies filters now, the
+threshold is 1 MiB instead of 512 MiB, and a member's peak no longer depends on
+its size — 300 MB member, **347 → 79 MB**.
+
+### Six fixes of ours about speed (ticket 30, stage Е of the roadmap)
+
+A solid archive of many small files — the commonest shape there is — used to
+grow **quadratically in the number of members**: ×1.45 of libunrar at 250
+entries, ×3.60 at 2000, **×14.55 at 8000**, where libunrar is linear. It is now
+linear and **twice as fast as libunrar** across the whole range: ×0.43…×0.49 at
+250…8000 entries, doubling ratio ≈×2. On 8000 entries that is **1.73 s →
+0.062 s**, measured in memory, interleaved, medians of paired runs.
+
+The per-step ratios below come from lighter runs taken while the work was going
+on (`ROUNDS=3 INNER=5`) and are there to say which step bought what; the figures
+in the paragraph above are the careful run at the end (`ROUNDS=5 INNER=9`).
+Each fix is marked `NEWTUA:` in the source.
+
+1. **`codec/rar50.rs`, `rar50/extract.rs` — a checkpoint instead of a copy of
+   the decoder.** Upstream took `self.decoder.clone()` before every member, as
+   the point to roll back to if integrity does not check out with filters
+   applied. The decoder carries the dictionary window inside it, so on 8000
+   entries with a 16 MiB window that clone is on the order of 50 GB of memory
+   traffic — and in the profile 84 % of the time was `memmove`. The rollback is
+   needed almost never and was paid for always.
+   `Unpack50Checkpoint` stores what actually changes: the window's *length* plus
+   `reps`, `last_length` and the tables. The window between checkpoint and
+   rollback is **append-only**, so the old state is its first `history_len`
+   bytes. The one exception is trimming from the front, and that path saves what
+   it drops (`drop_history_front`), so the whole window is always
+   `discarded ++ history`. **Counted, not assumed:** on solid archives of 250…
+   8000 small files the trim never fires once — the whole output is smaller than
+   the dictionary — and on a 400 MB solid archive it fired twice, for 5 bytes.
+   Alone this took ×14.55 down to **×1.42** and left the doubling ratio at ×2
+   across the range.
+2. **`source.rs` — the open file survives the member.** Upstream called
+   `File::open` per member; with the window copy gone, `__open`/`__lseek`/
+   `close` were about two thirds of the profile. `FileSource` keeps one
+   descriptor and hands it out through `PooledFile`, which returns it on `Drop`.
+   Not "always one file": a member split across volumes assembles several
+   readers at once (`fragment_reader`), so it is a rack with one slot — taken
+   means open another, freed means put it back. **×1.42 → ×0.50.**
+3. **`source.rs` — the read buffer is no larger than the range.** A member of a
+   solid archive of small files is a couple of hundred bytes, and a 64 KiB
+   buffer was allocated for each. **×0.50 → ×0.46.**
+4. **`codec/rar50.rs` — the streaming window is trimmed in one piece.**
+   `StreamingOutput::flush` dropped bytes one at a time (`pop_front`), and
+   `flush` runs once per 64 KiB: after the window fills, that is 65 536 calls
+   each time. The streaming path was **×1.49** of the buffered one by CPU time;
+   this alone brought it to **×1.12**.
+5. **`codec/rar50.rs` — the streaming path copies matches in blocks.** It called
+   `byte_at_distance` and `push` per byte — 44 % of its profile — while the
+   buffered path copies runs. A `VecDeque` is a ring already, so `as_slices`
+   gives the history in at most two contiguous pieces, and the part that lies in
+   `pending` is copied with `extend_from_within`, overlap and all. To keep the
+   offsets still under our feet, a match is never flushed through: `pending` is
+   sized for the longest match beyond the flush threshold and the flush happens
+   after it. **×1.12 → ×1.04**, and the gap with the buffered path is now within
+   the noise of a paired run.
+6. **`codec/fast.rs` — the x86 opcode scan is vectorised, and asks by a flag.**
+   The E8/E9 filter runs over every decoded block of a packed executable, the
+   commonest shape of a large RAR; it was 14 % of the profile there. Upstream's
+   `cmp_mask` had exactly two values and both are a ready call — `memchr` for
+   `0xe8`, `memchr2` for `0xe8`/`0xe9` — so the parameter became `include_e9`,
+   which has no third value. Upstream's own vectorised branch is behind
+   `portable_simd` and needs a nightly build; this is how it comes back on
+   stable, with the `unsafe` staying inside someone else's crate.
+   **×0.92** on an archive of x86 code.
+
+Two more, measured and small: the RAR 5 decrypting reader now decrypts 16 KiB
+at a time instead of one AES block (it sits *outside* the source buffer, so that
+buffer never helped it) — **×0.97** on a large encrypted member; and the "take
+`Unpack50Decoder::new()` instead of the clone when the archive is not solid"
+idea from the 2026-08-09 review is moot, since no clone is taken any more.
+
+**Six new unit tests came with them**, all in `codec/rar50.rs`, guarding the two
+branches nothing else reaches: the rollback — rare by construction, since it
+needs a member whose integrity fails *after* filters, so neither the corpus nor
+the `unar` comparison ever takes it — and a match that reads the history across
+the seam of the ring. They reach into private fields on purpose: they sit in the
+same module, and the alternative, synthesising a RAR 5 block stream, would need
+the encoder that was cut.
+
+**Not regressed, checked on purpose:** on a single large member we were already
+ahead of libunrar by CPU time, and still are — ×0.84 (`big_m3`), ×0.81
+(`big_m5`), ×0.88 (a 400 MB solid archive). The wall-clock gap there (×1.9…2.3)
+is libunrar's multithreading and cannot be answered on one core.
+
+### Filters in the streaming path, and a hole it closed (ticket 34)
+
+Upstream has two decode paths and only the buffered one applies RAR 5 filters;
+the streaming one refused with a typed sentinel, which the caller turned into
+"filtered member requires buffered decoding above the configured limit". Since
+the choice between the paths was made **by member size**, that refusal was a
+real hole: **a filtered member larger than 512 MiB did not extract at all.** It
+is exactly what RAR applies filters to — a large `.exe`/`.dll`/installer (E8/E9)
+or uncompressed audio and bitmaps (Delta) — and from outside it looked like a
+broken archive.
+
+Four changes, each marked `NEWTUA:`:
+
+1. **One filter implementation for both paths.** `apply_one_filter` transforms a
+   block; `apply_filters` (buffered, whole output at the end) and the streaming
+   emission stage both call it. The rules that constrain them — a block no
+   longer than 4 MiB, blocks that run forward without overlapping, a block that
+   fits inside the member — live in one function, `filter_block_end`, and are
+   checked by both. They have to be identical: the streaming path cannot go back
+   to bytes it has already handed out, so what one path refuses the other must
+   refuse too, or the two disagree and disagreement here is corruption, not a
+   refusal.
+   The 4 MiB ceiling is `unrar`'s own (`MAX_FILTER_BLOCK_SIZE` in `unpack.hpp`),
+   and so is the response to a longer block: drop the filter rather than fail.
+   It is also what makes deferred emission bounded at all — the length field is
+   32 bits wide.
+2. **The streaming emission stage.** Bytes before a filter's block go straight
+   to the sink; the block itself is held until complete, transformed, then sent.
+   A filter is always declared *ahead* of its block, so nothing already emitted
+   ever has to be revisited. The window keeps the **unfiltered** bytes — the same
+   rule `unrar` states in `UnpWriteBuf`: "we cannot process them just in place in
+   Window buffer, because these data can be used for future string matches".
+3. **The decoder copy in `stream_file_to` is gone.** It insured against failing
+   mid-member and cost a copy of the dictionary window per member — the same
+   disease ticket 30 cured on the buffered side, hiding in the streaming branch.
+   With the threshold lowered it made a solid archive of 8000 small files **×48**
+   slower. The window now returns to the decoder whichever way the decode ends,
+   so there is nothing left to insure.
+4. **"The window is all zeros" is carried, not recomputed.** The streaming path
+   used to scan the whole incoming window on entry to seed its zero-run
+   shortcut — O(window) per member, and on the same archive that alone was worth
+   several-fold. The decoder carries the flag; the buffered path keeps it up to
+   date over the member's own tail, which is O(member).
+
+**What it bought, measured:** peak memory on a 300 MB member **347 → 79 MB**, on
+a 196 MB filtered executable **272 → 72 MB**, and the 79 MB is the archive's
+dictionary, so it no longer depends on the member's size.
+
+**What it cost, measured the same way** — one code, two thresholds, paired runs:
+on a large member streaming costs **+2…3 % of CPU time** and up to +10 % of wall
+clock. Four times less memory for three per cent. On thousands of small members
+streaming is the *faster* of the two (×0.86…×0.92), but those stay below the
+threshold anyway. That is the trade `BUFFERED_DECODE_LIMIT` = 1 MiB makes; the
+earlier claim of "no price at all" came from a single unpaired run on a loaded
+machine and did not survive a paired one.
+
+### What `/simplify` found afterwards, and it was not cosmetic
+
+The cleanup pass over this work turned up **a second quadratic of the same
+family, still live**, and it is worth recording how it hid.
+
+Stage Е's evidence said the window is trimmed from the front almost never —
+"counted, not assumed". That count was honest and useless: every sample in the
+reference set is smaller than the archive's dictionary, so the trim never fires
+in them. **A solid archive larger than its dictionary trims on every member**,
+and the trim was `Vec::drain` from the front — a shift of the whole window, per
+member. Measured on a solid archive of 4000 files totalling 74 MB with a 32 MiB
+dictionary: **×8.9 of libunrar**, where the same shape below the dictionary runs
+at ×0.47.
+
+The window is a `VecDeque` in the decoder now, so dropping its front costs
+nothing, and the streaming path no longer rebuilds it either: it used to take
+the window as a `Vec`, convert to a ring and convert back, and the way back is
+O(window) once the ring's start has moved. **×8.9 → ×1.0**, with no change to
+the archives that were already fast.
+
+Three more from the same pass, each measured:
+
+- `Unpack50Checkpoint` cloned `DecodeTables` — four Huffman tables with a
+  1024-entry quick index each, ~23 KB and eight allocations **per member**. The
+  tables are never edited in place, only replaced wholesale, so `Arc` makes the
+  snapshot free and the method's promise of O(1) true.
+- `reset()` copied the whole window into the rollback store; for a **non-solid**
+  archive that is every member. Taking the window instead of copying it costs
+  nothing.
+- The decrypting reader allocated and zeroed a full 16 KiB per member even for a
+  200-byte one; it is sized by the member now, as the source buffer already was.
+
+And one trap for whoever cleans up next: the first version of the shared
+ring-copy helper took a destination slice, which forced the streaming caller to
+zero the space first. That extra pass over every matched byte cost **8 % on a
+large member** and did not show up in tests — only in a paired measurement. The
+helper hands out the two slices instead.
+
+**What the threshold means now.** Not "filters do not work above this" — they
+work on both paths. Only "below this we still decode into a `Vec`", and only for
+one thing: the retry that re-decodes a member without filters from the
+checkpoint when integrity fails. The streaming path cannot offer that, because
+its bytes are already gone. Worth knowing: **`unrar` has no such retry either**
+— it applies filters and checks the CRC — so the shrinking coverage is a
+divergence from upstream `rars`, not from the oracle.
 
 ## Tests
 

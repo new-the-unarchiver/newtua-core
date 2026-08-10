@@ -50,10 +50,6 @@ pub enum Error {
         version: ArchiveVersion,
         feature: &'static str,
     },
-    Rar50BufferedDecodeLimitExceeded {
-        limit: u64,
-        required: u64,
-    },
     UnsupportedFamilyFeature {
         family: ArchiveFamily,
         feature: &'static str,
@@ -113,10 +109,6 @@ impl std::fmt::Display for Error {
             Self::UnsupportedFeature { version, feature } => {
                 write!(f, "feature {feature} is not supported by {version:?}")
             }
-            Self::Rar50BufferedDecodeLimitExceeded { limit, required } => write!(
-                f,
-                "RAR 5 filtered member requires buffered decoding of {required} bytes, above the configured limit of {limit} bytes"
-            ),
             Self::UnsupportedFamilyFeature { family, feature } => {
                 write!(f, "feature {feature} is not supported by {family:?}")
             }
@@ -422,14 +414,6 @@ mod tests {
             }
             .to_string(),
             "feature quantum compression is not supported by Rar50"
-        );
-        assert_eq!(
-            Error::Rar50BufferedDecodeLimitExceeded {
-                limit: 536_870_912,
-                required: 734_003_200,
-            }
-            .to_string(),
-            "RAR 5 filtered member requires buffered decoding of 734003200 bytes, above the configured limit of 536870912 bytes"
         );
     }
 

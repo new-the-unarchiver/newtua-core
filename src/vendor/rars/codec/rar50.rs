@@ -2,6 +2,8 @@ use super::filters::{self, DeltaErrorMessages};
 use super::{Error, Result};
 use std::collections::VecDeque;
 use std::io::Read;
+use std::ops::Range;
+use std::sync::Arc;
 
 pub const LEVEL_TABLE_SIZE: usize = 20;
 pub const MAIN_TABLE_SIZE: usize = 306;
@@ -16,6 +18,10 @@ const STREAM_FLUSH_THRESHOLD: usize = 64 * 1024;
 /// Longest match RAR 5 can encode: length slot 43 with all extra bits set,
 /// plus the maximum distance bonus.
 const MAX_LZ_MATCH: usize = 4100;
+/// NEWTUA: потолок на длину блока фильтра — столько же, сколько у `unrar`
+/// (`MAX_FILTER_BLOCK_SIZE` в `unpack.hpp`). Это же и потолок на то, сколько
+/// потоковый путь придерживает ради фильтра (тикет 34).
+const MAX_FILTER_BLOCK_SIZE: usize = 0x40_0000;
 /// Zero-initialised bytes kept past the decode frontier so match copying can
 /// write whole eight-byte chunks without a length check per chunk.
 const COPY_SLACK: usize = 8;
@@ -39,7 +45,6 @@ struct OwnedCompressedBlock {
 #[doc(hidden)]
 pub enum StreamDecodeError<E> {
     Decode(Error),
-    FilteredMember,
     Sink(E),
 }
 
@@ -213,12 +218,69 @@ pub fn read_table_lengths(input: &[u8], algorithm_version: u8) -> Result<(TableL
     ))
 }
 
-#[derive(Debug, Clone)]
+// NEWTUA: `Clone` снят намеренно (тикет 34). Обе точки, где декодер
+// копировался целиком — а с ним и словарное окно, — убраны; без `Clone` их
+// нельзя вернуть молча.
+#[derive(Debug)]
 pub struct Unpack50Decoder {
-    tables: Option<DecodeTables>,
+    /// NEWTUA: таблицы под счётчиком ссылок (тикет 34, найдено `/simplify`).
+    ///
+    /// Точка отката обязана запомнить их вместе с окном, а `DecodeTables` —
+    /// это четыре таблицы Хаффмана с быстрым индексом на 1024 записи каждая,
+    /// около 23 КБ и восемь выделений на копию. На запись. Таблицы нигде не
+    /// правятся на месте, только подменяются целиком, так что счётчик ссылок
+    /// делает снимок бесплатным.
+    tables: Option<Arc<DecodeTables>>,
     reps: [usize; 4],
     last_length: usize,
-    history: Vec<u8>,
+    /// NEWTUA: окно словаря — кольцо, а не `Vec` (тикет 34, найдено `/simplify`).
+    ///
+    /// Апстрим держал его в `Vec` и срезал начало через `drain`, а это сдвиг
+    /// всего окна — на **каждую** запись, как только суммарный выход перерос
+    /// словарь. Ровно та квадратичная болезнь, что лечил тикет 30, только
+    /// прячется она на архивах крупнее словаря: сплошной архив из 4000 файлов
+    /// на 74 МБ при словаре в 32 МиБ шёл ×8,9 к libunrar там, где тот же вид
+    /// под словарём идёт ×0,47. У кольца срез начала стоит O(1).
+    ///
+    /// Заодно исчезла пересборка: потоковый путь брал окно себе и возвращал
+    /// обратно через `Vec` ⇄ `VecDeque`, и обратный ход стоил O(окна) на
+    /// запись, потому что после первого же среза начало кольца не в нуле.
+    history: VecDeque<u8>,
+    /// NEWTUA: «в окне одни нули» — признак, который несёт сам декодер, а не
+    /// вычисляется заново на каждую запись (тикет 34).
+    ///
+    /// Потоковый путь пользуется им ради быстрой выдачи нулей, и раньше он
+    /// пересчитывал его проходом по всему окну при входе. На сплошном архиве из
+    /// 8000 мелких файлов с окном в 16 МиБ это 8000 проходов по окну — та же
+    /// квадратичная болезнь, что и клон словаря, только в другом месте: при
+    /// опущенном пороге распаковка становилась в 64 раза медленнее.
+    ///
+    /// Признак осторожный: срезанное с начала окна его не поднимает обратно.
+    /// Ошибиться в эту сторону значит потерять ускорение, а не байты.
+    history_all_zero: bool,
+    /// NEWTUA: байты, ушедшие с начала окна с тех пор, как взята точка отката.
+    /// `None` — точки отката нет и запоминать нечего. См. [`Unpack50Checkpoint`].
+    discarded: Option<VecDeque<u8>>,
+}
+
+/// NEWTUA: точка отката декодера — вместо копии всего декодера (тикет 30).
+///
+/// Апстрим брал `decoder.clone()` перед каждой записью, а декодер носит внутри
+/// словарное окно: на сплошном архиве из 8000 мелких файлов с окном в 16 МиБ
+/// это порядка 50 ГБ пересылки памяти и квадратичный рост по числу записей.
+/// Здесь запоминается только то, что меняется: длина окна и три мелких поля.
+///
+/// Окно между точкой отката и откатом **только дописывается в конец**, поэтому
+/// прежнее состояние — это первые `history_len` байт. Единственное исключение —
+/// обрезка с начала (`drop_history_front`), и она свои байты сохраняет, так что
+/// полное окно всегда равно `discarded ++ history`.
+#[derive(Debug)]
+pub struct Unpack50Checkpoint {
+    tables: Option<Arc<DecodeTables>>,
+    reps: [usize; 4],
+    last_length: usize,
+    history_len: usize,
+    history_all_zero: bool,
 }
 
 impl Unpack50Decoder {
@@ -227,7 +289,61 @@ impl Unpack50Decoder {
             tables: None,
             reps: [0; 4],
             last_length: 0,
-            history: Vec::new(),
+            history: VecDeque::new(),
+            history_all_zero: true,
+            discarded: None,
+        }
+    }
+
+    /// NEWTUA: взять точку отката. O(1) по размеру окна.
+    pub fn checkpoint(&mut self) -> Unpack50Checkpoint {
+        self.discarded = Some(VecDeque::new());
+        Unpack50Checkpoint {
+            tables: self.tables.clone(),
+            reps: self.reps,
+            last_length: self.last_length,
+            history_len: self.history.len(),
+            history_all_zero: self.history_all_zero,
+        }
+    }
+
+    /// NEWTUA: точка отката больше не нужна — запись принята.
+    pub fn forget_checkpoint(&mut self) {
+        self.discarded = None;
+    }
+
+    /// NEWTUA: вернуть декодер в состояние, снятое [`Self::checkpoint`].
+    ///
+    /// Путь редкий: он берётся, только если целостность записи не сошлась
+    /// после применения фильтров.
+    pub fn roll_back(&mut self, checkpoint: Unpack50Checkpoint) {
+        self.tables = checkpoint.tables;
+        self.reps = checkpoint.reps;
+        self.last_length = checkpoint.last_length;
+        self.history_all_zero = checkpoint.history_all_zero;
+        // Путь редкий, так что берётся самая короткая форма: полное окно —
+        // это `discarded ++ history`, а прежнее состояние — его начало.
+        let mut history = self.discarded.take().unwrap_or_default();
+        history.append(&mut self.history);
+        history.truncate(checkpoint.history_len);
+        self.history = history;
+    }
+
+    /// NEWTUA: срезать `count` байт с начала окна, сохранив их для отката.
+    fn drop_history_front(&mut self, count: usize) {
+        // NEWTUA: срез всего окна при пустом складе — это перенос, а не копия.
+        // Случай не редкий: так уходит окно у **каждой** несплошной записи
+        // (`reset`), и копировать там было бы окно на запись.
+        if count == self.history.len()
+            && let Some(discarded) = &mut self.discarded
+            && discarded.is_empty()
+        {
+            *discarded = std::mem::take(&mut self.history);
+            return;
+        }
+        let dropped = self.history.drain(..count);
+        if let Some(discarded) = &mut self.discarded {
+            discarded.extend(dropped);
         }
     }
 
@@ -286,7 +402,7 @@ impl Unpack50Decoder {
             let mut payload_bit_pos = 0;
             if block.header.has_tables {
                 let (lengths, table_bits) = read_table_lengths(payload, algorithm_version)?;
-                self.tables = Some(DecodeTables::from_lengths(&lengths)?);
+                self.tables = Some(Arc::new(DecodeTables::from_lengths(&lengths)?));
                 payload_bit_pos = table_bits;
             }
             let tables = self
@@ -410,10 +526,11 @@ impl Unpack50Decoder {
             let tail = history_output
                 .as_deref()
                 .unwrap_or_else(|| &output[tail_start..]);
-            self.history.extend_from_slice(tail);
+            self.history_all_zero = self.history_all_zero && tail.iter().all(|&byte| byte == 0);
+            self.history.extend(tail);
             if self.history.len() > dictionary_size {
                 let discard = self.history.len() - dictionary_size;
-                self.history.drain(..discard);
+                self.drop_history_front(discard);
             }
             Ok(output)
         } else {
@@ -441,25 +558,62 @@ impl Unpack50Decoder {
         // dictionary here does not allocate a potentially huge RAR 7 window
         // up front. It does, however, retain every byte that a legal match may
         // reference instead of silently truncating the window at 64 MiB.
+        // NEWTUA: точка отката и потоковый путь не пересекаются — окно уезжает
+        // в `StreamingOutput`, и запомненная длина стала бы враньём. Держится
+        // это на порядке ветвлений в `rar50/extract.rs::write_file_to`, то есть
+        // в другом файле; здесь стоит проверка, чтобы порядок нельзя было
+        // поменять молча.
+        debug_assert!(
+            self.discarded.is_none(),
+            "потоковый путь не должен идти под точкой отката"
+        );
         let history_limit = dictionary_size;
         if self.history.len() > history_limit {
             let discard = self.history.len() - history_limit;
-            self.history.drain(..discard);
+            self.drop_history_front(discard);
         }
         let mut output = StreamingOutput::new(
             std::mem::take(&mut self.history),
+            self.history_all_zero,
             output_size,
             dictionary_size,
             history_limit,
         );
 
+        // NEWTUA: окно возвращается декодеру при любом исходе (тикет 34).
+        //
+        // Раньше вызывающий страховался от неудачи копией всего декодера, а
+        // копия декодера — это копия окна на каждую запись, то есть ровно тот
+        // квадратичный рост, который лечил тикет 30. Здесь окно уходит из
+        // декодера на время распаковки и возвращается назад независимо от того,
+        // чем она кончилась, — страховать больше нечего.
+        let result = self.decode_blocks_to_sink(
+            input,
+            algorithm_version,
+            output_size,
+            &mut output,
+            &mut sink,
+        );
+        self.history_all_zero = output.all_zero;
+        self.history = output.into_history();
+        result
+    }
+
+    fn decode_blocks_to_sink<E>(
+        &mut self,
+        input: &mut impl Read,
+        algorithm_version: u8,
+        output_size: usize,
+        output: &mut StreamingOutput,
+        sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
         loop {
             let block = read_compressed_block(input)?;
             let payload = block.payload.as_slice();
             let mut payload_bit_pos = 0;
             if block.header.has_tables {
                 let (lengths, table_bits) = read_table_lengths(payload, algorithm_version)?;
-                self.tables = Some(DecodeTables::from_lengths(&lengths)?);
+                self.tables = Some(Arc::new(DecodeTables::from_lengths(&lengths)?));
                 payload_bit_pos = table_bits;
             }
             let tables = self
@@ -472,13 +626,14 @@ impl Unpack50Decoder {
             while bits.bit_pos < block.header.payload_bits && output.written() < output_size {
                 let symbol = tables.main.decode(&mut bits)?;
                 match symbol {
-                    0..=255 => output.push(symbol as u8, &mut sink)?,
-                    256 => {
-                        return Err(StreamDecodeError::FilteredMember);
-                    }
+                    0..=255 => output.push(symbol as u8, sink)?,
+                    // NEWTUA: фильтр больше не повод отказаться (тикет 34).
+                    // Он объявлен впереди своего блока, поэтому выдача просто
+                    // придерживает блок и преобразует его целиком.
+                    256 => output.add_filter(read_filter(&mut bits, output.written())?)?,
                     257 => {
                         if self.last_length != 0 {
-                            output.copy_match(self.reps[0], self.last_length, &mut sink)?;
+                            output.copy_match(self.reps[0], self.last_length, sink)?;
                         }
                     }
                     258..=261 => {
@@ -496,7 +651,7 @@ impl Unpack50Decoder {
                         self.reps[..=rep_index].rotate_right(1);
                         self.reps[0] = distance;
                         self.last_length = length;
-                        output.copy_match(distance, length, &mut sink)?;
+                        output.copy_match(distance, length, sink)?;
                     }
                     262.. => {
                         let length_slot = symbol - 262;
@@ -516,7 +671,7 @@ impl Unpack50Decoder {
                         self.reps.rotate_right(1);
                         self.reps[0] = distance;
                         self.last_length = length;
-                        output.copy_match(distance, length, &mut sink)?;
+                        output.copy_match(distance, length, sink)?;
                     }
                 }
             }
@@ -528,9 +683,7 @@ impl Unpack50Decoder {
         }
 
         if output.written() == output_size {
-            output.finish(&mut sink)?;
-            self.history = output.into_history();
-            Ok(())
+            output.finish(sink)
         } else {
             Err(Error::NeedMoreInput.into())
         }
@@ -540,7 +693,10 @@ impl Unpack50Decoder {
         self.tables = None;
         self.reps = [0; 4];
         self.last_length = 0;
-        self.history.clear();
+        self.history_all_zero = true;
+        // NEWTUA: окно уходит целиком, и уходит оно с начала — значит, для
+        // точки отката его надо сперва запомнить, как и при обрезке.
+        self.drop_history_front(self.history.len());
     }
 
     // Самая горячая функция распаковки RAR 5 — на неё приходилась треть
@@ -578,7 +734,9 @@ impl Unpack50Decoder {
             let history_distance = distance - *pos;
             let index = self.history.len() - history_distance;
             let take = remaining.min(history_distance);
-            output[*pos..*pos + take].copy_from_slice(&self.history[index..index + take]);
+            let (from_head, from_tail) = ring_parts(&self.history, index, take);
+            output[*pos..*pos + from_head.len()].copy_from_slice(from_head);
+            output[*pos + from_head.len()..*pos + take].copy_from_slice(from_tail);
             *pos += take;
             remaining -= take;
             if remaining == 0 {
@@ -664,28 +822,58 @@ struct StreamingOutput {
     dictionary_size: usize,
     history_limit: usize,
     all_zero: bool,
+    /// NEWTUA: ступень выдачи с фильтрами (тикет 34).
+    ///
+    /// Объявленные, но ещё не отработавшие фильтры — в порядке появления.
+    filters: VecDeque<PendingFilter>,
+    /// Байты текущего блока фильтра, придержанные до его конца. Не больше
+    /// [`MAX_FILTER_BLOCK_SIZE`].
+    held: Vec<u8>,
+    /// Конец последнего принятого блока — им проверяется, что блоки идут
+    /// вперёд, теми же словами, что и на буферизованном пути.
+    last_block_end: usize,
 }
 
 impl StreamingOutput {
     fn new(
-        history: Vec<u8>,
+        history: VecDeque<u8>,
+        all_zero: bool,
         output_limit: usize,
         dictionary_size: usize,
         history_limit: usize,
     ) -> Self {
         Self {
-            all_zero: history.iter().all(|&byte| byte == 0),
-            history: history.into(),
-            pending: Vec::with_capacity(STREAM_FLUSH_THRESHOLD),
+            all_zero,
+            history,
+            // NEWTUA: место под самое длинное совпадение сверх порога сброса.
+            // Совпадение переносится одним куском и потому может перешагнуть
+            // порог; сброс происходит после него, а не посередине, и тогда
+            // смещения внутри `pending` не разъезжаются под ногами.
+            pending: Vec::with_capacity(STREAM_FLUSH_THRESHOLD + MAX_LZ_MATCH),
             written: 0,
             output_limit,
             dictionary_size,
             history_limit,
+            filters: VecDeque::new(),
+            held: Vec::new(),
+            last_block_end: 0,
         }
     }
 
     fn written(&self) -> usize {
         self.written
+    }
+
+    /// NEWTUA: принять объявленный фильтр (тикет 34).
+    ///
+    /// Границы проверяются теми же словами, что на буферизованном пути, — иначе
+    /// один путь принял бы архив, который другой отвергает, и фаззер поймал бы
+    /// это как расхождение.
+    fn add_filter(&mut self, filter: PendingFilter) -> Result<()> {
+        if accept_filter_block(&filter, &mut self.last_block_end, self.output_limit)?.is_some() {
+            self.filters.push_back(filter);
+        }
+        Ok(())
     }
 
     fn push<E>(
@@ -771,7 +959,16 @@ impl StreamingOutput {
         if distance > self.dictionary_size {
             return Err(Error::InvalidData("RAR 5 match distance exceeds dictionary").into());
         }
-        if self.all_zero && distance <= self.written + self.history.len() {
+        // NEWTUA: быстрый путь для нулей выдаёт приёмнику напрямую, минуя
+        // `pending`, — то есть минуя и ступень фильтров (тикет 34). Пока есть
+        // что фильтровать, им пользоваться нельзя; тогда нули пойдут обычной
+        // дорогой. Запись, которая вся из нулей **и** с фильтром, — случай
+        // умозрительный, так что терять тут нечего.
+        if self.all_zero
+            && self.filters.is_empty()
+            && self.held.is_empty()
+            && distance <= self.written + self.history.len()
+        {
             return self.push_zeroes(length, sink);
         }
         if distance == 0 || distance > self.history.len() + self.pending.len() {
@@ -788,11 +985,49 @@ impl StreamingOutput {
             let byte = self.byte_at_distance(1)?;
             return self.push_repeated(byte, length, sink);
         }
-        for _ in 0..length {
-            let byte = self.byte_at_distance(distance)?;
-            self.push(byte, sink)?;
+
+        // NEWTUA: совпадение переносится кусками, а не по байту (тикет 30, Е4).
+        //
+        // Апстрим звал здесь `byte_at_distance` и `push` на каждый байт, и это
+        // была вся разница с буферизованным путём: в профиле на этот цикл
+        // приходилось 44 % времени, а весь потоковый путь отставал от
+        // буферизованного в ×1,49. Порядок байтов не меняется — сперва то, что
+        // лежит в истории, затем то, что уже накоплено в `pending`, ровно как
+        // читал прежний цикл.
+        //
+        // `all_zero` тут не трогаем намеренно: сюда можно попасть, только если
+        // он уже ложь, — иначе совпадение перехватила бы проверка выше.
+        let mut remaining = length;
+        if distance > self.pending.len() {
+            let history_distance = distance - self.pending.len();
+            let take = remaining.min(history_distance);
+            let start = self.history.len() - history_distance;
+            self.extend_pending_from_history(start, take);
+            remaining -= take;
+        }
+        if remaining > 0 {
+            // Здесь `distance <= pending.len()`, и источник лежит в `pending`.
+            // Наложение (совпадение длиннее расстояния) разворачивается само:
+            // с каждым оборотом доступный кусок растёт на только что дописанное.
+            let start = self.pending.len() - distance;
+            while remaining > 0 {
+                let take = remaining.min(self.pending.len() - start);
+                self.pending.extend_from_within(start..start + take);
+                remaining -= take;
+            }
+        }
+        self.written += length;
+        if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
+            self.flush(sink)?;
         }
         Ok(())
+    }
+
+    /// NEWTUA: `take` байт истории, начиная с `start`, дописать в `pending`.
+    fn extend_pending_from_history(&mut self, start: usize, take: usize) {
+        let (from_head, from_tail) = ring_parts(&self.history, start, take);
+        self.pending.extend_from_slice(from_head);
+        self.pending.extend_from_slice(from_tail);
     }
 
     fn byte_at_distance(&self, distance: usize) -> Result<u8> {
@@ -817,11 +1052,64 @@ impl StreamingOutput {
         if self.pending.is_empty() {
             return Ok(());
         }
-        sink(DecodedChunk::Bytes(&self.pending)).map_err(StreamDecodeError::Sink)?;
-        self.history.extend(self.pending.iter().copied());
+        // NEWTUA: окно получает **нефильтрованные** байты, приёмник —
+        // фильтрованные (тикет 34). Так же поступает и `unrar`: он копирует
+        // блок из окна и преобразует копию, потому что окно ещё понадобится
+        // будущим совпадениям. Поэтому история пополняется здесь, до ступени.
+        self.history.extend(&self.pending);
+        // NEWTUA: окно срезается одним куском. Апстрим снимал по байту, а
+        // `flush` зовётся раз на 64 КиБ — после того как окно набралось, это
+        // 65 536 `pop_front` на вызов и сотни миллионов на большом файле.
+        if self.history.len() > self.history_limit {
+            let over = self.history.len() - self.history_limit;
+            self.history.drain(..over);
+        }
+        // Буфер вынимается и возвращается: ступени нужен и он, и `self`.
+        // Ёмкость при этом уезжает вместе с ним и приезжает обратно.
+        let pending = std::mem::take(&mut self.pending);
+        let result = self.emit(&pending, sink);
+        self.pending = pending;
         self.pending.clear();
-        while self.history.len() > self.history_limit {
-            self.history.pop_front();
+        result
+    }
+
+    /// NEWTUA: ступень выдачи (тикет 34).
+    ///
+    /// До начала блока фильтра байты уходят приёмнику как есть; внутри блока
+    /// придерживаются, а когда блок собран целиком — преобразуются и уходят.
+    /// Начало блока всегда впереди текущей позиции (`start = pos + offset`),
+    /// поэтому «догонять» уже выданное не приходится ни разу.
+    fn emit<E>(
+        &mut self,
+        bytes: &[u8],
+        sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        // Позиция первого байта `bytes` в записи. Отдельного счётчика выданного
+        // не нужно: `pending` уже вынут, значит всё, кроме него, ступень прошла.
+        let mut pos = self.written - bytes.len();
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let Some(&filter) = self.filters.front() else {
+                sink(DecodedChunk::Bytes(rest)).map_err(StreamDecodeError::Sink)?;
+                return Ok(());
+            };
+            if pos < filter.start {
+                let take = (filter.start - pos).min(rest.len());
+                sink(DecodedChunk::Bytes(&rest[..take])).map_err(StreamDecodeError::Sink)?;
+                pos += take;
+                rest = &rest[take..];
+                continue;
+            }
+            let take = (filter.start + filter.length - pos).min(rest.len());
+            self.held.extend_from_slice(&rest[..take]);
+            pos += take;
+            rest = &rest[take..];
+            if self.held.len() == filter.length {
+                self.filters.pop_front();
+                apply_one_filter(&mut self.held, &filter)?;
+                sink(DecodedChunk::Bytes(&self.held)).map_err(StreamDecodeError::Sink)?;
+                self.held.clear();
+            }
         }
         Ok(())
     }
@@ -830,11 +1118,37 @@ impl StreamingOutput {
         &mut self,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        self.flush(sink)
+        self.flush(sink)?;
+        // NEWTUA: недособранный блок фильтра означает, что он выходит за конец
+        // записи, — а это `add_filter` уже отверг бы. Проверка на случай, если
+        // когда-нибудь отвергать перестанет.
+        if !self.held.is_empty() || !self.filters.is_empty() {
+            return Err(Error::InvalidData("RAR 5 filter range exceeds output").into());
+        }
+        Ok(())
     }
 
-    fn into_history(self) -> Vec<u8> {
-        self.history.into()
+    fn into_history(self) -> VecDeque<u8> {
+        self.history
+    }
+}
+
+/// NEWTUA: `len` байт кольца, начиная с `start`, двумя сплошными кусками.
+///
+/// `VecDeque` и есть кольцо, а `as_slices` отдаёт его двумя кусками; больше
+/// двух их не бывает по построению. Помощник отдаёт куски, а не копирует их
+/// сам: приёмники у двух путей разные — в буферизованном это готовый срез
+/// выхода, в потоковом дописывание в конец `pending`, — и общая «скопируй
+/// сюда» заставила бы потоковый путь сперва обнулить место под копию. Лишний
+/// проход по каждому байту совпадения; замер показал 8 % на большой записи.
+fn ring_parts(ring: &VecDeque<u8>, start: usize, len: usize) -> (&[u8], &[u8]) {
+    let (head, tail) = ring.as_slices();
+    if start < head.len() {
+        let from_head = len.min(head.len() - start);
+        (&head[start..start + from_head], &tail[..len - from_head])
+    } else {
+        let start = start - head.len();
+        (&tail[start..start + len], &[])
     }
 }
 
@@ -930,6 +1244,19 @@ fn read_filter(bits: &mut BitReader<'_>, current_pos: usize) -> Result<PendingFi
     } else {
         0
     };
+    // NEWTUA: блок длиннее потолка — это не фильтр (тикет 34).
+    //
+    // Длина читается как 32-битное число, то есть по формату блок вправе
+    // заявить хоть 4 ГБ, и потоковому пути пришлось бы столько придержать.
+    // `unrar` берёт то же число и поступает так же (`unpack50.cpp`:
+    // `if (Filter.BlockLength>MAX_FILTER_BLOCK_SIZE) Filter.BlockLength=0`),
+    // то есть роняет фильтр, а не отказывает. `rar` таких блоков не пишет;
+    // если данные фильтр правда требовали, отказ придёт от CRC.
+    let length = if length > MAX_FILTER_BLOCK_SIZE {
+        0
+    } else {
+        length
+    };
     Ok(PendingFilter {
         start: current_pos
             .checked_add(offset)
@@ -949,24 +1276,64 @@ fn read_filter_data(bits: &mut BitReader<'_>) -> Result<u32> {
     Ok(data)
 }
 
-fn apply_filters(output: &mut [u8], filters: &[PendingFilter]) -> Result<()> {
-    for filter in filters {
-        let end = filter
-            .start
-            .checked_add(filter.length)
-            .ok_or(Error::InvalidData("RAR 5 filter range overflows"))?;
-        let data = output
-            .get_mut(filter.start..end)
-            .ok_or(Error::InvalidData("RAR 5 filter range exceeds output"))?;
-        match filter.filter_type {
-            FilterType::Delta => {
-                let decoded = filters::delta_decode(data, filter.channels, rar50_delta_messages())?;
-                data.copy_from_slice(&decoded);
-            }
-            FilterType::E8 => e8e9_decode(data, filter.start as u32, false),
-            FilterType::E8E9 => e8e9_decode(data, filter.start as u32, true),
-            FilterType::Arm => arm_decode(data, filter.start as u32),
+/// NEWTUA: границы блока фильтра — одни на оба пути (тикет 34).
+///
+/// Потоковый путь физически не может того, что буферизованный делает даром:
+/// вернуться к уже выданным байтам. Значит, запрещённое одному запрещено обоим,
+/// иначе пути разойдутся — а расхождение здесь не отказ, а порча. Проверка
+/// вынесена сюда, чтобы обе стороны спрашивали её одними словами.
+///
+/// `previous_end` — конец предыдущего непустого блока; блоки обязаны идти
+/// вперёд и не налезать друг на друга. `rar` иначе и не пишет.
+fn accept_filter_block(
+    filter: &PendingFilter,
+    previous_end: &mut usize,
+    output_len: usize,
+) -> Result<Option<Range<usize>>> {
+    let end = filter
+        .start
+        .checked_add(filter.length)
+        .ok_or(Error::InvalidData("RAR 5 filter range overflows"))?;
+    if filter.start < *previous_end {
+        return Err(Error::InvalidData(
+            "RAR 5 filter blocks overlap or run backwards",
+        ));
+    }
+    if end > output_len {
+        return Err(Error::InvalidData("RAR 5 filter range exceeds output"));
+    }
+    if filter.length == 0 {
+        return Ok(None);
+    }
+    *previous_end = end;
+    Ok(Some(filter.start..end))
+}
+
+/// NEWTUA: преобразование одного блока. Общее тело для обоих путей (тикет 34).
+///
+/// `start` нужен только как смещение блока в файле — от него считают адреса
+/// фильтры E8/E9 и ARM.
+fn apply_one_filter(data: &mut [u8], filter: &PendingFilter) -> Result<()> {
+    match filter.filter_type {
+        FilterType::Delta => {
+            let decoded = filters::delta_decode(data, filter.channels, rar50_delta_messages())?;
+            data.copy_from_slice(&decoded);
         }
+        FilterType::E8 => e8e9_decode(data, filter.start as u32, false),
+        FilterType::E8E9 => e8e9_decode(data, filter.start as u32, true),
+        FilterType::Arm => arm_decode(data, filter.start as u32),
+    }
+    Ok(())
+}
+
+fn apply_filters(output: &mut [u8], filters: &[PendingFilter]) -> Result<()> {
+    let mut previous_end = 0;
+    let output_len = output.len();
+    for filter in filters {
+        let Some(block) = accept_filter_block(filter, &mut previous_end, output_len)? else {
+            continue;
+        };
+        apply_one_filter(&mut output[block], filter)?;
     }
     Ok(())
 }
@@ -983,10 +1350,9 @@ fn e8e9_decode(data: &mut [u8], file_offset: u32, include_e9: bool) {
     if data.len() <= 4 {
         return;
     }
-    let cmp_mask = if include_e9 { 0xfe } else { 0xff };
     let opcode_limit = data.len() - 4;
     let mut opcode_pos = 0usize;
-    while let Some(pos) = super::fast::next_x86_opcode(data, opcode_pos, opcode_limit, cmp_mask) {
+    while let Some(pos) = super::fast::next_x86_opcode(data, opcode_pos, opcode_limit, include_e9) {
         let cur_pos = pos + 1;
         let offset = file_offset.wrapping_add(cur_pos as u32) % X86_FILTER_FILE_SIZE;
         let addr = u32::from_le_bytes([
@@ -1316,6 +1682,22 @@ fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// NEWTUA: приёмник, собирающий выданное в один буфер.
+    ///
+    /// Тот же `match` по куску был выписан в модуле четырежды; после правок
+    /// тикета 34 стало бы шесть раз.
+    fn collecting_sink(
+        got: &mut Vec<u8>,
+    ) -> impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), std::convert::Infallible> {
+        move |chunk| {
+            match chunk {
+                DecodedChunk::Bytes(bytes) => got.extend_from_slice(bytes),
+                DecodedChunk::Repeated { byte, len } => got.extend(std::iter::repeat_n(byte, len)),
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn reads_level_lengths_with_literal_fifteen() {
         let mut nibbles = vec![1, 2, 15, 0, 3, 4];
@@ -1437,7 +1819,7 @@ mod tests {
         const OLD_STREAM_HISTORY_LIMIT: usize = 64 * 1024 * 1024;
         let distance = OLD_STREAM_HISTORY_LIMIT + 1;
         let history = vec![b'A'; distance];
-        let mut output = StreamingOutput::new(history, 1, distance, distance);
+        let mut output = StreamingOutput::new(history.into(), false, 1, distance, distance);
         let mut decoded = Vec::new();
 
         output
@@ -1468,7 +1850,7 @@ mod tests {
 
     #[test]
     fn streaming_window_rejects_match_beyond_declared_dictionary() {
-        let mut output = StreamingOutput::new(vec![b'A'; 8], 1, 7, 8);
+        let mut output = StreamingOutput::new(vec![b'A'; 8].into(), false, 1, 7, 8);
 
         assert!(matches!(
             output.copy_match(8, 1, &mut |_| Ok::<(), std::io::Error>(())),
@@ -1476,5 +1858,117 @@ mod tests {
                 "RAR 5 match distance exceeds dictionary"
             )))
         ));
+    }
+
+    // NEWTUA: точка отката (тикет 30). Её путь редкий — он берётся, только если
+    // целостность записи не сошлась после фильтров, — и потому не встречается
+    // ни в корпусе, ни в сверке с `unar`. Здесь он проверяется прямо: поля
+    // видны, потому что тесты лежат в том же модуле.
+
+    fn decoder_with_window(window: Vec<u8>) -> Unpack50Decoder {
+        let mut decoder = Unpack50Decoder::new();
+        decoder.history = window.into();
+        decoder.reps = [11, 22, 33, 44];
+        decoder.last_length = 7;
+        decoder
+    }
+
+    #[test]
+    fn roll_back_restores_the_window_after_it_grew() {
+        let mut decoder = decoder_with_window((0..100u8).collect());
+        let before = decoder.history.clone();
+
+        let checkpoint = decoder.checkpoint();
+        decoder.history.extend([200; 50]);
+        decoder.reps = [0; 4];
+        decoder.last_length = 0;
+        decoder.roll_back(checkpoint);
+
+        assert_eq!(decoder.history, before);
+        assert_eq!(decoder.reps, [11, 22, 33, 44]);
+        assert_eq!(decoder.last_length, 7);
+    }
+
+    #[test]
+    fn roll_back_restores_the_window_after_it_was_trimmed_from_the_front() {
+        // Тот самый случай, ради которого `truncate` в одиночку не годится:
+        // байты ушли с начала, и вернуть их может только сохранённая копия.
+        let mut decoder = decoder_with_window((0..100u8).collect());
+        let before = decoder.history.clone();
+
+        let checkpoint = decoder.checkpoint();
+        decoder.history.extend([200; 50]);
+        decoder.drop_history_front(80);
+        decoder.roll_back(checkpoint);
+
+        assert_eq!(decoder.history, before);
+    }
+
+    #[test]
+    fn roll_back_restores_the_window_after_a_non_solid_member_reset_it() {
+        // `!solid` уносит окно целиком, и уносит с начала.
+        let mut decoder = decoder_with_window((0..100u8).collect());
+        let before = decoder.history.clone();
+
+        let checkpoint = decoder.checkpoint();
+        decoder.reset();
+        decoder.history.extend([7; 10]);
+        decoder.roll_back(checkpoint);
+
+        assert_eq!(decoder.history, before);
+        assert_eq!(decoder.last_length, 7);
+    }
+
+    #[test]
+    fn a_forgotten_checkpoint_stops_saving_what_the_window_drops() {
+        let mut decoder = decoder_with_window((0..100u8).collect());
+
+        decoder.checkpoint();
+        decoder.forget_checkpoint();
+        decoder.drop_history_front(10);
+
+        assert!(decoder.discarded.is_none());
+        assert_eq!(decoder.history.len(), 90);
+    }
+
+    // NEWTUA: совпадение, читающее историю через шов кольца (тикет 30, Е4).
+
+    #[test]
+    fn a_match_reads_history_across_the_seam_of_the_ring() {
+        let mut history: VecDeque<u8> = VecDeque::with_capacity(32);
+        history.extend(0..32u8);
+        for _ in 0..10 {
+            let byte = history.pop_front().expect("окно не пусто");
+            history.push_back(byte);
+        }
+        assert!(
+            !history.as_slices().1.is_empty(),
+            "тест бессмыслен, если кольцо не свёрнуто: проверить раскладку VecDeque"
+        );
+        let expected: Vec<u8> = history.iter().copied().collect();
+
+        let mut output = StreamingOutput::new(VecDeque::new(), false, 64, 64, 32);
+        output.history = history;
+        let mut got = Vec::new();
+        let mut sink = collecting_sink(&mut got);
+        output
+            .copy_match(32, 32, &mut sink)
+            .expect("совпадение целиком внутри окна");
+        output.finish(&mut sink).expect("сброс остатка");
+        drop(sink);
+
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn a_match_longer_than_its_distance_repeats_the_pattern() {
+        let mut output = StreamingOutput::new(vec![1, 2, 3].into(), false, 32, 64, 32);
+        let mut got = Vec::new();
+        let mut sink = collecting_sink(&mut got);
+        output.copy_match(3, 8, &mut sink).expect("наложение");
+        output.finish(&mut sink).expect("сброс остатка");
+        drop(sink);
+
+        assert_eq!(got, vec![1, 2, 3, 1, 2, 3, 1, 2]);
     }
 }

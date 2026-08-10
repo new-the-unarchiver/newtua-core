@@ -268,7 +268,7 @@ impl Archive {
             &mut file,
             archive_len,
             signature.offset,
-            ArchiveSource::File(path),
+            ArchiveSource::file(path),
             password,
         )
     }
