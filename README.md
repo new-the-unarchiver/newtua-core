@@ -136,7 +136,7 @@ a `.dmg` in ADC — that is parity and closing it would be new work, not a repai
 | `Xz` | `.xz` (single compressed file, no container) |
 | `Raw` | any other single decompressed stream (e.g. `.zst`, `.lz4`, `.Z`, `.br`, `.sz`, `.lzma`, `.lz`) |
 | `SevenZ` | `.7z`, incl. AES-256 encryption |
-| `Rar` | `.rar`, single- and multi-volume |
+| `Rar` | `.rar`, single- and multi-volume. A RAR 5 link — symbolic, hard, or a reference to an identical file — comes out as a symbolic link, as it does under `unar`; a target leading outside the extraction folder is refused |
 | `Cab` | `.cab` (MSZIP, LZX and Quantum) |
 | `Ar` | `.ar`/`.a` |
 | `Deb` | `.deb` (Debian package, ar + tar members) |

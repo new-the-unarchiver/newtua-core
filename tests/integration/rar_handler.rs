@@ -453,3 +453,129 @@ fn rar15_matches_unar_byte_for_byte() {
         );
     }
 }
+
+// links.rar: ссылки RAR 5 всех видов, какие умеет собрать сам `rar`.
+// Собрано так:
+//   printf 'real payload\n' > real.txt
+//   mkdir sub && printf 'in sub\n' > sub/inner.txt
+//   ln -s real.txt link.txt      # обычная ссылка
+//   ln -s sub dirlink            # ссылка на каталог
+//   ln -s /etc/hosts abs.txt     # ссылка наружу дерева распаковки
+//   ln real.txt hard.txt         # жёсткая ссылка
+//   cp real.txt copy.txt         # ссылка на одинаковый файл (`-oi`)
+//   rar a -ma5 -ol -oh -oi1:1 -r links.rar \
+//     real.txt sub link.txt dirlink abs.txt hard.txt copy.txt
+// (RAR 7.22.) `unrar lt` называет их: Unix symbolic link, Hard link,
+// File reference.
+const LINKS: &[u8] = include_bytes!("../fixtures/links.rar");
+
+/// Перенаправление RAR 5 любого вида доходит до `EntryKind::Symlink` с целью.
+///
+/// Эталон — `unar`: на этом самом архиве он кладёт символическую ссылку и на
+/// месте жёсткой ссылки, и на месте ссылки на одинаковый файл. Своего вида
+/// записи под них у нас нет, а пустой файл вместо жёсткой ссылки — молчаливая
+/// потеря содержимого.
+#[test]
+fn rar5_redirections_of_every_kind_become_symlinks() {
+    let (_tmp, mut ar) = open_fixture(LINKS, &OpenOptions::default());
+    let entries = ar.entries().unwrap().to_vec();
+
+    let kinds: Vec<(String, Option<String>)> = entries
+        .iter()
+        .map(|e| {
+            let target = match &e.kind {
+                newtua_core::EntryKind::Symlink { target } => {
+                    Some(target.to_string_lossy().into_owned())
+                }
+                _ => None,
+            };
+            (e.path.to_string_lossy().into_owned(), target)
+        })
+        .collect();
+
+    let expected: Vec<(String, Option<String>)> = [
+        ("real.txt", None),
+        ("sub/inner.txt", None),
+        ("link.txt", Some("real.txt")),
+        ("dirlink", Some("sub")),
+        ("abs.txt", Some("/etc/hosts")),
+        ("hard.txt", Some("real.txt")),
+        ("copy.txt", Some("real.txt")),
+        ("sub", None),
+    ]
+    .iter()
+    .map(|(n, t)| ((*n).to_owned(), t.map(str::to_owned)))
+    .collect();
+    assert_eq!(kinds, expected);
+
+    // Каталог остаётся каталогом, а ссылка на каталог — ссылкой: у неё стоят
+    // оба признака, и порядок проверки решает, что вырастет на её месте.
+    assert!(matches!(entries[7].kind, newtua_core::EntryKind::Dir));
+
+    // Тела у ссылки нет: распаковщика на неё не зовут вовсе.
+    let mut out = Vec::new();
+    ar.read_entry(2, &mut out).unwrap();
+    assert!(out.is_empty(), "у ссылки нет тела: {out:?}");
+}
+
+/// Распаковка ссылок: цели совпадают с тем, что даёт `unar`, а ссылка наружу
+/// дерева отбивается.
+///
+/// `unar` абсолютную ссылку создаёт как есть — мы отказываем, как и сам
+/// `unrar` («Absolute path link … skipped»): цель за пределами каталога
+/// распаковки правил проекта не проходит.
+#[cfg(unix)]
+#[test]
+fn rar5_symlinks_extract_like_unar_and_refuse_escaping_target() {
+    let (_tmp, mut ar) = open_fixture(LINKS, &OpenOptions::default());
+    let dest = tempfile::tempdir().unwrap();
+    let report = newtua_core::extract_all(
+        &mut *ar,
+        &mut newtua_core::ExtractOptions {
+            dest: dest.path().to_path_buf(),
+            wrapper_name: Some("links".into()),
+            strict: false,
+            preserve: true,
+            selection: None,
+            progress: None,
+            keep_macos_metadata: false,
+        },
+    )
+    .unwrap();
+
+    let root = dest.path().join("links");
+    for (name, target) in [
+        ("link.txt", "real.txt"),
+        ("dirlink", "sub"),
+        ("hard.txt", "real.txt"),
+        ("copy.txt", "real.txt"),
+    ] {
+        let link = root.join(name);
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new(target),
+            "цель ссылки {name} разошлась с тем, что кладёт `unar`"
+        );
+    }
+    // Ссылка на каталог ведёт в каталог, а не в пустоту.
+    assert_eq!(
+        std::fs::read(root.join("dirlink/inner.txt")).unwrap(),
+        b"in sub\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("real.txt")).unwrap(),
+        b"real payload\n"
+    );
+
+    assert!(
+        root.join("abs.txt").symlink_metadata().is_err(),
+        "ссылка на /etc/hosts не должна появиться на диске"
+    );
+    assert_eq!(
+        report.failed.len(),
+        1,
+        "отказ ровно один — абсолютная цель: {:?}",
+        report.failed
+    );
+    assert_eq!(report.failed[0].0, Path::new("abs.txt"));
+}

@@ -104,6 +104,13 @@ handed the files to you with today's date and default permissions.
   with two-second resolution, so a file packed on an odd second showed up a
   second early; the exact instant was in the archive all along and unreachable
   through the old binding.
+- **A link inside a RAR 5 archive now comes out as a link.** A symbolic link, a
+  hard link and a reference to an identical file (`rar -oi`) all used to land as
+  an empty file bearing the right name: the target sat in a header field the old
+  binding never handed out. All three are extracted as symbolic links now, which
+  is what `unar` makes of them too. One difference from `unar`, and it is
+  deliberate: a link whose target leads outside the extraction folder is refused
+  instead of created, exactly as `unrar` itself refuses it.
 - **Extracting a few files from a large RAR no longer reads the whole archive**
   unless it has to. A solid archive still does — there the entries share one
   compression window and there is no way around it — but an ordinary archive

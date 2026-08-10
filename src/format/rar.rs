@@ -8,7 +8,7 @@ use crate::archive::{
     ArchiveReader, Confidence, Entry, EntryKind, EntrySink, FormatHandler, FormatId, OneEntry,
     OpenOptions, SinkStep, SinkWriter, Source,
 };
-use crate::encoding::decode_names;
+use crate::encoding::{decode_names, detect_encoding};
 use crate::error::{Error, Result};
 use crate::vendor::rars;
 
@@ -180,10 +180,12 @@ struct Place {
 /// Собрать оглавление набора и запомнить, где чья запись лежит.
 fn list(archives: &[rars::Archive], encoding: Option<&str>) -> (Vec<Entry>, Vec<Place>) {
     let mut raw_names: Vec<Vec<u8>> = Vec::new();
+    let mut raw_links: Vec<Vec<u8>> = Vec::new();
     let mut places: Vec<Place> = Vec::new();
     let mut metas: Vec<rars::ArchiveMemberMeta> = Vec::new();
 
     for (volume, archive) in archives.iter().enumerate() {
+        let links = link_targets(archive);
         for (ordinal, member) in archive.members().enumerate() {
             // Продолжение файла из прошлого тома — не отдельная запись
             // (тикет 19). Считать его записью значит сдвинуть все номера после
@@ -192,12 +194,25 @@ fn list(archives: &[rars::Archive], encoding: Option<&str>) -> (Vec<Entry>, Vec<
                 continue;
             }
             raw_names.push(member.meta.name.clone());
+            raw_links.push(links.get(ordinal).copied().unwrap_or(&[]).to_vec());
             places.push(Place { volume, ordinal });
             metas.push(member.meta);
         }
     }
 
-    let names = decode_names(&raw_names, encoding);
+    // Кодировку выбирают **имена всего архива**, и цель ссылки читается ею же:
+    // цель — такой же путь, и правило «одна кодировка на архив» иначе
+    // нарушится, а короткая цель вроде `..\файл` в одиночку опознаётся хуже
+    // целого набора имён. Ярлык берётся один раз: определение идёт по всем
+    // именам сразу и стоит прохода по ним.
+    let label = detect_encoding(&raw_names, encoding);
+    let names = decode_names(&raw_names, Some(&label));
+    let link_names = if raw_links.iter().any(|t| !t.is_empty()) {
+        decode_names(&raw_links, Some(&label))
+    } else {
+        Vec::new()
+    };
+
     let entries = raw_names
         .into_iter()
         .zip(&metas)
@@ -205,10 +220,15 @@ fn list(archives: &[rars::Archive], encoding: Option<&str>) -> (Vec<Entry>, Vec<
         .map(|(i, (raw, meta))| Entry {
             path_raw: raw,
             path: PathBuf::from(&names[i]),
-            kind: if meta.is_directory {
-                EntryKind::Dir
-            } else {
-                EntryKind::File
+            // Ссылка проверяется первой: у ссылки на каталог стоит и признак
+            // каталога, а создать надо ссылку, иначе на её месте вырастет
+            // пустая папка.
+            kind: match link_names.get(i).filter(|t| !t.is_empty()) {
+                Some(target) => EntryKind::Symlink {
+                    target: PathBuf::from(target),
+                },
+                None if meta.is_directory => EntryKind::Dir,
+                None => EntryKind::File,
             },
             size: meta.unpacked_size,
             mode: unix_mode(meta.file_attr),
@@ -219,6 +239,36 @@ fn list(archives: &[rars::Archive], encoding: Option<&str>) -> (Vec<Entry>, Vec<
         .collect();
 
     (entries, places)
+}
+
+/// Цели перенаправления RAR 5 по порядку файловых заголовков тома; пусто там,
+/// где запись — обычный файл.
+///
+/// Порядок здесь тот же, которым живёт `Place::ordinal`, — номер среди
+/// файловых заголовков тома, — поэтому цель и берётся по этому номеру.
+///
+/// До RAR 5 ссылка хранилась телом записи, а не полем заголовка, поэтому у
+/// старших поколений список пуст и трогать их поведение нечем.
+///
+/// **Перенаправление любого вида становится ссылкой.** RAR 5 различает пять:
+/// символическая ссылка Unix и Windows, точка соединения Windows, жёсткая
+/// ссылка и ссылка на одинаковый файл (`rar -oi`). Эталон здесь `unar`, и на
+/// собранных архивах он проверен: жёсткую ссылку и ссылку на одинаковый файл
+/// он тоже кладёт символической (`unrar` вместо этого делает настоящую
+/// жёсткую ссылку и настоящую копию). Своего вида записи под них у нас нет, а
+/// пустой файл на месте жёсткой ссылки — молчаливая потеря содержимого.
+fn link_targets(archive: &rars::Archive) -> Vec<&[u8]> {
+    match archive {
+        rars::Archive::Rar50Plus(a) => a
+            .files()
+            .map(|f| {
+                f.redirection
+                    .as_ref()
+                    .map_or(&[][..], |r| r.target_name.as_slice())
+            })
+            .collect(),
+        rars::Archive::Rar13(_) | rars::Archive::Rar15To40(_) => Vec::new(),
+    }
 }
 
 /// Права POSIX, если архив собран на Unix.
@@ -365,8 +415,8 @@ impl Volumes {
             // Ссылка RAR 5 живёт отдельным полем заголовка, а не телом записи,
             // и обычный обход её молча пропускает. Пропуск сдвинул бы все
             // номера после неё, поэтому берётся обход, который о ссылках
-            // сообщает. Тело у такой записи пустое — ровно то, что отдавала и
-            // libunrar; разбирать поле ссылки будет тикет 15.
+            // сообщает. Цель отсюда не берётся: она уже прочитана в оглавление
+            // (`link_targets`), а здесь у ссылки только пустое тело.
             Self::Rar50Plus(v) => rars::rar50::extract_volumes_to_with_redirections(
                 v,
                 opts,
@@ -466,7 +516,13 @@ impl RarReader {
                 SinkStep::Skip => continue,
                 SinkStep::Body => {}
             }
-            let outcome = if matches!(self.entries[idx].kind, EntryKind::Dir) {
+            // У каталога и у ссылки тела нет: распаковщику такую запись не
+            // отдают вовсе. Цель ссылки лежит в заголовке и уже прочитана в
+            // оглавление.
+            let outcome = if matches!(
+                self.entries[idx].kind,
+                EntryKind::Dir | EntryKind::Symlink { .. }
+            ) {
                 Ok(())
             } else {
                 let mut writer = SinkWriter::new(sink);
