@@ -115,6 +115,15 @@ handed the files to you with today's date and default permissions.
   unless it has to. A solid archive still does — there the entries share one
   compression window and there is no way around it — but an ordinary archive
   now decompresses only what was asked for.
+- **A large file inside a RAR no longer needs as much memory as it is big.** A
+  4 GB film used to mean 4 GB of RAM held until extraction finished, which on a
+  smaller machine meant swapping or the system killing the process outright. The
+  body now reaches disk as it is decompressed: on a 700 MB file inside a solid
+  archive the peak went from 863 MB to 114 MB, and that 114 MB is the archive's
+  dictionary, so a file of any size costs the same. A member under 512 MiB is
+  still decoded in one piece, but it too got lighter — a 300 MB one went from
+  751 MB to 414 MB, and a 196 MB executable, where RAR's filters actually run,
+  from 502 MB to 272 MB.
 
 ### Other
 

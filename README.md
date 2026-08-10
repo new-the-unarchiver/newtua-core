@@ -224,7 +224,7 @@ None of them requires a system library. That is largely the point of
 ## Tests
 
 The package published to crates.io carries the library only — no `tests/`
-directory. The suite is driven by real archives: 11 MB of binary fixtures that
+directory. The suite is driven by real archives: 13 MB of binary fixtures that
 the test files embed at compile time with `include_bytes!`. Shipping them would
 blow past the 10 MiB package limit, and shipping the tests without them would
 hand you a suite that cannot compile at all.
