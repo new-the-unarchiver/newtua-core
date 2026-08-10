@@ -229,7 +229,7 @@ the test files embed at compile time with `include_bytes!`. Shipping them would
 blow past the 10 MiB package limit, and shipping the tests without them would
 hand you a suite that cannot compile at all.
 
-Nothing is hidden. All 750 tests and every fixture live in the
+Nothing is hidden. All tests and every fixture live in the
 [repository on GitHub](https://github.com/new-the-unarchiver/newtua-core) and
 run in CI on Linux, macOS and Windows. To run them yourself:
 
@@ -238,6 +238,15 @@ git clone https://github.com/new-the-unarchiver/newtua-core
 cd newtua-core
 cargo test
 ```
+
+**One fixture we cannot state the licence of.** `tests/fixtures/rar15.rar` is
+`RUN.RAR` from the [Sembiance file-format samples](https://sembiance.com/fileFormatSamples/) —
+seven DOS batch files from a 1995 bulletin board, 3 KB, kept because it is the
+only RAR 1.5 archive we have and no packer in existence today produces that
+format. Its collection declares no licence. It is not part of the published
+package (`exclude = ["tests/**"]`), and it will be replaced when we build a
+RAR 1.5 archive of our own from our own data. If you are its author and would
+rather it were not here, open an issue and it goes.
 
 ## License
 

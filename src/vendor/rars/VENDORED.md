@@ -204,7 +204,11 @@ What each decoder is guarded by now, so this is not taken on trust:
 | RAR 1.5 (`rar13`, `Unpack15`) | **had nothing left**, so a real archive was added: `tests/fixtures/rar15.rar` (`RUN.RAR` from sembiance/file-format-samples, method 51, version 15), extracted and compared file by file against what `unar` gets from it |
 
 The RAR 1.5 case is the honest ledger of this cut: the test that went was
-self-judged, the one that replaced it is judged by `unar`.
+self-judged, the one that replaced it is judged by `unar`. One caveat travels
+with it — the sample collection it came from declares no licence, and this
+repository is public. Kept deliberately (there is no other RAR 1.5 archive to
+be had, and none can be created today), noted in `README.md`, and to be
+replaced by an archive we build ourselves under DOSBox.
 
 ## Licence
 
