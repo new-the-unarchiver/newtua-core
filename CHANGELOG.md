@@ -162,6 +162,14 @@ handed the files to you with today's date and default permissions.
   passwords are refused exactly as before, and the extracted bytes, permissions
   and timestamps still match `unar` on 8001 files across three encrypted
   archives.
+- **The same waste is gone from older RAR archives (RAR 3 and 4), where it cost
+  even more.** Turning the password into a key there takes 262 144 rounds of
+  hashing, and it was being done once per file although the archives WinRAR
+  writes use one salt throughout. On the samples we have — two and three
+  encrypted files — extraction went from being level with libunrar to **about
+  twice as fast** (×1.07 → ×0.44 and ×0.73 → ×0.36). An archive that really does
+  vary the salt still gets a key per salt. Verified against `unar` byte for byte
+  on eight encrypted RAR 3/4 archives.
 
 ### Other
 

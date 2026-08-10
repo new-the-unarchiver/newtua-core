@@ -1,4 +1,5 @@
 use crate::vendor::rars::crc32::crc32;
+use crate::vendor::rars::crypto::cache::DerivedSecretCache;
 use crate::vendor::rars::crypto::rar50::{Rar50Cipher, Rar50Keys};
 use crate::vendor::rars::detect::{ArchiveSignature, RAR50_SIGNATURE};
 use crate::vendor::rars::error::{Error, Result};
@@ -9,8 +10,7 @@ use std::fs::File;
 use std::io::Read;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
-use zeroize::Zeroizing;
+use std::sync::Arc;
 
 mod blake2sp;
 mod extract;
@@ -72,39 +72,13 @@ pub struct Archive {
     key_cache: Rar50KeyCache,
 }
 
-/// NEWTUA (тикет 33): один выведенный ключ, запомненный на весь архив.
+/// NEWTUA (тикет 33): выведенный ключ RAR 5, запомненный на весь архив.
 ///
-/// PBKDF2 у RAR 5 стоит `2^kdf_count` раундов HMAC-SHA256 — при обычном
-/// `kdf_count = 15` это 32 768 раундов и около 6 мс. Соль и число итераций
-/// лежат в заголовке **каждой** записи, но в одном архиве совпадают, поэтому
-/// без кэша сплошной архив из 4000 файлов выводил один и тот же ключ 4000 раз
-/// и шёл 17 с против 0,16 с у libunrar.
-///
-/// Ключ кэша — тройка «пароль + соль + число итераций», и промах по любой её
-/// части выводит ключ заново: архив с разными солями законен, и отдать ему
-/// чужой ключ значит расшифровать мусор. Пароль входит в ключ кэша потому, что
-/// вызывающий вправе перебирать пароли на одном и том же архиве.
-///
-/// `Mutex` внутри `Arc`, а не `RefCell`: `Archive` доезжает до вызывающего
-/// внутри `Box<dyn ArchiveReader>`, и `Send`/`Sync` у него отнимать нельзя.
-/// Списано с `EncryptedHeaderCipherCache` для RAR 3 (`rar15_40.rs`).
-#[derive(Default, Clone)]
+/// Ключ кэша — «пароль + соль + число итераций»; зачем кэш вообще и почему
+/// промах обязателен, написано у самого типа в `crypto/cache.rs`.
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Rar50KeyCache {
-    entry: Arc<Mutex<Option<CachedKey>>>,
-}
-
-struct CachedKey {
-    password: Zeroizing<Vec<u8>>,
-    salt: [u8; 16],
-    kdf_count: u8,
-    keys: Rar50Keys,
-}
-
-impl std::fmt::Debug for Rar50KeyCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Ни ключа, ни пароля в отладочной печати: `Rar50Keys` поступает так же.
-        f.debug_struct("Rar50KeyCache").finish_non_exhaustive()
-    }
+    inner: DerivedSecretCache<([u8; 16], u8), Rar50Keys>,
 }
 
 impl Rar50KeyCache {
@@ -112,22 +86,9 @@ impl Rar50KeyCache {
     /// делает вызывающий: она стоит одного SHA-256 и обязана идти и на
     /// попадании в кэш тоже, иначе путь «неверный пароль» изменился бы.
     fn derive(&self, password: &[u8], salt: [u8; 16], kdf_count: u8) -> Result<Rar50Keys> {
-        let mut slot = self.entry.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(cached) = slot.as_ref()
-            && cached.salt == salt
-            && cached.kdf_count == kdf_count
-            && cached.password.as_slice() == password
-        {
-            return Ok(cached.keys.clone());
-        }
-        let keys = Rar50Keys::derive(password, salt, kdf_count).map_err(map_rar50_crypto_error)?;
-        *slot = Some(CachedKey {
-            password: Zeroizing::new(password.to_vec()),
-            salt,
-            kdf_count,
-            keys: keys.clone(),
-        });
-        Ok(keys)
+        self.inner.get_or_derive(password, (salt, kdf_count), || {
+            Rar50Keys::derive(password, salt, kdf_count).map_err(map_rar50_crypto_error)
+        })
     }
 }
 

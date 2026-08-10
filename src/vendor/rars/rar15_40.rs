@@ -2,6 +2,7 @@ use crate::vendor::rars::codec::rar13::Unpack15;
 use crate::vendor::rars::codec::rar20::Unpack20;
 use crate::vendor::rars::codec::rar29::Unpack29;
 use crate::vendor::rars::crc32::{Crc32, crc32};
+use crate::vendor::rars::crypto::cache::DerivedSecretCache;
 use crate::vendor::rars::crypto::rar15::Rar15Cipher;
 use crate::vendor::rars::crypto::rar20::Rar20Cipher;
 use crate::vendor::rars::crypto::rar30::{Error as Rar30Error, Rar30Cipher};
@@ -62,6 +63,10 @@ pub struct Archive {
     pub main: MainHeader,
     pub blocks: Vec<Block>,
     source: ArchiveSource,
+    /// NEWTUA: кэш выведенного шифра, тикет 35. Живёт на архиве, а не на
+    /// записи: соль в архиве обычно одна на всех, а вывод ключа стоит
+    /// 262 144 раундов SHA-1.
+    key_cache: Rar30CipherCache,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +235,7 @@ impl FileHeader {
             self.unp_ver,
             password,
             self.salt,
+            &archive.key_cache,
         )?))
     }
 
@@ -556,18 +562,13 @@ impl Archive {
         let main = parse_main_header(&main_header, &relative_block(&main_block))?;
         let mut pos = main_block.offset + main_block.head_size as usize;
         let mut blocks = Vec::new();
-        let mut encrypted_header_ciphers = EncryptedHeaderCipherCache::default();
+        let key_cache = Rar30CipherCache::default();
 
         while (sfx_offset + pos) as u64 + 7 <= file_len {
             let (block, header, total) = if main.has_encrypted_headers() {
                 let password = password.ok_or(Error::NeedPassword)?;
                 let encrypted = read_encrypted_header_at(
-                    &mut file,
-                    file_len,
-                    sfx_offset,
-                    pos,
-                    password,
-                    &mut encrypted_header_ciphers,
+                    &mut file, file_len, sfx_offset, pos, password, &key_cache,
                 )?;
                 (encrypted.block, encrypted.header, encrypted.total_size)
             } else {
@@ -636,6 +637,7 @@ impl Archive {
             main,
             blocks,
             source,
+            key_cache,
         })
     }
 
@@ -758,24 +760,27 @@ struct EncryptedHeader {
     total_size: usize,
 }
 
-#[derive(Default)]
-struct EncryptedHeaderCipherCache {
-    salt: Option<[u8; 8]>,
-    cipher: Option<Rar30Cipher>,
+/// NEWTUA (тикет 35): выведенный шифр RAR 3, запомненный на весь архив.
+///
+/// Вывод ключа здесь — 262 144 раунда SHA-1 (`HASH_ROUNDS` в `crypto/rar30.rs`),
+/// то есть дороже, чем у RAR 5. Раньше кэш был только у заголовков; тела
+/// записей выводили ключ каждое своё, хотя WinRAR пишет одну соль на архив
+/// (измерено на трёх образцах RAR 4 — тикет 35 §2).
+///
+/// Ячейка хранит **нетронутый** шифр, а наружу отдаёт копию: `Rar30Cipher`
+/// сцепляет блоки и по ходу расшифровки меняет свой вектор, так что общий на
+/// всех он был бы порчей. Копия — это копия развёрнутого ключа AES, около
+/// двухсот байт.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Rar30CipherCache {
+    inner: DerivedSecretCache<Option<[u8; 8]>, Rar30Cipher>,
 }
 
-impl EncryptedHeaderCipherCache {
-    fn cipher(&mut self, password: &[u8], salt: [u8; 8]) -> Result<Rar30Cipher> {
-        if self.salt != Some(salt) {
-            self.salt = Some(salt);
-            self.cipher =
-                Some(Rar30Cipher::new(password, Some(salt)).map_err(map_rar30_crypto_error)?);
-        }
-        Ok(self
-            .cipher
-            .as_ref()
-            .expect("RAR 3 encrypted header cipher cache initialized")
-            .clone())
+impl Rar30CipherCache {
+    fn cipher(&self, password: &[u8], salt: Option<[u8; 8]>) -> Result<Rar30Cipher> {
+        self.inner.get_or_derive(password, salt, || {
+            Rar30Cipher::new(password, salt).map_err(map_rar30_crypto_error)
+        })
     }
 }
 
@@ -789,7 +794,7 @@ fn read_encrypted_header_at(
     archive_offset: usize,
     offset: usize,
     password: &[u8],
-    cipher_cache: &mut EncryptedHeaderCipherCache,
+    cipher_cache: &Rar30CipherCache,
 ) -> Result<EncryptedHeader> {
     let absolute = archive_offset
         .checked_add(offset)
@@ -799,7 +804,7 @@ fn read_encrypted_header_at(
     }
     let first = read_exact_at(file, absolute, 24)?;
     let salt = read_header_salt(&first, 0)?;
-    let mut cipher = cipher_cache.cipher(password, salt)?;
+    let mut cipher = cipher_cache.cipher(password, Some(salt))?;
     let mut first_block = [0u8; 16];
     first_block.copy_from_slice(&first[8..24]);
     cipher

@@ -451,11 +451,19 @@ impl PendingSplitRefs {
         let Some(password) = password else {
             return Err(Error::NeedPassword);
         };
+        // Кэш берётся у первого тома набора: у каждого тома он свой, и вывод
+        // ключа всё равно случится один раз на том, а не на запись.
+        let cache_owner = self
+            .fragments
+            .first()
+            .and_then(|&(volume_index, _)| volumes.get(volume_index))
+            .ok_or(Error::InvalidHeader("RAR 1.5 split volume is missing"))?;
         Ok(Box::new(DecryptingReader::new(
             reader,
             self.unp_ver,
             password,
             self.salt,
+            &cache_owner.key_cache,
         )?))
     }
 }
@@ -467,7 +475,15 @@ enum SplitCipher {
 }
 
 impl SplitCipher {
-    fn new(unp_ver: u8, password: &[u8], salt: Option<[u8; 8]>) -> Result<Self> {
+    // NEWTUA (тикет 35): кэш только у RAR 3 — там вывод ключа стоит 262 144
+    // раунда SHA-1. У RAR 1.5 и 2.0 шифр строится из пароля за микросекунды
+    // (таблица подстановки, 256 проходов по паролю), кэшировать нечего.
+    fn new(
+        unp_ver: u8,
+        password: &[u8],
+        salt: Option<[u8; 8]>,
+        key_cache: &Rar30CipherCache,
+    ) -> Result<Self> {
         if unp_ver == 15 {
             return Ok(Self::Rar15(Rar15Cipher::new(password)));
         }
@@ -475,9 +491,7 @@ impl SplitCipher {
             return Ok(Self::Rar20(Box::new(Rar20Cipher::new(password))));
         }
         if unp_ver >= 29 {
-            return Ok(Self::Rar30(Box::new(
-                Rar30Cipher::new(password, salt).map_err(super::map_rar30_crypto_error)?,
-            )));
+            return Ok(Self::Rar30(Box::new(key_cache.cipher(password, salt)?)));
         }
         Err(Error::UnsupportedEncryption {
             family: "RAR 1.5-4.x split volume",
@@ -502,8 +516,9 @@ impl<R: Read> DecryptingReader<R> {
         unp_ver: u8,
         password: &[u8],
         salt: Option<[u8; 8]>,
+        key_cache: &Rar30CipherCache,
     ) -> Result<Self> {
-        let cipher = SplitCipher::new(unp_ver, password, salt)?;
+        let cipher = SplitCipher::new(unp_ver, password, salt, key_cache)?;
         let read_buffer = matches!(cipher, SplitCipher::Rar15(_)).then(|| vec![0; 64 * 1024]);
         Ok(Self {
             inner,
@@ -654,7 +669,14 @@ mod tests {
         let plain = b"RAR 1.5 encrypted payload read in pieces";
         let mut encrypted = plain.to_vec();
         Rar15Cipher::new(b"pw").crypt_in_place(&mut encrypted);
-        let mut reader = DecryptingReader::new(Cursor::new(encrypted), 15, b"pw", None).unwrap();
+        let mut reader = DecryptingReader::new(
+            Cursor::new(encrypted),
+            15,
+            b"pw",
+            None,
+            &Rar30CipherCache::default(),
+        )
+        .unwrap();
         let mut out = Vec::new();
         let mut buf = [0u8; 3];
 
@@ -754,6 +776,7 @@ mod tests {
             },
             blocks: Vec::new(),
             source: ArchiveSource::Memory(Arc::from(Vec::new().into_boxed_slice())),
+            key_cache: Rar30CipherCache::default(),
         }
     }
 
@@ -776,6 +799,7 @@ mod tests {
             },
             blocks,
             source: ArchiveSource::Memory(Arc::from(source.into_boxed_slice())),
+            key_cache: Rar30CipherCache::default(),
         }
     }
 
@@ -911,7 +935,7 @@ mod tests {
         for ver in [14u8, 16, 19, 25, 27, 28] {
             assert!(
                 matches!(
-                    SplitCipher::new(ver, b"pw", None),
+                    SplitCipher::new(ver, b"pw", None, &Rar30CipherCache::default()),
                     Err(Error::UnsupportedEncryption { unpack_version, .. }) if unpack_version == ver
                 ),
                 "unp_ver {ver} should be rejected"
@@ -921,7 +945,13 @@ mod tests {
 
     #[test]
     fn decrypting_reader_new_rejects_unsupported_unpack_version() {
-        let result = DecryptingReader::new(Cursor::new(Vec::<u8>::new()), 25, b"pw", None);
+        let result = DecryptingReader::new(
+            Cursor::new(Vec::<u8>::new()),
+            25,
+            b"pw",
+            None,
+            &Rar30CipherCache::default(),
+        );
         assert!(matches!(
             result,
             Err(Error::UnsupportedEncryption {

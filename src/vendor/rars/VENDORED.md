@@ -384,6 +384,40 @@ change the wrong-password path. That path was compared before and after on four
 cases (wrong password and no password, on both archives): identical message,
 identical exit code.
 
+### RAR 3 had the same defect, and its KDF is dearer (ticket 35)
+
+RAR 3 turns a password into a key with **262 144 rounds of SHA-1**
+(`HASH_ROUNDS`, `crypto/rar30.rs`) — more than RAR 5 pays. Upstream cached that
+only for **headers** (`EncryptedHeaderCipherCache`); every member's **body**
+derived its own. A probe on three RAR 4 samples showed what packers actually
+write: WinRAR 4.20 and SharpCompress use **one salt for the whole archive**
+(so every derivation after the first was the same work again), while libarchive
+writes a different salt per member (so a cache there must miss, and does).
+
+Both caches are now one `Rar30CipherCache` on `Archive`, and both caches in the
+tree — RAR 3's and RAR 5's — are the same type, `DerivedSecretCache` in
+`crypto/cache.rs`, which is **entirely ours**. One home for the rule that
+matters: a miss on any part of `(password, params)` derives again. The cell holds
+a *pristine* cipher and hands out clones, because `Rar30Cipher` chains blocks and
+mutates its IV as it decrypts — a shared one would be corruption, and a clone is
+~200 bytes of AES key schedule.
+
+Measured, paired, same window (small archives, so the ratio is the number that
+means anything):
+
+| sample | members | derivations per open | ours, before → after | vs libunrar |
+|---|---|---|---|---|
+| SharpCompress, one salt | 3 encrypted | 3 → **1** | 0.0164 → **0.0044 s** | ×1.07 → **×0.44** |
+| WinRAR 4.20, one salt | 2 encrypted | 2 → **1** | 0.0131 → **0.0047 s** | ×0.73 → **×0.36** |
+| libarchive, two salts | 2 | 2 → 2 (correct miss) | — | — |
+
+Checked against `unar` byte for byte on **eight** encrypted RAR 3/4 archives,
+including the `-hp` ones and a compact-Unicode name; refusals on a wrong and on a
+missing password were captured before and after the change and matched line for
+line. No archive of thousands of encrypted RAR 4 members exists to measure — `rar`
+7.22 cannot write RAR 4 at all — so the proof here is the derivation count, not
+seconds.
+
 ## Tests
 
 **Every unit test inside `src/` came along** — codecs, crypto, headers, CRC,
