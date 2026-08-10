@@ -194,11 +194,15 @@ impl FileHeader {
         decoder: &mut Unpack50Decoder,
         password: Option<&[u8]>,
     ) -> Result<DecodedData> {
-        let (packed, keys) = self.packed_data_with_password(archive, password)?;
-        let data = self.decode_packed_with_decoder(&packed, decoder)?;
-        Ok(DecodedData { data, keys })
+        self.decoded_data_with_mode(archive, decoder, password, DecodeMode::Lz)
     }
 
+    /// NEWTUA: упакованное тело больше не читается в память целиком.
+    ///
+    /// Апстрим звал `read_to_end` и клал рядом с распакованной записью ещё и
+    /// упакованную — на файле в 300 МБ это лишняя сотня мегабайт пика
+    /// (тикет 29). Декодер и так умеет читать поток, а «хранимая» запись сюда
+    /// не доходит: у неё свой потоковый путь (`write_stored_to`).
     fn decoded_data_with_mode(
         &self,
         archive: &Archive,
@@ -206,19 +210,54 @@ impl FileHeader {
         password: Option<&[u8]>,
         mode: DecodeMode,
     ) -> Result<DecodedData> {
-        let (packed, keys) = self.packed_data_with_password(archive, password)?;
-        let data = self.decode_packed_with_decoder_mode(&packed, decoder, mode)?;
+        if self.is_stored() {
+            let (packed, keys) = self.packed_data_with_password(archive, password)?;
+            let data = self.decode_packed_with_decoder_mode(&packed, decoder, mode)?;
+            return Ok(DecodedData { data, keys });
+        }
+        let (mut packed, keys) = self.packed_reader_with_password(archive, password)?;
+        let data = self.decode_packed_reader_with_decoder_mode(&mut packed, decoder, mode)?;
         Ok(DecodedData { data, keys })
     }
 
-    fn decode_packed_with_decoder(
+    /// Распаковать сжатую запись, читая упакованное тело потоком.
+    ///
+    /// NEWTUA: близнец `decode_packed_with_decoder_mode` без ветки «хранимой»
+    /// записи — та требует всего упакованного тела сразу и сюда не приходит.
+    fn decode_packed_reader_with_decoder_mode(
         &self,
-        packed: &[u8],
+        packed: &mut impl Read,
         decoder: &mut Unpack50Decoder,
+        mode: DecodeMode,
     ) -> Result<Vec<u8>> {
-        self.decode_packed_with_decoder_mode(packed, decoder, DecodeMode::Lz)
+        if self.unpacked_size == 0 && self.packed_size() == 0 {
+            return Ok(Vec::new());
+        }
+
+        let info = self.decoded_compression_info()?;
+        let dictionary_size = usize::try_from(info.dictionary_size).map_err(|_| {
+            Error::InvalidHeader("RAR 5 dictionary size overflows host address size")
+        })?;
+        let output_size = checked_unpacked_size(self.unpacked_size)?;
+        match decoder.decode_member_from_reader_with_dictionary(
+            packed,
+            info.algorithm_version,
+            output_size,
+            dictionary_size,
+            info.solid,
+            mode,
+        ) {
+            Ok(data) => Ok(data),
+            Err(error) => self.map_truncated_unverified_payload(error),
+        }
     }
 
+    /// Распаковать «хранимую» запись: у неё упакованное тело и есть выход,
+    /// и проверки длины требуют его целиком.
+    ///
+    /// NEWTUA: сжатая запись сюда больше не приходит — она читается потоком
+    /// (`decode_packed_reader_with_decoder_mode`). Ветки LZ ниже остались
+    /// достижимы через ту же дверь только у апстрима.
     fn decode_packed_with_decoder_mode(
         &self,
         packed: &[u8],
@@ -541,20 +580,21 @@ fn rar50_buffered_decode_limit(options: crate::vendor::rars::ArchiveReadOptions<
         .unwrap_or(BUFFERED_DECODE_LIMIT)
 }
 
-pub fn extract_volumes_to_with_redirections<F, R>(
+/// NEWTUA: писарь получил время жизни (`'w`) — см. `rar13::extract_volumes_to`.
+pub fn extract_volumes_to_with_redirections<'w, F, R>(
     volumes: &[Archive],
     options: crate::vendor::rars::ArchiveReadOptions<'_>,
     mut open: F,
     mut redirect: R,
 ) -> Result<()>
 where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + 'w>>,
     R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
 {
     extract_volumes_to_impl(volumes, options, &mut open, &mut redirect, true)
 }
 
-fn extract_volumes_to_impl<F, R>(
+fn extract_volumes_to_impl<'w, F, R>(
     volumes: &[Archive],
     options: crate::vendor::rars::ArchiveReadOptions<'_>,
     open: &mut F,
@@ -562,7 +602,7 @@ fn extract_volumes_to_impl<F, R>(
     emit_redirections: bool,
 ) -> Result<()>
 where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + 'w>>,
     R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
 {
     if volumes.is_empty() {
@@ -685,7 +725,7 @@ impl PendingSplitRefs {
         self.fragments.push((volume_index, file_index));
     }
 
-    fn write_to<F>(
+    fn write_to<'w, F>(
         self,
         volumes: &[Archive],
         final_file: &FileHeader,
@@ -693,7 +733,7 @@ impl PendingSplitRefs {
         open: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + 'w>>,
     {
         let decryptor = session.split_decryptor(&self, volumes)?;
         let meta = ExtractedEntryMeta {
@@ -1065,12 +1105,12 @@ mod tests {
         let mut decoder = Unpack50Decoder::new();
 
         assert_eq!(
-            file.decode_packed_with_decoder(b"secret\0\0", &mut decoder)
+            file.decode_packed_with_decoder_mode(b"secret\0\0", &mut decoder, DecodeMode::Lz)
                 .unwrap(),
             b"secret"
         );
         assert!(matches!(
-            file.decode_packed_with_decoder(b"secret\0\x01", &mut decoder),
+            file.decode_packed_with_decoder_mode(b"secret\0\x01", &mut decoder, DecodeMode::Lz),
             Err(Error::InvalidHeader(
                 "RAR 5 encrypted stored file has non-zero padding"
             ))
@@ -1221,7 +1261,7 @@ mod tests {
         file.unpacked_size = 32;
         let short = vec![0u8; 16];
         assert!(matches!(
-            file.decode_packed_with_decoder(&short, &mut decoder),
+            file.decode_packed_with_decoder_mode(&short, &mut decoder, DecodeMode::Lz),
             Err(Error::InvalidHeader(_))
         ));
 
@@ -1230,13 +1270,13 @@ mod tests {
         encrypted.unpacked_size = 32;
         let too_short = vec![0u8; 16];
         assert!(matches!(
-            encrypted.decode_packed_with_decoder(&too_short, &mut decoder),
+            encrypted.decode_packed_with_decoder_mode(&too_short, &mut decoder, DecodeMode::Lz),
             Err(Error::InvalidHeader(_))
         ));
 
         let exact = vec![0u8; 64];
         let trimmed = encrypted
-            .decode_packed_with_decoder(&exact, &mut decoder)
+            .decode_packed_with_decoder_mode(&exact, &mut decoder, DecodeMode::Lz)
             .unwrap();
         assert_eq!(trimmed.len(), encrypted.unpacked_size as usize);
     }

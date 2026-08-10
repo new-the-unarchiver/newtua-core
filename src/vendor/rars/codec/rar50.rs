@@ -392,11 +392,23 @@ impl Unpack50Decoder {
             if mode.applies_filters() {
                 apply_filters(&mut output, &filters)?;
             }
-            self.history
-                .extend_from_slice(history_output.as_deref().unwrap_or(&output));
-            if self.history.len() > dictionary_size {
-                let discard = self.history.len() - dictionary_size;
-                self.history.drain(..discard);
+            // NEWTUA: в окно уходит только его хвост. Апстрим дописывал в
+            // историю **весь** выход и лишь потом обрезал её до словаря —
+            // то есть на файле в 300 МБ со словарём в 32 МиБ история на миг
+            // вырастала до 300 МБ впустую (тикет 29). Что именно попадает в
+            // окно, не меняется: у фильтрованной записи это по-прежнему
+            // нефильтрованный выход.
+            let source = history_output.as_deref().unwrap_or(&output);
+            if source.len() >= dictionary_size {
+                self.history.clear();
+                self.history
+                    .extend_from_slice(&source[source.len() - dictionary_size..]);
+            } else {
+                self.history.extend_from_slice(source);
+                if self.history.len() > dictionary_size {
+                    let discard = self.history.len() - dictionary_size;
+                    self.history.drain(..discard);
+                }
             }
             Ok(output)
         } else {

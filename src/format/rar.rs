@@ -587,20 +587,26 @@ struct Walker<'a> {
     next: usize,
     /// Номер очередной записи в этом проходе.
     pos: usize,
-    sink: &'a mut dyn EntrySink,
-    /// Тело текущей записи.
-    ///
-    /// Копится целиком, а не льётся приёмнику по кускам: подпись обхода отдаёт
-    /// наружу `Box<dyn Write>` без времени жизни, то есть писать в занятый
-    /// приёмник такой писарь не может. Пик памяти от этого не растёт против
-    /// прежнего кода — libunrar тоже собирала запись в памяти целиком, — но и
-    /// не падает; этим занят тикет 29.
-    body: Rc<RefCell<Vec<u8>>>,
-    /// Запись, чьё тело копится прямо сейчас.
+    /// Приёмник, разделённый с писарем: обход держит писаря, пока льёт тело, а
+    /// ходоку приёмник нужен на границах записей. Одновременно в него никто не
+    /// пишет — писарь предыдущей записи умирает раньше, чем обход спросит
+    /// следующую.
+    shared: Rc<RefCell<Shared<'a>>>,
+    /// Запись, чьё тело льётся прямо сейчас.
     open: Option<usize>,
     /// Отказ приёмника: наружу он уходит как есть, а проход обрывается.
     fatal: Option<Error>,
     stop: bool,
+}
+
+/// Приёмник и отказ, который он выдал на куске тела.
+///
+/// Отказ хранится отдельно по той же причине, что и в `SinkWriter`: наружу
+/// обход отдаёт безликую ошибку ввода-вывода, а `end` должен получить нашу — по
+/// ней решают, отменили распаковку или архив сломан.
+struct Shared<'a> {
+    sink: &'a mut dyn EntrySink,
+    err: Option<Error>,
 }
 
 impl<'a> Walker<'a> {
@@ -609,8 +615,7 @@ impl<'a> Walker<'a> {
             want,
             next: 0,
             pos: 0,
-            sink,
-            body: Rc::new(RefCell::new(Vec::new())),
+            shared: Rc::new(RefCell::new(Shared { sink, err: None })),
             open: None,
             fatal: None,
             stop: false,
@@ -622,10 +627,10 @@ impl<'a> Walker<'a> {
     }
 
     /// Очередная запись прохода: нужна ли она и куда писать её тело.
-    fn open_body(&mut self) -> rars::Result<Box<dyn Write>> {
+    fn open_body(&mut self) -> rars::Result<Box<dyn Write + 'a>> {
         if self.begin_next()? {
             Ok(Box::new(BodyWriter {
-                buf: Rc::clone(&self.body),
+                shared: Rc::clone(&self.shared),
             }))
         } else {
             Ok(Box::new(std::io::sink()))
@@ -648,10 +653,10 @@ impl<'a> Walker<'a> {
         if pos != self.want[self.next] {
             return Ok(false);
         }
-        match self.sink.begin(pos) {
+        let step = self.shared.borrow_mut().sink.begin(pos);
+        match step {
             Ok(SinkStep::Body) => {
                 self.open = Some(pos);
-                self.body.borrow_mut().clear();
                 Ok(true)
             }
             Ok(SinkStep::Skip) => {
@@ -669,15 +674,21 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// Закрыть накопленное тело: отдать его приёмнику и сообщить исход.
+    /// Закрыть текущую запись: сообщить приёмнику исход её тела.
+    ///
+    /// Отказ самого приёмника перекрывает исход прохода: обход о нём узнал
+    /// безликой ошибкой ввода-вывода и приписал бы её архиву.
     fn close_open(&mut self, outcome: Result<()>) -> rars::Result<()> {
         let Some(idx) = self.open.take() else {
             return Ok(());
         };
-        let body = std::mem::take(&mut *self.body.borrow_mut());
-        let outcome = outcome.and_then(|()| self.sink.write_body(&body));
+        let outcome = match self.shared.borrow_mut().err.take() {
+            Some(e) => Err(e),
+            None => outcome,
+        };
         self.next += 1;
-        match self.sink.end(idx, outcome) {
+        let ended = self.shared.borrow_mut().sink.end(idx, outcome);
+        match ended {
             Ok(true) => Ok(()),
             Ok(false) => {
                 self.stop = true;
@@ -721,13 +732,15 @@ impl<'a> Walker<'a> {
         while !self.exhausted() {
             let idx = self.want[self.next];
             self.next += 1;
-            match self.sink.begin(idx)? {
+            let step = self.shared.borrow_mut().sink.begin(idx)?;
+            match step {
                 SinkStep::Stop => break,
                 SinkStep::Skip => continue,
                 SinkStep::Body => {}
             }
             let why = Error::Corrupt(format!("rar: заголовки кончились на записи {idx}"));
-            if !self.sink.end(idx, Err(why))? {
+            let ended = self.shared.borrow_mut().sink.end(idx, Err(why))?;
+            if !ended {
                 break;
             }
         }
@@ -735,18 +748,25 @@ impl<'a> Walker<'a> {
     }
 }
 
-/// Писарь, копящий тело записи.
+/// Писарь, льющий тело записи прямо приёмнику.
 ///
-/// Времени жизни у него нет намеренно: подпись обхода требует
-/// `Box<dyn Write>` — то есть `'static`, — а приёмник живёт заимствованным.
-struct BodyWriter {
-    buf: Rc<RefCell<Vec<u8>>>,
+/// Время жизни у него от приёмника: подпись обхода в вендоренном коде правлена
+/// под это (`Box<dyn Write + 'w>`, метка `NEWTUA`). До тикета 29 писаря
+/// требовали `'static`, и тело приходилось копить целиком в памяти.
+struct BodyWriter<'a> {
+    shared: Rc<RefCell<Shared<'a>>>,
 }
 
-impl Write for BodyWriter {
+impl Write for BodyWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buf.borrow_mut().extend_from_slice(buf);
-        Ok(buf.len())
+        let mut shared = self.shared.borrow_mut();
+        match shared.sink.write_body(buf) {
+            Ok(()) => Ok(buf.len()),
+            Err(e) => {
+                shared.err = Some(e);
+                Err(std::io::Error::other("entry sink rejected the body"))
+            }
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -873,6 +893,84 @@ mod tests {
         std::fs::write(dir.path().join("a.rar"), b"x").unwrap();
         std::fs::write(dir.path().join("b.r00"), b"x").unwrap();
         assert!(sibling_volumes(&dir.path().join("a.rar")).is_empty());
+    }
+
+    /// Приёмник, запоминающий каждый кусок тела отдельно.
+    #[derive(Default)]
+    struct Chunks {
+        pieces: Vec<Vec<u8>>,
+        ended: Vec<usize>,
+    }
+
+    impl EntrySink for Chunks {
+        fn begin(&mut self, _idx: usize) -> Result<SinkStep> {
+            Ok(SinkStep::Body)
+        }
+
+        fn write_body(&mut self, buf: &[u8]) -> Result<()> {
+            self.pieces.push(buf.to_vec());
+            Ok(())
+        }
+
+        fn end(&mut self, idx: usize, outcome: Result<()>) -> Result<bool> {
+            outcome?;
+            self.ended.push(idx);
+            Ok(true)
+        }
+    }
+
+    /// Тело уходит приёмнику по мере распаковки, а не одним куском в конце.
+    ///
+    /// Это и есть тикет 29 с нашей стороны: прежний ходок копил всю запись в
+    /// `Vec` и отдавал её одним вызовом, то есть держал в памяти целый файл.
+    #[test]
+    fn body_reaches_the_sink_piece_by_piece() {
+        let mut sink = Chunks::default();
+        {
+            let mut walker = Walker::new(&[0], &mut sink);
+            let mut writer = walker.open_body().unwrap();
+            writer.write_all(b"first").unwrap();
+            writer.write_all(b"second").unwrap();
+            drop(writer);
+            walker.finish().unwrap();
+        }
+        assert_eq!(
+            sink.pieces,
+            vec![b"first".to_vec(), b"second".to_vec()],
+            "куски должны дойти как есть, а не склеенными"
+        );
+        assert_eq!(sink.ended, vec![0]);
+    }
+
+    /// Отказ приёмника на куске тела доходит до `end` как наша ошибка, а не
+    /// как безликая ошибка ввода-вывода от перелива.
+    #[test]
+    fn a_sink_refusal_survives_the_write() {
+        struct Refuses;
+        impl EntrySink for Refuses {
+            fn begin(&mut self, _idx: usize) -> Result<SinkStep> {
+                Ok(SinkStep::Body)
+            }
+            fn write_body(&mut self, _buf: &[u8]) -> Result<()> {
+                Err(Error::Corrupt("некуда писать".into()))
+            }
+            fn end(&mut self, _idx: usize, outcome: Result<()>) -> Result<bool> {
+                match outcome {
+                    Err(Error::Corrupt(why)) => {
+                        assert_eq!(why, "некуда писать");
+                        Ok(true)
+                    }
+                    other => panic!("исход приёмника подменён: {other:?}"),
+                }
+            }
+        }
+
+        let mut sink = Refuses;
+        let mut walker = Walker::new(&[0], &mut sink);
+        let mut writer = walker.open_body().unwrap();
+        assert!(writer.write_all(b"body").is_err());
+        drop(writer);
+        walker.finish().unwrap();
     }
 
     /// Права читаются только у архивов, собранных на Unix.

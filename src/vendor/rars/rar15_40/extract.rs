@@ -197,13 +197,15 @@ impl FileHeader {
 }
 
 /// Streams a multivolume archive set to caller-provided writers.
-pub fn extract_volumes_to<F>(
+///
+/// NEWTUA: писарь получил время жизни (`'w`) — см. `rar13::extract_volumes_to`.
+pub fn extract_volumes_to<'w, F>(
     volumes: &[Archive],
     options: crate::vendor::rars::ArchiveReadOptions<'_>,
     mut open: F,
 ) -> Result<()>
 where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + 'w>>,
 {
     if volumes.is_empty() {
         return Err(Error::InvalidHeader("RAR 1.5 volume set is empty"));
@@ -343,7 +345,7 @@ impl PendingSplitRefs {
         self.fragments.push((volume_index, file_index));
     }
 
-    fn write_to<F>(
+    fn write_to<'w, F>(
         self,
         volumes: &[Archive],
         final_file: &FileHeader,
@@ -352,7 +354,7 @@ impl PendingSplitRefs {
         open: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + 'w>>,
     {
         let meta = ExtractedEntryMeta {
             name: self.name.clone(),

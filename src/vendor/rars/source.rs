@@ -1,9 +1,11 @@
 use crate::vendor::rars::error::{Error, Result};
 use std::fs::File;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+const READ_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Откуда читаются байты архива.
 ///
@@ -36,6 +38,12 @@ impl ArchiveSource {
         Ok(())
     }
 
+    /// NEWTUA: файловый поток буферизован.
+    ///
+    /// Апстрим отдавал голый дескриптор, и это было терпимо, пока упакованное
+    /// тело читалось одним `read_to_end`. Тикет 29 пустил его потоком, а
+    /// разбор блоков RAR 5 читает по два-три байта — без буфера это системный
+    /// вызов на каждое поле заголовка.
     pub(crate) fn range_reader(&self, range: Range<usize>) -> Result<Box<dyn Read + '_>> {
         match self {
             Self::Memory(data) => {
@@ -45,7 +53,10 @@ impl ArchiveSource {
             Self::File(path) => {
                 let mut file = File::open(path.as_ref())?;
                 file.seek(SeekFrom::Start(range.start as u64))?;
-                Ok(Box::new(file.take(range.len() as u64)))
+                Ok(Box::new(BufReader::with_capacity(
+                    READ_BUFFER_SIZE,
+                    file.take(range.len() as u64),
+                )))
             }
         }
     }

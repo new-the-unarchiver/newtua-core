@@ -120,6 +120,51 @@ answers "what here is not upstream's" without reading this file.
    better test than it was, since the input is no longer produced by the code
    under test.
 
+### Four fixes of ours about memory (ticket 29, stage Г of the roadmap)
+
+Extracting a member used to cost as much memory as the member is large: a 4 GB
+film inside an archive needed 4 GB of RAM. These four are what changed that, and
+each is marked `NEWTUA:` in the source.
+
+1. **The walk hands out a writer with a lifetime** (`rar13.rs`,
+   `rar15_40/extract.rs`, `rar50/extract.rs` — six signatures). Upstream's
+   `Box<dyn Write>` means `'static`, so a caller whose sink is borrowed could
+   not hand one over and had to collect the whole member in a `Vec` first. This
+   is what unblocked our own side (`format/rar.rs`, `Walker`/`BodyWriter`).
+   Measured on a solid archive holding one 700 MB file: **peak memory 863 → 114
+   MB**, the body arriving in 11 201 pieces of 64 KiB instead of one piece of
+   734 003 200 bytes. The 114 MB is the archive's dictionary, so it stays the
+   same for a file of any size.
+2. **`rar50/extract.rs` — the packed body is no longer read into memory whole.**
+   Upstream called `read_to_end` and so kept the *packed* member alongside the
+   unpacked one. The decoder reads a stream perfectly well; the buffered path
+   now feeds it one (`decode_packed_reader_with_decoder_mode`). A stored member
+   still takes the old route — its length checks need the whole payload — and it
+   has its own streaming path anyway (`write_stored_to`).
+3. **`codec/rar50.rs` — the dictionary window only takes its own tail.**
+   Upstream appended the *entire* output to the history and only then trimmed it
+   to the dictionary size, so a 300 MB file with a 32 MiB dictionary grew the
+   history to 300 MB for nothing. What ends up in the window is unchanged: a
+   filtered member still contributes its unfiltered output.
+4. **`source.rs` — the file reader is buffered.** Upstream handed out a bare
+   descriptor, which was tolerable while the packed body arrived in one
+   `read_to_end`. Fix 2 made it a stream, and RAR 5 block parsing reads two and
+   three bytes at a time — without a buffer that is a system call per header
+   field.
+
+Fixes 2 and 3 together: **peak 751 → 414 MB** on a 300 MB member.
+
+**What is deliberately left.** A member below `BUFFERED_DECODE_LIMIT` (512 MiB)
+is still decoded into a `Vec` whole, so its peak stays at about 1.4× the
+member's size. Removing that means routing everything through the streaming
+path, and that path costs two things today, both measured: it is **×1.49 slower**
+(1.47 s against 2.20 s of CPU time on the same 300 MB, paired, three runs), and
+it **does not implement RAR 5 filters** at all — a filtered member above the
+limit does not extract today, so lowering the limit without teaching the stream
+filters would take extraction away from files that currently work. Both point at
+the same code the roadmap's stage Е is about to profile, so the human's call on
+2026-08-10 was to come back to it after Е rather than rewrite the hot loop twice.
+
 ## Tests
 
 **Every unit test inside `src/` came along** — codecs, crypto, headers, CRC,

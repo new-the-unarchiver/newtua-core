@@ -436,13 +436,18 @@ impl Entry {
 }
 
 /// Streams a multivolume archive set to caller-provided writers.
-pub fn extract_volumes_to<F>(
+///
+/// NEWTUA: писарь получил время жизни (`'w`). У апстрима он `Box<dyn Write>`,
+/// то есть `'static`, и вызывающий не мог отдать писаря, который пишет в
+/// заимствованный приёмник, — тело приходилось копить целиком в памяти
+/// (тикет 29). Правка одинаковая во всех трёх поколениях формата.
+pub fn extract_volumes_to<'w, F>(
     volumes: &[Archive],
     password: Option<&[u8]>,
     mut open: F,
 ) -> Result<()>
 where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + 'w>>,
 {
     let mut pending: Option<PendingSplitRefs> = None;
     let mut unpack15 = Unpack15::new();
@@ -595,7 +600,7 @@ impl PendingSplitRefs {
         Ok(())
     }
 
-    fn write_to<F>(
+    fn write_to<'w, F>(
         self,
         volumes: &[Archive],
         final_entry: &Entry,
@@ -605,7 +610,7 @@ impl PendingSplitRefs {
         open: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + 'w>>,
     {
         let mut reader = self.fragment_reader(volumes, password)?;
         let meta = ExtractedEntryMeta {
