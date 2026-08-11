@@ -271,14 +271,13 @@ impl Archive {
         signature: ArchiveSignature,
         options: crate::vendor::rars::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
-        Self::parse_path_with_signature_and_password(path, signature, options.password)
-    }
-
-    pub fn parse_path_with_signature_and_password(
-        path: impl AsRef<Path>,
-        signature: ArchiveSignature,
-        password: Option<&[u8]>,
-    ) -> Result<Self> {
+        // NEWTUA: ячейка ключа приходит сюда, а не приделывается к тому после
+        // разбора — при `-hp` ключ нужен, чтобы прочитать заголовки.
+        let key_cache = options
+            .volume_keys
+            .map(|keys| keys.rar50.clone())
+            .unwrap_or_default();
+        let password = options.password;
         if signature.family != ArchiveFamily::Rar50Plus {
             return Err(Error::UnsupportedSignature);
         }
@@ -295,6 +294,7 @@ impl Archive {
             signature.offset,
             ArchiveSource::file(path),
             password,
+            key_cache,
         )
     }
 
@@ -304,6 +304,7 @@ impl Archive {
         sfx_offset: usize,
         source: ArchiveSource,
         password: Option<&[u8]>,
+        key_cache: Rar50KeyCache,
     ) -> Result<Self> {
         let signature = read_exact_at(file, sfx_offset, RAR50_SIGNATURE.len())?;
         if signature != RAR50_SIGNATURE {
@@ -311,7 +312,6 @@ impl Archive {
         }
 
         let file_cell = std::cell::RefCell::new(file);
-        let key_cache = Rar50KeyCache::default();
         let (main, blocks) = parse_archive_blocks(
             archive_len,
             password,
@@ -341,12 +341,6 @@ impl Archive {
 
     fn range_reader(&self, range: Range<usize>) -> Result<Box<dyn Read + '_>> {
         self.source.range_reader(range)
-    }
-
-    /// NEWTUA: см. `Archive::share_key_cache_with` в `mod.rs` — один вывод
-    /// ключа на набор томов, а не на том.
-    pub(crate) fn share_key_cache_with(&mut self, first: &Self) {
-        self.key_cache = first.key_cache.clone();
     }
 
     pub fn files(&self) -> impl Iterator<Item = &FileHeader> {

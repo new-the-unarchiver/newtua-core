@@ -530,14 +530,13 @@ impl Archive {
         signature: ArchiveSignature,
         options: crate::vendor::rars::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
-        Self::parse_path_with_signature_and_password(path, signature, options.password)
-    }
-
-    pub fn parse_path_with_signature_and_password(
-        path: impl AsRef<Path>,
-        signature: ArchiveSignature,
-        password: Option<&[u8]>,
-    ) -> Result<Self> {
+        // NEWTUA: см. близнеца в `rar50.rs` — ячейка приходит в разбор, а не
+        // приделывается после. Здесь вывод ключа стоит 262 144 раунда SHA-1.
+        let key_cache = options
+            .volume_keys
+            .map(|keys| keys.rar30.clone())
+            .unwrap_or_default();
+        let password = options.password;
         if signature.family != ArchiveFamily::Rar15To40 {
             return Err(Error::UnsupportedSignature);
         }
@@ -550,6 +549,7 @@ impl Archive {
             signature.offset,
             ArchiveSource::file(path),
             password,
+            key_cache,
         )
     }
 
@@ -559,6 +559,7 @@ impl Archive {
         sfx_offset: usize,
         source: ArchiveSource,
         password: Option<&[u8]>,
+        key_cache: Rar30CipherCache,
     ) -> Result<Self> {
         let marker = read_block_header_at(&mut file, file_len, sfx_offset, 0)?;
         if marker.head_type != MARK_HEAD || marker.head_size != RAR15_SIGNATURE.len() as u16 {
@@ -578,7 +579,6 @@ impl Archive {
         let main = parse_main_header(&main_header, &relative_block(&main_block))?;
         let mut pos = main_block.offset + main_block.head_size as usize;
         let mut blocks = Vec::new();
-        let key_cache = Rar30CipherCache::default();
 
         while (sfx_offset + pos) as u64 + 7 <= file_len {
             let (block, header, total) = if main.has_encrypted_headers() {
@@ -659,12 +659,6 @@ impl Archive {
 
     fn range_reader(&self, range: Range<usize>) -> Result<Box<dyn Read + '_>> {
         self.source.range_reader(range)
-    }
-
-    /// NEWTUA: см. `Archive::share_key_cache_with` в `mod.rs` — один вывод
-    /// ключа на набор томов, а не на том.
-    pub(crate) fn share_key_cache_with(&mut self, first: &Self) {
-        self.key_cache = first.key_cache.clone();
     }
 
     pub fn files(&self) -> impl Iterator<Item = &FileHeader> {
@@ -794,7 +788,38 @@ fn map_rar30_crypto_error(error: Rar30Error) -> Error {
     Error::from(error)
 }
 
+/// NEWTUA: у RAR 3 нет поля для проверки ключа — значит и отличить «пароль не
+/// тот» от «архив побит» здесь нечем, а вердикт с ровно таким смыслом в перечне
+/// уже есть. Неверный ключ даёт на выходе AES мусор, и мусор шёл в разбор как
+/// настоящий заголовок: два байта случайного размера почти всегда больше
+/// остатка файла, и человек получал `TooShort` — «архив недокачан». Он шёл
+/// перекачивать файл из-за опечатки в пароле. Поэтому любой отказ разбора
+/// заголовка, расшифрованного неизвестно чем, называется своим именем.
+/// Ошибки ввода-вывода не трогаем: диск к паролю отношения не имеет, и подмена
+/// была бы той же ошибкой, что здесь чинится. Тикет 36.
 fn read_encrypted_header_at(
+    file: &mut File,
+    file_len: u64,
+    archive_offset: usize,
+    offset: usize,
+    password: &[u8],
+    cipher_cache: &Rar30CipherCache,
+) -> Result<EncryptedHeader> {
+    decrypt_header_at(
+        file,
+        file_len,
+        archive_offset,
+        offset,
+        password,
+        cipher_cache,
+    )
+    .map_err(|error| match error {
+        Error::Io(_) => error,
+        _ => Error::WrongPasswordOrCorruptData,
+    })
+}
+
+fn decrypt_header_at(
     file: &mut File,
     file_len: u64,
     archive_offset: usize,

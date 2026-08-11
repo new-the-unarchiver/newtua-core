@@ -442,6 +442,117 @@ Two more from the same pass:
   parsing and extraction can come to accept different archives.
 - `K: Clone` was required by the cache and used by nothing.
 
+### A wrong password on a header-encrypted RAR 3 archive read as a broken file (ticket 36)
+
+`rar a -hp` encrypts every block after the main header. A wrong key turns them
+into noise, and upstream fed that noise to the header parser: the two bytes it
+reads as `head_size` are uniform over 0…65 535, so almost always they exceed
+what is left of the file and the answer was `TooShort` — which reaches a person
+as **"input is too short"**, i.e. *your download is truncated*. They would go
+looking for a second copy of a file that is intact, over a typo in the password.
+RAR 5 has said `WrongPassword` here all along, and the difference between the two
+generations is not explicable to anyone.
+
+`read_encrypted_header_at` (`rar15_40.rs`) now says what it means: a header
+decrypted with an unknown key that does not parse is
+`WrongPasswordOrCorruptData`. **I/O errors are passed through untouched** — a
+disk failure has nothing to do with the password, and relabelling it would be the
+very mistake being fixed here.
+
+RAR 3 cannot do better than "password or corruption", and does not need to: the
+format has no key-check field — that arrived with RAR 5 — so the two causes are
+indistinguishable **in principle**, and the verdict is named after what the
+person should do. Genuine corruption of an `-hp` archive now reports the same
+thing; `unrar` blames the password in that case too.
+
+Guarded by two tests in `tests/integration/rar_handler.rs` over a fixture built
+from format bytes in the test itself: `rar` 7.22 cannot produce RAR 4 any more
+(`-ma4` is gone), and a third-party sample would repeat ticket 31 — an
+undeclared-licence binary in a public repository. Since `-hp` leaves the marker
+and the main header in the clear, both are real there and the encrypted tail is
+what it looks like to a wrong key. On the unpatched tree the first test fails
+with exactly the string from the ticket, `Corrupt("input is too short")`.
+
+### Two ways an encrypted member stored without compression was lost (ticket 37)
+
+Data loss, both inherited from upstream, both reproduced on `e214774` — they
+arrived with the move to the vendored reader, not with anything since. On the
+sample they were found on, 5 of 201 entries came out; `unrar` reads all of them,
+byte for byte with the files the archive was built from.
+
+**1. The discarded padding had to be zero, and there is no such promise.** An
+encrypted stored member is padded to 16 bytes, and upstream refused the member
+unless the tail was all zeros (three sites: buffered, streaming and split).
+`rar` 7.22 does not fill it — what lands there is whatever was left in its
+buffer, so the first members of an archive came out (buffer still clean) and the
+rest were reported as a broken archive. The padding is now dropped in silence,
+as `unrar` drops it. The password is guarded by the encryption record's
+`check_value`, and integrity by CRC32 and BLAKE2sp; the padding guarded nothing.
+
+**The ticket's stated boundary was wrong, and the measurement is what corrected
+it.** It said the defect needed encrypted headers *and* volumes *and* `-m0`. It
+needs none of the first two: a **single-volume** `rar a -m0 -p` archive loses
+36 of 40 members. The `-p` control that looked healthy held files of 2000 bytes —
+a multiple of 16, so it had no padding at all to trip over. The condition is
+"member size not a multiple of 16", full stop.
+
+**2. The split path checked integrity by a different rule than the whole one.**
+It applied the key's MAC to the checksum whenever the member was encrypted; the
+whole-member path applies it only when `uses_hash_mac` is set (bit 1 of the
+encryption record's flags). An archive built with `rar a -hp` does not set that
+bit, so every member split across a volume boundary was declared corrupt — and
+the bytes were right all along, which a probe showed before a line was changed.
+`PendingSplitRefs::write_stored_to` now calls `verify_streaming_integrity`, the
+same function the whole-member path uses. One rule in one place, for the same
+reason the filter rules are.
+
+Two fixtures guard them, both built here and both failing on the unpatched tree:
+`encpad.rar` (single volume, `-m0 -p`, 1500-byte members — refused with
+"non-zero padding") and `hpvol.part1…6.rar` (six 2 KiB volumes, `-m0 -hp` —
+"checksum mismatch" on the first split member).
+
+### The key cache never reached parsing, so `-hp` volume sets paid per volume
+
+Ticket 33 moved key derivation behind a cache; the `/simplify` pass after it made
+that cache shared across a volume set. Both stopped one step short: the cache was
+handed to a volume **after** it was parsed (`share_key_cache_with`). For an
+archive with encrypted headers the key is what makes the headers readable, so it
+is needed *during* parsing — and a 44-volume `-hp` set derived it 44 times. The
+same set without `-hp` derived it once, which is exactly why no measurement
+caught it.
+
+The cache is now an input to parsing: `ArchiveReadOptions::volume_keys` carries a
+`VolumeKeyCaches` that `format/rar.rs` creates once per set and gives to every
+volume, first one included. `share_key_cache_with` is gone from all three files —
+one road to the cell, not two.
+
+Counted, not inferred: derivations per open went **44 → 1** and **22 → 1** on the
+two `-hp` sets, and stayed **1** on the `-p` controls. Paired, medians of eleven
+rounds: 734 → 146 ms and 368 → 66 ms; the `-p` controls moved ×1.03 and ×0.99,
+which is noise (their ranges overlap). Both `parse_path_with_signature_and_password`
+entry points went with the change — nothing called them any more.
+
+### The two stored-body loops became one (`/simplify` after tickets 36/37)
+
+`FileHeader::write_stored_to` and `PendingSplitRefs::write_stored_to` were near
+word-for-word twins: read 64 KiB, trim the tail to `unpacked_size`, update CRC32
+and the hash, write, check the length, verify. **They had already drifted twice**
+— once in the integrity rule, which is what lost most of a `-hp` archive, and
+once in when to trim at all (the whole-member copy trimmed unconditionally, the
+split one only for encrypted members). Ticket 37 had to be applied to both.
+
+`stream_stored_body` is now the one body; each caller supplies only what
+actually differs — where the stream comes from and where the keys come from. The
+padding rule, which was written in three places, is written in one. Trimming is
+unconditional: an unencrypted stored member has packed size equal to unpacked, so
+a branch for it would only have grown a second rule.
+
+One visible consequence: the split path now labels its own errors with the entry
+name, the way the whole-member path always did, instead of being labelled from
+outside by `write_to`. Three upstream unit tests matched on the bare error and
+now unwrap the `AtEntry` context first — the same way `format/rar.rs` unwraps it
+to decide whether to ask for a password.
+
 ## Tests
 
 **Every unit test inside `src/` came along** — codecs, crypto, headers, CRC,

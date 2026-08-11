@@ -10,11 +10,24 @@ fn open_fixture(
     bytes: &[u8],
     opts: &OpenOptions,
 ) -> (tempfile::NamedTempFile, Box<dyn ArchiveReader>) {
+    let (tmp, opened) = try_open_fixture(bytes, opts);
+    (tmp, opened.unwrap())
+}
+
+/// То же, но исход отдаётся как есть: тестам про отказ нужен `Err`, а
+/// договорённость «временный файл живёт, пока жив читатель» — одна на всех.
+fn try_open_fixture(
+    bytes: &[u8],
+    opts: &OpenOptions,
+) -> (
+    tempfile::NamedTempFile,
+    newtua_core::Result<Box<dyn ArchiveReader>>,
+) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), bytes).unwrap();
     let src = Source::path(tmp.path()).unwrap();
-    let ar = RarHandler.open(src, opts).unwrap();
-    (tmp, ar)
+    let opened = RarHandler.open(src, opts);
+    (tmp, opened)
 }
 
 #[test]
@@ -106,6 +119,203 @@ fn verify_password_with_correct_password_is_ok() {
     assert!(ar.verify_password().is_ok());
 }
 
+// ── RAR 3 с зашифрованными заголовками ───────────────────────────────────────
+
+/// Архив RAR 3 с зашифрованными заголовками (`rar a -hp`), собранный здесь же.
+///
+/// Фикстуры на этот случай у нас нет и взять её негде: `rar` 7.22 не умеет
+/// делать RAR 4 (`-ma4` он уже не знает), а чужой образец повторил бы историю
+/// тикета 31 — двоичный файл без объявленной лицензии в открытом репозитории.
+/// Поэтому архив собран из байтов формата: `-hp` шифрует блоки **после**
+/// главного заголовка, так что маркер и главный блок здесь настоящие, а
+/// «зашифрованный» хвост — то, чем он и выглядит для неверного ключа.
+///
+/// 20 байт структуры: маркер `Rar!\x1a\x07\x00`, затем главный блок в 13 байт —
+/// контрольная сумма `0x99ce`, тип `0x73`, флаги `0x0080` (`MHD_PASSWORD`),
+/// размер 13 и два пустых зарезервированных поля. Дальше 32 байта хвоста:
+/// восемь на соль и шестнадцать с лишним на тело заголовка.
+#[rustfmt::skip]
+const HEADER_ENC_FIXTURE: &[u8] = &[
+    0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00,
+    0xce, 0x99, 0x73, 0x80, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+    0xdd, 0xee, 0xff, 0x00, 0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78,
+    0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0,
+];
+
+/// Неверный пароль к RAR 3 `-hp` — это «неверный пароль», а не порча архива.
+///
+/// Тикет 36. Неверный ключ даёт на выходе AES мусор, и мусор шёл в разбор как
+/// настоящий заголовок: два байта случайного размера почти всегда больше
+/// остатка файла, и человек получал `Corrupt("input is too short")` — то есть
+/// «архив недокачан». Он шёл искать вторую копию из-за опечатки в пароле.
+///
+/// Отличить «пароль не тот» от «файл побит» в RAR 3 нельзя в принципе: поля для
+/// проверки ключа формат не хранит, оно появилось только в RAR 5. Поэтому
+/// вердикт называется по тому, что человеку делать: проверить пароль.
+#[test]
+fn rar3_header_encrypted_wrong_password_is_not_corruption() {
+    use newtua_core::Error;
+    let (_tmp, opened) = try_open_fixture(HEADER_ENC_FIXTURE, &with_password("WRONG"));
+    let Err(err) = opened else {
+        panic!("архив из мусора не должен открываться");
+    };
+    assert!(
+        matches!(err, Error::WrongPassword),
+        "неверный пароль к -hp обязан называться паролем, а не порчей: {err:?}"
+    );
+}
+
+/// А отсутствие пароля остаётся отсутствием пароля.
+///
+/// Граница правки тикета 36: спросить пароль и объявить его неверным — разные
+/// вещи, и первая была верна до правки. Пустая строка сюда не годится:
+/// `std::env::var` отдаёт `Ok("")`, и заданный пустой пароль — это заданный
+/// пароль (ловушка тикета 33).
+#[test]
+fn rar3_header_encrypted_without_password_still_asks_for_one() {
+    use newtua_core::Error;
+    let (_tmp, opened) = try_open_fixture(HEADER_ENC_FIXTURE, &OpenOptions::default());
+    let Err(err) = opened else {
+        panic!("архив с зашифрованными заголовками не открывается без пароля");
+    };
+    assert!(
+        matches!(err, Error::Encrypted),
+        "без пароля -hp обязан просить пароль: {err:?}"
+    );
+}
+
+// ── RAR 5: зашифрованная запись, сохранённая без сжатия (тикет 37) ───────────
+
+// encpad.rar: восемь файлов по 1500 байт случайных данных, собран здесь:
+//   rar a -r -m0 -ep1 -pSecret123 encpad.rar pad
+// 1500 не кратно 16, поэтому у каждой зашифрованной записи есть добивка, и
+// `rar` 7.22 оставляет в ней остатки своего буфера — нулевая она только у
+// первых записей архива. Судья целостности не наш код: CRC32 и BLAKE2sp
+// каждой записи записал сам `rar`, и распаковщик их сверяет.
+const ENC_PAD_FIXTURE: &[u8] = include_bytes!("../fixtures/encpad.rar");
+
+// hpvol.partN.rar: шесть файлов по 1500 байт, шесть томов, собран здесь:
+//   rar a -r -v2k -m0 -ep1 -hpSecret123 hpvol.rar src
+// Тома по 2 КиБ гарантируют записи, разрезанные между томами, а `-hp` снимает
+// у них флаг `uses_hash_mac` — сочетание, на котором терялся почти весь архив.
+const HPVOL_PARTS: [&[u8]; 6] = [
+    include_bytes!("../fixtures/hpvol.part1.rar"),
+    include_bytes!("../fixtures/hpvol.part2.rar"),
+    include_bytes!("../fixtures/hpvol.part3.rar"),
+    include_bytes!("../fixtures/hpvol.part4.rar"),
+    include_bytes!("../fixtures/hpvol.part5.rar"),
+    include_bytes!("../fixtures/hpvol.part6.rar"),
+];
+
+/// Пароль всех собранных здесь зашифрованных фикстур.
+const SECRET: &str = "Secret123";
+
+/// Разложить тома набора рядом друг с другом и открыть первый: продолжение
+/// ищется по соседним именам (`sibling_volumes`), поэтому лежать они обязаны
+/// вместе.
+///
+/// `damage` — том (с нуля) и смещение байта, который надо испортить по дороге.
+/// Портится копия в памяти, фикстура на диске остаётся целой и служит заодно
+/// обычным многотомным образцом.
+fn open_volumes(
+    stem: &str,
+    parts: &[&[u8]],
+    opts: &OpenOptions,
+    damage: Option<(usize, usize)>,
+) -> (tempfile::TempDir, Box<dyn ArchiveReader>) {
+    let dir = tempfile::tempdir().unwrap();
+    for (i, part) in parts.iter().enumerate() {
+        let mut bytes = part.to_vec();
+        if let Some((volume, at)) = damage
+            && volume == i
+        {
+            bytes[at] ^= 0xff;
+        }
+        std::fs::write(dir.path().join(format!("{stem}.part{}.rar", i + 1)), bytes).unwrap();
+    }
+    let first = dir.path().join(format!("{stem}.part1.rar"));
+    let src = Source::path(&first).unwrap();
+    let ar = RarHandler.open(src, opts).unwrap();
+    (dir, ar)
+}
+
+fn with_password(password: &str) -> OpenOptions {
+    OpenOptions {
+        password: Some(password.into()),
+        encoding_override: None,
+    }
+}
+
+/// Распаковать весь архив одним проходом — тем самым, которым ходит движок.
+///
+/// Не циклом `read_entry`: у сплошного архива и у набора томов это разные пути,
+/// и стеречь надо тот, по которому идёт распаковка на самом деле.
+fn read_all(ar: &mut dyn ArchiveReader) -> Collector {
+    let indices: Vec<usize> = (0..ar.entries().unwrap().len()).collect();
+    let mut sink = Collector::default();
+    ar.read_entries(&indices, &mut sink).unwrap();
+    sink
+}
+
+/// Номера записей по именам: порядок в архиве — дело упаковщика, и привязка к
+/// нему сделала бы тест хрупким.
+fn index_of(ar: &mut dyn ArchiveReader, names: &[String]) -> Vec<usize> {
+    let entries = ar.entries().unwrap();
+    names
+        .iter()
+        .map(|name| {
+            entries
+                .iter()
+                .position(|e| e.path.to_string_lossy() == *name)
+                .unwrap_or_else(|| panic!("{name} нет в оглавлении"))
+        })
+        .collect()
+}
+
+fn numbered(dir: &str, stem: &str, count: usize) -> Vec<String> {
+    (0..count).map(|i| format!("{dir}/{stem}{i}.bin")).collect()
+}
+
+/// Добивка зашифрованной записи, сохранённой без сжатия, отбрасывается — какая
+/// бы в ней ни лежала труха.
+///
+/// Тикет 37. Требование «добивка обязана быть нулевой» формат нигде не даёт, а
+/// `rar` 7.22 её ничем не заполняет: туда попадает то, что осталось в его
+/// буфере. Отсюда и вид беды — первые записи архива выходили, а дальше человек
+/// получал «архив побит» на файлах, которые `unrar` читает целиком.
+#[test]
+fn rar5_encrypted_stored_member_survives_non_zero_padding() {
+    let (_tmp, mut ar) = open_fixture(ENC_PAD_FIXTURE, &with_password(SECRET));
+    let at = index_of(ar.as_mut(), &numbered("pad", "p", 8));
+    let sink = read_all(ar.as_mut());
+
+    assert!(sink.failed.is_empty(), "отказов быть не должно");
+    for (i, &idx) in at.iter().enumerate() {
+        assert_eq!(sink.body(idx).len(), 1500, "запись pad/p{i}.bin");
+    }
+}
+
+/// Запись, разрезанная между томами архива с зашифрованными заголовками,
+/// проверяется тем же правилом, что и целая.
+///
+/// Тикет 37, второй дефект. Путь для разрезанной записи применял MAC к
+/// контрольной сумме всегда, когда запись зашифрована, а путь для целой — лишь
+/// когда взведён флаг `uses_hash_mac`. Архив, собранный `rar a -hp`, этого
+/// флага не ставит, и каждая разрезанная запись объявлялась побитой: из 201
+/// записи выходило пять.
+#[test]
+fn rar5_header_encrypted_split_member_is_not_reported_corrupt() {
+    let (_dir, mut ar) = open_volumes("hpvol", &HPVOL_PARTS, &with_password(SECRET), None);
+    let at = index_of(ar.as_mut(), &numbered("src", "e", 6));
+    let sink = read_all(ar.as_mut());
+
+    assert!(sink.failed.is_empty(), "отказов быть не должно");
+    for (i, &idx) in at.iter().enumerate() {
+        assert_eq!(sink.body(idx).len(), 1500, "запись src/e{i}.bin");
+    }
+}
+
 // ── Timestamps ───────────────────────────────────────────────────────────────
 
 /// RAR 5 хранит момент времени, и он доходит до записи точно.
@@ -154,11 +364,23 @@ struct Collector {
     current: Option<usize>,
     got: Vec<(usize, Vec<u8>)>,
     failed: Vec<usize>,
+    /// Текст отказа по записи: у отказа есть не только факт, но и причина, и
+    /// неверная причина уводит человека чинить не то (тикет 37 §5).
+    reasons: Vec<(usize, String)>,
     skip: Vec<usize>,
     stop_before: Option<usize>,
 }
 
 impl Collector {
+    fn reason(&self, idx: usize) -> &str {
+        &self
+            .reasons
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .unwrap_or_else(|| panic!("записи {idx} нет среди отказавших"))
+            .1
+    }
+
     fn body(&self, idx: usize) -> &[u8] {
         &self
             .got
@@ -189,8 +411,9 @@ impl EntrySink for Collector {
 
     fn end(&mut self, idx: usize, outcome: newtua_core::Result<()>) -> newtua_core::Result<bool> {
         assert_eq!(self.current, Some(idx), "end() пришёл не за той записью");
-        if outcome.is_err() {
+        if let Err(e) = outcome {
             self.failed.push(idx);
+            self.reasons.push((idx, e.to_string()));
             self.got.retain(|(i, _)| *i != idx);
         }
         Ok(true)
@@ -325,17 +548,13 @@ const MV_P1: &[u8] = include_bytes!("../fixtures/mvmulti.part1.rar");
 const MV_P2: &[u8] = include_bytes!("../fixtures/mvmulti.part2.rar");
 const MV_P3: &[u8] = include_bytes!("../fixtures/mvmulti.part3.rar");
 
-/// Разложить три тома рядом друг с другом и открыть первый: продолжение
-/// набора ищется по соседним именам (`sibling_volumes`), поэтому лежать они
-/// обязаны вместе.
 fn open_multivolume() -> (tempfile::TempDir, Box<dyn ArchiveReader>) {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("mvmulti.part1.rar"), MV_P1).unwrap();
-    std::fs::write(dir.path().join("mvmulti.part2.rar"), MV_P2).unwrap();
-    std::fs::write(dir.path().join("mvmulti.part3.rar"), MV_P3).unwrap();
-    let src = Source::path(&dir.path().join("mvmulti.part1.rar")).unwrap();
-    let ar = RarHandler.open(src, &OpenOptions::default()).unwrap();
-    (dir, ar)
+    open_volumes(
+        "mvmulti",
+        &[MV_P1, MV_P2, MV_P3],
+        &OpenOptions::default(),
+        None,
+    )
 }
 
 /// Тела фикстуры — тот же линейный конгруэнтный генератор, каким они созданы.
@@ -379,6 +598,92 @@ fn a_multivolume_set_reads_a_subset() {
     let mut sink = Collector::default();
     ar.read_entries(&[2], &mut sink).unwrap();
     assert_eq!(sink.body(2), blob(3, 12_000));
+}
+
+// ── Одна испорченная запись не уносит соседей (G14, тикет 37 §5) ────────────
+
+// torn.part1..3.rar: шесть файлов по 700 несжимаемых байт, тома по 2 КиБ:
+//   rar a -r -v2k -m0 -ep1 torn.rar t
+// Тома режут часть тел, часть — нет; на этом и держится проверка. Фикстура на
+// диске **целая**, портится копия в памяти: так один и тот же образец служит и
+// обычным многотомным набором.
+const TORN_PARTS: [&[u8]; 3] = [
+    include_bytes!("../fixtures/torn.part1.rar"),
+    include_bytes!("../fixtures/torn.part2.rar"),
+    include_bytes!("../fixtures/torn.part3.rar"),
+];
+
+/// Тела фикстуры — тот же генератор, каким они созданы: один поток на все шесть
+/// файлов подряд, потом порезанный по 700 байт.
+fn torn_bodies() -> Vec<Vec<u8>> {
+    blob(7, 6 * 700).chunks(700).map(<[u8]>::to_vec).collect()
+}
+
+/// Разложить набор, испортив один байт в теле внутри второго тома.
+fn open_torn(damage: Option<usize>) -> (tempfile::TempDir, Box<dyn ArchiveReader>) {
+    let damage = damage.map(|at| (1, at));
+    open_volumes("torn", &TORN_PARTS, &OpenOptions::default(), damage)
+}
+
+/// Целый набор читается целиком — фикстура сама по себе исправна.
+#[test]
+fn a_torn_set_reads_whole_when_undamaged() {
+    let (_dir, mut ar) = open_torn(None);
+    let at = index_of(ar.as_mut(), &numbered("t", "f", 6));
+    let sink = read_all(ar.as_mut());
+
+    assert!(sink.failed.is_empty(), "отказов быть не должно");
+    for (i, body) in torn_bodies().iter().enumerate() {
+        assert_eq!(sink.body(at[i]), &body[..], "запись t/f{i}.bin");
+    }
+}
+
+/// Одна испорченная запись не уносит с собой тех соседей, что от неё не зависят.
+///
+/// G14, названный внутри тикета 37 §5. Проход по архиву обрывается на первой
+/// же неудаче и, начатый заново, спотыкается о ту же запись, — так весь остаток
+/// набора объявлялся потерянным. Вне сплошного архива соседи от испорченной
+/// записи не зависят, и те из них, что не разрезаны границей тома, читаются
+/// поодиночке. На этом образце было три целых файла из шести, стало четыре;
+/// `unrar` достаёт пять.
+///
+/// **И причина отказа теперь правдива.** Недошедшим записям сообщалось
+/// «заголовки кончились», хотя заголовки на месте — прекратился обход.
+#[test]
+fn a_damaged_entry_does_not_take_its_neighbours_with_it() {
+    let (_dir, mut ar) = open_torn(Some(500));
+    let at = index_of(ar.as_mut(), &numbered("t", "f", 6));
+    let sink = read_all(ar.as_mut());
+
+    let bodies = torn_bodies();
+    // Испорчено тело `t/f1.bin`; её отказ и есть настоящая причина.
+    let damaged = at[1];
+    assert!(
+        sink.failed.contains(&damaged),
+        "битая запись обязана отказать, отказали {:?}",
+        sink.failed
+    );
+    assert!(
+        sink.reason(damaged).contains("checksum mismatch"),
+        "у настоящей порчи причина своя: {}",
+        sink.reason(damaged)
+    );
+    // Записи после неё, не разрезанные границей тома, обязаны выйти целыми:
+    // до правки весь остаток набора считался потерянным.
+    for i in [3usize, 4, 5] {
+        assert_eq!(sink.body(at[i]), &bodies[i][..], "сосед t/f{i}.bin потерян");
+    }
+    // А та, что разрезана и потому поодиночке не читается, честно говорит, почему.
+    for &idx in &sink.failed {
+        if idx == damaged {
+            continue;
+        }
+        let why = sink.reason(idx);
+        assert!(
+            why.contains("обход архива прервался"),
+            "недошедшей записи полагается правда, а не «заголовки кончились»: {why}"
+        );
+    }
 }
 
 // ── RAR 1.5: настоящий архив эпохи, судья — `unar` ───────────────────────────

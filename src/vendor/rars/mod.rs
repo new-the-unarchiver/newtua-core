@@ -43,6 +43,17 @@ pub struct ArchiveReadOptions<'a> {
     /// Below the limit it is, which keeps the retry that re-decodes without
     /// filters when integrity fails; above it the member streams.
     pub rar50_buffered_decode_limit: Option<u64>,
+    /// NEWTUA: ячейка выведенного ключа, общая на весь набор томов.
+    ///
+    /// Даётся **разбору**, а не приделывается к тому после него, и разница не
+    /// косметическая: у архива с зашифрованными заголовками (`rar a -hp`) ключ
+    /// нужен, чтобы прочитать заголовки, то есть внутри разбора. Пока ячейку
+    /// раздавали после, `-hp`-набор из 44 томов выводил ключ 44 раза.
+    ///
+    /// **Читается только разбором.** Эти же опции ходят и в обход-распаковку
+    /// (`extract_volumes_to`), но там ключ берётся у уже разобранного архива, и
+    /// поле не смотрят вовсе: ставить его на распаковке бесполезно.
+    pub volume_keys: Option<&'a VolumeKeyCaches>,
 }
 
 impl<'a> ArchiveReadOptions<'a> {
@@ -55,6 +66,24 @@ impl<'a> ArchiveReadOptions<'a> {
     }
 }
 
+/// NEWTUA: выведенные ключи набора томов — по ячейке на поколение формата.
+///
+/// Пароль и соль у набора одни, а тома — отдельные `Archive`, каждый со своей
+/// ячейкой. Одно значение на набор заводит `format/rar.rs` (`parse_set`) и
+/// отдаёт его каждому тому, включая первый; внутри ячейки `Arc`, так что копия
+/// делит содержимое (`crypto/cache.rs`).
+///
+/// Два поля, а не одно: у RAR 5 запоминается ключ, у RAR 3 — готовый шифр, и
+/// цена вывода у них разная (32 768 раундов HMAC-SHA256 против 262 144 раундов
+/// SHA-1). Набор смешанных поколений невозможен, так что вторая ячейка в любом
+/// наборе просто не трогается. У RAR 1.3 ячейки нет вовсе — его шифр это три
+/// байта.
+#[derive(Debug, Default, Clone)]
+pub struct VolumeKeyCaches {
+    pub(crate) rar50: rar50::Rar50KeyCache,
+    pub(crate) rar30: rar15_40::Rar30CipherCache,
+}
+
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 /// A parsed RAR archive, preserving the concrete archive family.
@@ -65,29 +94,6 @@ pub enum Archive {
     Rar15To40(rar15_40::Archive),
     /// RAR 5.0 or later archive, including RAR 7 archives.
     Rar50Plus(rar50::Archive),
-}
-
-impl Archive {
-    /// NEWTUA: том перенимает ячейку выведенного ключа у первого тома набора.
-    ///
-    /// Тома разбираются по одному и каждый заводит свою ячейку, а пароль и соль
-    /// у набора общие — без этого набор из 42 томов выводил ключ 42 раза
-    /// (246 мс против 55 мс на замере). Ячейка делится через `Arc`, так что
-    /// «перенять» — это скопировать указатель.
-    ///
-    /// Разные поколения формата в одном наборе невозможны, и такая пара просто
-    /// ничего не делает: у RAR 1.3 ячейки нет вовсе — его шифр это три байта.
-    pub(crate) fn share_key_cache_with(&mut self, first: &Self) {
-        match (self, first) {
-            (Self::Rar15To40(volume), Self::Rar15To40(first)) => {
-                volume.share_key_cache_with(first);
-            }
-            (Self::Rar50Plus(volume), Self::Rar50Plus(first)) => {
-                volume.share_key_cache_with(first);
-            }
-            _ => {}
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

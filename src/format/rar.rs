@@ -53,16 +53,21 @@ impl FormatHandler for RarHandler {
                 None => return Err(without),
             },
         };
-        let (entries, places) = list(&archives, opts.encoding_override.as_deref());
+        let toc = list(&archives, opts.encoding_override.as_deref());
         let volumes = Volumes::from_family(archives)?;
-        let one_pass = volumes.needs_one_pass();
+        // Обход по всему архиву нужен ради двух свойств, и оба уже известны:
+        // сплошной архив спрашивается у набора, разрезанные записи посчитаны
+        // оглавлением. Второй раз заголовки не перебираются.
+        let solid = volumes.is_solid();
+        let one_pass = solid || toc.any_split;
 
         Ok(Box::new(RarReader {
             volumes,
             password,
-            entries,
-            places,
+            entries: toc.entries,
+            places: toc.places,
             one_pass,
+            solid,
         }))
     }
 }
@@ -75,25 +80,35 @@ impl FormatHandler for RarHandler {
 /// распаковщик получает набор целиком: разрезанный файл он склеивает из кусков,
 /// лежащих в разных томах, и потому обязан видеть их все.
 fn parse_set(first: &Path, password: Option<&str>) -> Result<Vec<rars::Archive>> {
-    let head = parse_one(first, password)?;
+    // Пароль у набора один и соль тоже, а тома — отдельные `Archive`, каждый
+    // со своей ячейкой под выведенный ключ. Ячейка заводится здесь, одна на
+    // весь набор, и достаётся **разбору** каждого тома, первого в том числе.
+    //
+    // Отдавать её после разбора было мало: у архива с зашифрованными
+    // заголовками (`rar a -hp`) ключ нужен, чтобы прочитать сами заголовки, то
+    // есть внутри разбора, — и набор из 44 томов выводил ключ 44 раза, хотя
+    // тот же набор без `-hp` обходился одним.
+    let keys = rars::VolumeKeyCaches::default();
+    let head = parse_one(first, password, &keys)?;
     if !is_volume(&head) {
         return Ok(vec![head]);
     }
     let mut archives = vec![head];
     for path in sibling_volumes(first) {
-        let mut volume = parse_one(&path, password)?;
-        // Пароль у набора один, соль тоже, а тома разбираются по одному и
-        // каждый заводит свою ячейку под выведенный ключ. Без этой строки
-        // набор из 42 томов выводил ключ 42 раза — 246 мс там, где хватает
-        // одного вывода.
-        volume.share_key_cache_with(&archives[0]);
-        archives.push(volume);
+        archives.push(parse_one(&path, password, &keys)?);
     }
     Ok(archives)
 }
 
-fn parse_one(path: &Path, password: Option<&str>) -> Result<rars::Archive> {
-    let opts = rars::ArchiveReadOptions::with_optional_password(password.map(str::as_bytes));
+fn parse_one(
+    path: &Path,
+    password: Option<&str>,
+    keys: &rars::VolumeKeyCaches,
+) -> Result<rars::Archive> {
+    let opts = rars::ArchiveReadOptions {
+        volume_keys: Some(keys),
+        ..rars::ArchiveReadOptions::with_optional_password(password.map(str::as_bytes))
+    };
     rars::ArchiveReader::read_path_with_options(path, opts).map_err(map_err)
 }
 
@@ -181,18 +196,36 @@ fn exists_while(dir: &Path, next: impl Fn(u64) -> String) -> Vec<PathBuf> {
 struct Place {
     volume: usize,
     ordinal: usize,
+    /// Запись продолжается в следующем томе, то есть склеивается только обходом
+    /// набора и поодиночке не читается (`alone_readable`).
+    split: bool,
+}
+
+/// Оглавление набора: что в нём лежит, где лежит, и нужен ли обход целиком.
+struct Toc {
+    entries: Vec<Entry>,
+    places: Vec<Place>,
+    /// Хоть одна запись разрезана границей тома.
+    ///
+    /// Считается здесь, а не отдельным обходом заголовков: те же члены тех же
+    /// томов уже перебираются ниже. И считается **до** пропуска продолжений —
+    /// набор, открытый со среднего тома, начинается с продолжения, у которого
+    /// головы нет вовсе, и по одному `is_split_after` оно бы не заметилось.
+    any_split: bool,
 }
 
 /// Собрать оглавление набора и запомнить, где чья запись лежит.
-fn list(archives: &[rars::Archive], encoding: Option<&str>) -> (Vec<Entry>, Vec<Place>) {
+fn list(archives: &[rars::Archive], encoding: Option<&str>) -> Toc {
     let mut raw_names: Vec<Vec<u8>> = Vec::new();
     let mut raw_links: Vec<Vec<u8>> = Vec::new();
     let mut places: Vec<Place> = Vec::new();
     let mut metas: Vec<rars::ArchiveMemberMeta> = Vec::new();
+    let mut any_split = false;
 
     for (volume, archive) in archives.iter().enumerate() {
         let links = link_targets(archive);
         for (ordinal, member) in archive.members().enumerate() {
+            any_split |= member.meta.is_split_before || member.meta.is_split_after;
             // Продолжение файла из прошлого тома — не отдельная запись
             // (тикет 19). Считать его записью значит сдвинуть все номера после
             // него: распаковка отдаёт разрезанный файл один раз, склеенным.
@@ -201,7 +234,11 @@ fn list(archives: &[rars::Archive], encoding: Option<&str>) -> (Vec<Entry>, Vec<
             }
             raw_names.push(member.meta.name.clone());
             raw_links.push(links.get(ordinal).copied().unwrap_or(&[]).to_vec());
-            places.push(Place { volume, ordinal });
+            places.push(Place {
+                volume,
+                ordinal,
+                split: member.meta.is_split_after,
+            });
             metas.push(member.meta);
         }
     }
@@ -244,7 +281,11 @@ fn list(archives: &[rars::Archive], encoding: Option<&str>) -> (Vec<Entry>, Vec<
         })
         .collect();
 
-    (entries, places)
+    Toc {
+        entries,
+        places,
+        any_split,
+    }
 }
 
 /// Цели перенаправления RAR 5 по порядку файловых заголовков тома; пусто там,
@@ -349,30 +390,23 @@ impl Volumes {
         }
     }
 
-    /// Нужен ли проход по всему архиву ради одной записи.
+    /// Сплошной ли архив: запись распаковывается только из окна, накопленного
+    /// предыдущими, поэтому обход нужен весь — и поодиночке такую запись не
+    /// прочитать даже после аварии (`alone_readable`).
     ///
-    /// Нужен в двух случаях: **сплошной** архив (запись распаковывается только
-    /// из общего окна, накопленного предыдущими) и **разрезанный** файл
-    /// (склеивается из кусков в разных томах, и делает это обход набора).
-    /// Во всех прочих архивах записи независимы, и пропуск не стоит ничего.
-    fn needs_one_pass(&self) -> bool {
+    /// Второе основание для полного обхода — разрезанная между томами запись, —
+    /// спрашивается не здесь, а у оглавления (`Toc::any_split`): оно и так
+    /// перебирает всех членов всех томов, и второй такой перебор был бы вторым
+    /// ответом на тот же вопрос.
+    fn is_solid(&self) -> bool {
         match self {
-            Self::Rar13(v) => v.iter().any(|a| {
-                a.main.is_solid()
-                    || a.entries
-                        .iter()
-                        .any(|e| e.is_split_before() || e.is_split_after())
-            }),
-            Self::Rar15To40(v) => v.iter().any(|a| {
-                a.main.is_solid()
-                    || a.files()
-                        .any(|f| f.is_solid() || f.is_split_before() || f.is_split_after())
-            }),
-            Self::Rar50Plus(v) => v.iter().any(|a| {
-                a.main.is_solid()
-                    || a.files()
-                        .any(|f| f.is_split_before() || f.is_split_after() || rar50_solid(f))
-            }),
+            Self::Rar13(v) => v.iter().any(|a| a.main.is_solid()),
+            Self::Rar15To40(v) => v
+                .iter()
+                .any(|a| a.main.is_solid() || a.files().any(|f| f.is_solid())),
+            Self::Rar50Plus(v) => v
+                .iter()
+                .any(|a| a.main.is_solid() || a.files().any(rar50_solid)),
         }
     }
 
@@ -453,6 +487,8 @@ struct RarReader {
     entries: Vec<Entry>,
     places: Vec<Place>,
     one_pass: bool,
+    /// Архив сплошной: запись живёт только в общем окне предыдущих.
+    solid: bool,
 }
 
 impl ArchiveReader for RarReader {
@@ -517,31 +553,55 @@ impl RarReader {
     /// не доходит вовсе.
     fn read_each(&self, indices: &[usize], sink: &mut dyn EntrySink) -> Result<()> {
         for &idx in indices {
-            match sink.begin(idx)? {
-                SinkStep::Stop => return Ok(()),
-                SinkStep::Skip => continue,
-                SinkStep::Body => {}
+            if !self.deliver_one(idx, None, sink)? {
+                return Ok(());
             }
+        }
+        Ok(())
+    }
+
+    /// Одна запись приёмнику, от `begin` до `end`. `false` — приёмник просит
+    /// остановиться.
+    ///
+    /// `refusal` задан, когда исход известен заранее: запись, до которой обход
+    /// не дошёл, читать нечем, но сказать о ней приёмнику всё равно надо. Иначе
+    /// тело читается прямо здесь.
+    ///
+    /// Одно рукопожатие с приёмником на оба случая: у `read_each` и у добора
+    /// после аварии (`recover_rest`) оно одно и то же, а две копии договора
+    /// «что значит `Skip`, что значит `end → false`» разошлись бы.
+    fn deliver_one(
+        &self,
+        idx: usize,
+        refusal: Option<Error>,
+        sink: &mut dyn EntrySink,
+    ) -> Result<bool> {
+        match sink.begin(idx)? {
+            SinkStep::Stop => return Ok(false),
+            SinkStep::Skip => return Ok(true),
+            SinkStep::Body => {}
+        }
+        let outcome = match refusal {
+            Some(why) => Err(why),
             // У каталога и у ссылки тела нет: распаковщику такую запись не
             // отдают вовсе. Цель ссылки лежит в заголовке и уже прочитана в
             // оглавление.
-            let outcome = if matches!(
+            None if matches!(
                 self.entries[idx].kind,
                 EntryKind::Dir | EntryKind::Symlink { .. }
-            ) {
+            ) =>
+            {
                 Ok(())
-            } else {
+            }
+            None => {
                 let mut writer = SinkWriter::new(sink);
                 let wrote =
                     self.volumes
                         .write_member(self.places[idx], self.password_bytes(), &mut writer);
                 writer.outcome(wrote)
-            };
-            if !sink.end(idx, outcome)? {
-                return Ok(());
             }
-        }
-        Ok(())
+        };
+        sink.end(idx, outcome)
     }
 
     /// Сплошной архив или разрезанный файл: распаковщик идёт по архиву сам, от
@@ -552,29 +612,81 @@ impl RarReader {
     /// libunrar. На сплошном архиве это дорого (пропуск там означает
     /// распаковку), но дороже прежнего не будет: тот начинал сначала на
     /// **каждой** записи, а не на отказавшей.
+    ///
+    /// **Перезапуск спасает не всё, и это его предел.** Он идёт от начала
+    /// архива и потому снова упирается в ту же испорченную запись — только
+    /// теперь она уже отмечена, приписать отказ некому, и проход кончается
+    /// молча. Остаток списка добирается поштучно (`recover_rest`).
     fn one_pass_walk(&self, indices: &[usize], sink: &mut dyn EntrySink) -> Result<()> {
-        let mut walker = Walker::new(indices, sink);
-        loop {
-            let outcome = self.volumes.walk(self.password_bytes(), &mut walker);
-            if let Some(err) = walker.fatal.take() {
-                // Отказал приёмник — распаковку отменили или писать некуда.
-                // Это не беда архива, и остаток списка не отмечается.
-                return Err(err);
-            }
-            match outcome {
-                Ok(()) | Err(rars::Error::Cancelled) => break,
-                Err(e) => {
-                    if !walker.blame_open(map_err(e))? {
-                        break;
+        let mut broke_on = None;
+        let reached = {
+            let mut walker = Walker::new(indices, sink);
+            loop {
+                let outcome = self.volumes.walk(self.password_bytes(), &mut walker);
+                if let Some(err) = walker.fatal.take() {
+                    // Отказал приёмник — распаковку отменили или писать некуда.
+                    // Это не беда архива, и остаток списка не отмечается.
+                    return Err(err);
+                }
+                match outcome {
+                    Ok(()) | Err(rars::Error::Cancelled) => break,
+                    Err(e) => {
+                        // Причина запоминается видом, а не текстом: неверный
+                        // пароль, оборвавший обход, обязан остаться неверным
+                        // паролем и для записей, до которых обход не дошёл, —
+                        // иначе спросить пароль по ним будет уже нечем.
+                        broke_on = Some(e.clone());
+                        if !walker.blame_open(map_err(e))? {
+                            break;
+                        }
+                        if walker.stop || walker.exhausted() {
+                            break;
+                        }
+                        walker.pos = 0;
                     }
-                    if walker.stop || walker.exhausted() {
-                        break;
-                    }
-                    walker.pos = 0;
                 }
             }
+            walker.finish()?
+        };
+        self.recover_rest(&indices[reached..], broke_on.as_ref(), sink)
+    }
+
+    /// Записи, до которых проход не дошёл: прочитать поодиночке, если можно, а
+    /// иначе сказать правду о том, почему их нет.
+    ///
+    /// Одна испорченная запись сбивала **весь** остаток архива, хотя вне
+    /// сплошного архива соседи от неё не зависят: на многотомном наборе из
+    /// шести файлов с одним битым `unrar` спасал пять, а мы отдавали три.
+    /// Поштучное чтение — тот же путь, которым идёт несплошной архив всегда
+    /// (`read_each`), и цена ему возникает только после аварии.
+    ///
+    /// **Чего добрать нельзя, о том говорится прямо.** В сплошном архиве запись
+    /// распаковывается из окна, накопленного предыдущими, а разрезанная между
+    /// томами склеивается только обходом набора — по одной их не прочитать.
+    /// Прежде все они получали «rar: заголовки кончились на записи N», и это
+    /// была неправда: заголовки на месте, обход прекратился.
+    fn recover_rest(
+        &self,
+        rest: &[usize],
+        broke_on: Option<&rars::Error>,
+        sink: &mut dyn EntrySink,
+    ) -> Result<()> {
+        for &idx in rest {
+            let refusal = if self.alone_readable(idx) {
+                None
+            } else {
+                Some(not_reached(broke_on, idx))
+            };
+            if !self.deliver_one(idx, refusal, sink)? {
+                return Ok(());
+            }
         }
-        walker.finish()
+        Ok(())
+    }
+
+    /// Можно ли прочитать эту запись, не проходя по архиву целиком.
+    fn alone_readable(&self, idx: usize) -> bool {
+        !self.solid && !self.places[idx].split
     }
 }
 
@@ -724,33 +836,24 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// Проход кончился: дописать последнюю запись и отметить те, до которых он
-    /// так и не дошёл.
+    /// Проход кончился: дописать последнюю запись и сказать, сколько записей
+    /// списка он успел разобрать.
     ///
-    /// Виноват тут архив, а не вызывающий: номера пришли из `entries()`, а
-    /// заголовков под них не хватило. Поэтому `Corrupt`, а не `InvalidIndex`.
-    fn finish(&mut self) -> Result<()> {
+    /// Что делать с остальными — забота вызывающего: список у него свой, и там
+    /// же известно, читаются ли они поодиночке. Приёмника этот метод после
+    /// `close_open` больше не трогает, так что ходока можно уронить и взять
+    /// приёмник обратно.
+    fn finish(&mut self) -> Result<usize> {
         let _ = self.close_open(Ok(()));
         if let Some(e) = self.fatal.take() {
             return Err(e);
         }
-        if self.stop {
-            return Ok(());
-        }
-        while !self.exhausted() {
-            let idx = self.want[self.next];
-            self.next += 1;
-            match self.sink_begin(idx)? {
-                SinkStep::Stop => break,
-                SinkStep::Skip => continue,
-                SinkStep::Body => {}
-            }
-            let why = Error::Corrupt(format!("rar: заголовки кончились на записи {idx}"));
-            if !self.sink_end(idx, Err(why))? {
-                break;
-            }
-        }
-        Ok(())
+        // Приёмник просил остановиться — недошедших для него нет.
+        Ok(if self.stop {
+            self.want.len()
+        } else {
+            self.next
+        })
     }
 }
 
@@ -776,6 +879,29 @@ impl Write for BodyWriter<'_> {
 }
 
 // ── Ошибки ───────────────────────────────────────────────────────────────────
+
+/// Почему записи нет, если обход до неё не дошёл.
+///
+/// **Вид ошибки важнее её текста.** По виду вызывающий решает, спросить ли
+/// пароль, — поэтому обход, оборвавшийся на неверном пароле, оставляет неверный
+/// пароль и всем записям за ним. Заворачивать такое в `Corrupt` значило бы
+/// повторить дефект тикета 36, только на соседях: человек услышал бы «архив
+/// побит» там, где надо всего лишь исправить опечатку.
+///
+/// Пояснение приписывается только к поломке, где текст и есть весь смысл. А
+/// `None` — это не авария: обход дошёл до конца, но заголовков под запрошенные
+/// номера не хватило.
+fn not_reached(broke_on: Option<&rars::Error>, idx: usize) -> Error {
+    let Some(cause) = broke_on else {
+        return Error::Corrupt(format!("rar: заголовки кончились на записи {idx}"));
+    };
+    match map_err(cause.clone()) {
+        e @ (Error::WrongPassword | Error::Encrypted | Error::Unsupported { .. }) => e,
+        other => Error::Corrupt(format!(
+            "rar: обход архива прервался ({other}), до этой записи он не дошёл"
+        )),
+    }
+}
 
 /// Ошибка распаковщика — в нашу.
 ///

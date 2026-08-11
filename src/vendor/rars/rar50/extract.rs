@@ -283,11 +283,12 @@ impl FileHeader {
                         "RAR 5 encrypted stored file is shorter than unpacked size",
                     ));
                 }
-                if packed[unpacked_size..].iter().any(|&byte| byte != 0) {
-                    return Err(Error::InvalidHeader(
-                        "RAR 5 encrypted stored file has non-zero padding",
-                    ));
-                }
+                // NEWTUA (тикет 37): добивку до 16 байт молча отбрасываем.
+                // Апстрим требовал, чтобы она была нулевой, — формат этого не
+                // обещает, а `rar` 7.22 её ничем не заполняет: там остатки
+                // своего буфера. Отсюда и вид дефекта: первые записи архива
+                // выходили (буфер ещё чист), дальше сыпалось. Подробности и
+                // общий смысл трёх мест — у близнеца в `write_stored_to`.
                 return Ok(packed[..unpacked_size].to_vec());
             }
             if packed.len() as u64 != self.unpacked_size {
@@ -367,6 +368,23 @@ impl FileHeader {
         self.verify_streaming_integrity(crc, hash, keys)
     }
 
+    /// NEWTUA (тикет 37): у зашифрованной записи, сохранённой без сжатия, тело
+    /// дополнено до 16 байт, и добивка **отбрасывается молча**.
+    ///
+    /// Апстрим требовал, чтобы она была нулевой, и отбивал запись, если это не
+    /// так. Формат такого не обещает, а `rar` 7.22 добивку ничем не заполняет —
+    /// туда попадает то, что осталось в его буфере. Отсюда и вид дефекта:
+    /// первые записи архива выходили (буфер ещё чист), дальше сыпалось, а
+    /// человеку это читалось как «архив побит». `unrar` те же архивы читает
+    /// целиком; проверено на собранном для этого образце — 40 файлов из 40,
+    /// байт в байт. Условие «размер записи не кратен 16» и есть всё, что нужно:
+    /// ни томов, ни `-hp` дефект не требовал, вопреки первой редакции тикета.
+    ///
+    /// Пароль тут стережёт не добивка, а `check_value` записи шифрования
+    /// (`keys_from_encryption`), целостность — CRC32 и BLAKE2sp. Проверка
+    /// снята во **всех трёх** местах разом: буферизованном, потоковом и
+    /// разрезанном между томами — иначе пути RAR 5 начали бы принимать разные
+    /// архивы, а фаззер до третьего из них не достаёт.
     fn write_stored_to(
         &self,
         archive: &Archive,
@@ -376,57 +394,76 @@ impl FileHeader {
         let (mut reader, keys) = self
             .packed_reader_with_password(archive, password)
             .map_err(|error| self.entry_error("decoding", error))?;
-        let mut crc = Crc32::new();
-        let mut hash =
-            streaming_hash_verifier(self).map_err(|error| self.entry_error("decoding", error))?;
-        let mut written = 0u64;
-        let mut buf = [0u8; 64 * 1024];
-
-        loop {
-            let count = reader
-                .read(&mut buf)
-                .map_err(Error::from)
-                .map_err(|error| self.entry_error("decoding", error))?;
-            if count == 0 {
-                break;
-            }
-            let remaining =
-                usize::try_from(self.unpacked_size.saturating_sub(written)).unwrap_or(usize::MAX);
-            let chunk_len = count.min(remaining);
-            let chunk = &buf[..chunk_len];
-            if self.encrypted && buf[chunk_len..count].iter().any(|&byte| byte != 0) {
-                return Err(self.entry_error(
-                    "decoding",
-                    Error::InvalidHeader("RAR 5 encrypted stored file has non-zero padding"),
-                ));
-            }
-            written = written
-                .checked_add(chunk.len() as u64)
-                .ok_or(Error::InvalidHeader("RAR 5 stored size overflows"))
-                .map_err(|error| self.entry_error("decoding", error))?;
-            crc.update(chunk);
-            if let Some((_, hasher)) = &mut hash {
-                hasher.update(chunk);
-            }
-            writer
-                .write_all(chunk)
-                .map_err(Error::from)
-                .map_err(|error| self.entry_error("writing", error))?;
-        }
-
-        if written != self.unpacked_size {
-            return Err(self.entry_error(
-                "decoding",
-                Error::InvalidHeader("RAR 5 stored file has mismatched packed and unpacked sizes"),
-            ));
-        }
-        self.verify_streaming_integrity(crc, hash, keys.as_ref())
-            .map_err(|error| self.entry_error("verifying", error))
+        stream_stored_body(self, &mut reader, keys.as_ref(), writer)
     }
 
     fn entry_error(&self, operation: &'static str, error: Error) -> Error {
         error.at_entry(self.name.clone(), operation)
     }
+}
+
+/// NEWTUA (тикет 37): хранимое тело из потока приёмнику — **один** код на целую
+/// запись и на разрезанную между томами.
+///
+/// Различались они только источником потока, но копий было две, и они успели
+/// разойтись дважды: в правиле проверки целостности (и это стоило почти всего
+/// архива на `rar a -hp`) и в том, при каких записях отбрасывать добивку. Здесь
+/// же лежит и само правило добивки — третье место, где оно было записано.
+///
+/// **Добивка отбрасывается молча, какая бы ни была.** У зашифрованной записи
+/// тело дополнено до 16 байт; апстрим требовал, чтобы хвост был нулевым, а
+/// `rar` 7.22 его ничем не заполняет — там остатки его буфера. Обрезка по
+/// `unpacked_size` безусловна: у незашифрованной записи упакованный размер и
+/// так равен распакованному, так что отдельная ветка под неё только плодила бы
+/// второе правило.
+///
+/// Пароль здесь стережёт `check_value` записи шифрования, целостность — CRC32 и
+/// BLAKE2sp; добивка не стерегла ничего.
+fn stream_stored_body(
+    file: &FileHeader,
+    reader: &mut dyn Read,
+    keys: Option<&Rar50Keys>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let mut crc = Crc32::new();
+    let mut hash =
+        streaming_hash_verifier(file).map_err(|error| file.entry_error("decoding", error))?;
+    let mut written = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+
+    loop {
+        let count = reader
+            .read(&mut buf)
+            .map_err(Error::from)
+            .map_err(|error| file.entry_error("decoding", error))?;
+        if count == 0 {
+            break;
+        }
+        let remaining =
+            usize::try_from(file.unpacked_size.saturating_sub(written)).unwrap_or(usize::MAX);
+        let chunk = &buf[..count.min(remaining)];
+        written = written
+            .checked_add(chunk.len() as u64)
+            .ok_or(Error::InvalidHeader("RAR 5 stored size overflows"))
+            .map_err(|error| file.entry_error("decoding", error))?;
+        crc.update(chunk);
+        if let Some((_, hasher)) = &mut hash {
+            hasher.update(chunk);
+        }
+        writer
+            .write_all(chunk)
+            .map_err(Error::from)
+            .map_err(|error| file.entry_error("writing", error))?;
+    }
+
+    if written != file.unpacked_size {
+        return Err(file.entry_error(
+            "decoding",
+            Error::InvalidHeader("RAR 5 stored file has mismatched packed and unpacked sizes"),
+        ));
+    }
+    file.verify_streaming_integrity(crc, hash, keys)
+        .map_err(|error| file.entry_error("verifying", error))
 }
 
 fn write_repeated_chunk(
@@ -739,9 +776,10 @@ impl PendingSplitRefs {
         };
         let mut writer = open(&meta)?;
         if final_file.is_stored() {
-            return self
-                .write_stored_to(volumes, final_file, decryptor.as_ref(), &mut writer)
-                .map_err(|error| final_file.entry_error("extracting", error));
+            // Пометку операции ставит `stream_stored_body` — та же, что у целой
+            // записи. Второй обёртки здесь нет нарочно: она приписала бы к
+            // «при проверке записи X» ещё и «при распаковке записи X».
+            return self.write_stored_to(volumes, final_file, decryptor.as_ref(), &mut writer);
         }
 
         let data = session
@@ -757,6 +795,10 @@ impl PendingSplitRefs {
         Ok(())
     }
 
+    /// NEWTUA (тикет 37): своего цикла у разрезанной записи больше нет — тело
+    /// льётся тем же `stream_stored_body`, что и у целой. Здесь остаётся ровно
+    /// то, чем разрезанная запись отличается: поток склеен из кусков в разных
+    /// томах, а ключ и вектор взяты из заголовка первого куска.
     fn write_stored_to(
         &self,
         volumes: &[Archive],
@@ -765,71 +807,8 @@ impl PendingSplitRefs {
         writer: &mut dyn Write,
     ) -> Result<()> {
         let mut reader = self.fragment_reader(volumes, decryptor)?;
-        let mut crc = Crc32::new();
-        let mut hash = streaming_hash_verifier(final_file)?;
-        let mut written = 0u64;
-        let mut buf = [0u8; 64 * 1024];
-
-        loop {
-            let count = reader.read(&mut buf)?;
-            if count == 0 {
-                break;
-            }
-            let chunk = if final_file.encrypted {
-                let remaining = usize::try_from(final_file.unpacked_size.saturating_sub(written))
-                    .unwrap_or(usize::MAX);
-                let chunk_len = count.min(remaining);
-                if buf[chunk_len..count].iter().any(|&byte| byte != 0) {
-                    return Err(Error::InvalidHeader(
-                        "RAR 5 encrypted stored split file has non-zero padding",
-                    ));
-                }
-                &buf[..chunk_len]
-            } else {
-                &buf[..count]
-            };
-            written = written
-                .checked_add(chunk.len() as u64)
-                .ok_or(Error::InvalidHeader("RAR 5 stored split size overflows"))?;
-            crc.update(chunk);
-            if let Some((_, hasher)) = &mut hash {
-                hasher.update(chunk);
-            }
-            writer.write_all(chunk)?;
-        }
-
-        if written != final_file.unpacked_size {
-            return Err(Error::InvalidHeader(
-                "RAR 5 stored split file has mismatched packed and unpacked sizes",
-            ));
-        }
-        if let Some(expected) = final_file.data_crc32 {
-            let actual = if final_file.encrypted {
-                let decryptor = decryptor.ok_or(Error::InvalidHeader(
-                    "RAR 5 encrypted split CRC needs encryption keys",
-                ))?;
-                decryptor.keys.mac_crc32(crc.finish())
-            } else {
-                crc.finish()
-            };
-            if actual != expected {
-                return Err(Error::Crc32Mismatch { expected, actual });
-            }
-        }
-        if let Some((expected, hasher)) = hash {
-            let actual = if final_file.encrypted {
-                let decryptor = decryptor.ok_or(Error::InvalidHeader(
-                    "RAR 5 encrypted split hash needs encryption keys",
-                ))?;
-                decryptor.keys.mac_hash32(hasher.finalize())
-            } else {
-                hasher.finalize()
-            };
-            if !constant_time_eq(&expected, &actual) {
-                return Err(Error::HashMismatch { hash_type: 0 });
-            }
-        }
-        Ok(())
+        let keys = decryptor.map(|decryptor| &decryptor.keys);
+        stream_stored_body(final_file, &mut reader, keys, writer)
     }
 
     fn split_decryptor(
@@ -1110,8 +1089,15 @@ mod tests {
         assert_eq!(crc.finish(), expected);
     }
 
+    /// NEWTUA (тикет 37): добивка отбрасывается, какая бы ни была.
+    ///
+    /// Тест перевёрнут нарочно. Апстрим требовал здесь нулевой добивки и
+    /// отбивал запись, если это не так; `rar` 7.22 её ничем не заполняет, и
+    /// требование стоило нам почти всего архива на образце, который `unrar`
+    /// читает целиком. Ждём того же ответа на оба входа — они отличаются
+    /// только выброшенными байтами.
     #[test]
-    fn encrypted_stored_decode_rejects_nonzero_discarded_padding() {
+    fn encrypted_stored_decode_discards_padding_whatever_it_holds() {
         let mut file = plain_file(b"secret.txt", b"secret", None);
         file.encrypted = true;
         file.unpacked_size = 6;
@@ -1122,12 +1108,11 @@ mod tests {
                 .unwrap(),
             b"secret"
         );
-        assert!(matches!(
-            file.decode_packed_with_decoder_mode(b"secret\0\x01", &mut decoder, DecodeMode::Lz),
-            Err(Error::InvalidHeader(
-                "RAR 5 encrypted stored file has non-zero padding"
-            ))
-        ));
+        assert_eq!(
+            file.decode_packed_with_decoder_mode(b"secret\xa7\x01", &mut decoder, DecodeMode::Lz)
+                .unwrap(),
+            b"secret"
+        );
     }
 
     #[test]
@@ -1416,6 +1401,20 @@ mod tests {
         }
     }
 
+    /// Причина под обёртками «в записи такой-то» и «по смещению такому-то».
+    ///
+    /// NEWTUA (тикет 37): с тех пор как хранимое тело льётся одним кодом
+    /// (`stream_stored_body`), путь разрезанной записи метит свои ошибки именем
+    /// записи так же, как и путь целой, — а раньше получал пометку снаружи. Так
+    /// же разбирает их и `format/rar.rs`, решая, спросить пароль или доложить о
+    /// поломке: вид причины важнее обёртки.
+    fn cause(error: &Error) -> &Error {
+        match error {
+            Error::AtEntry { source, .. } | Error::AtArchiveOffset { source, .. } => cause(source),
+            other => other,
+        }
+    }
+
     fn split_fragment_file(name: &[u8], hfl_flags: u64) -> FileHeader {
         FileHeader {
             block: empty_block(HEAD_FILE, hfl_flags, 0..0),
@@ -1569,7 +1568,7 @@ mod tests {
             .write_stored_to(&volumes, &final_file, None, &mut out)
             .unwrap_err();
         assert!(
-            matches!(err, Error::InvalidHeader(msg) if msg.contains("mismatched packed and unpacked")),
+            matches!(cause(&err), Error::InvalidHeader(msg) if msg.contains("mismatched packed and unpacked")),
             "expected size mismatch error, got {err:?}"
         );
     }
@@ -1594,7 +1593,7 @@ mod tests {
             .write_stored_to(&volumes, &final_file, None, &mut out)
             .unwrap_err();
         assert!(
-            matches!(err, Error::Crc32Mismatch { .. }),
+            matches!(cause(&err), Error::Crc32Mismatch { .. }),
             "expected CRC mismatch, got {err:?}"
         );
     }
@@ -1626,7 +1625,7 @@ mod tests {
             .write_stored_to(&volumes, &final_file, None, &mut out)
             .unwrap_err();
         assert!(
-            matches!(err, Error::HashMismatch { hash_type: 0 }),
+            matches!(cause(&err), Error::HashMismatch { hash_type: 0 }),
             "expected hash mismatch, got {err:?}"
         );
     }
