@@ -81,7 +81,13 @@ fn parse_set(first: &Path, password: Option<&str>) -> Result<Vec<rars::Archive>>
     }
     let mut archives = vec![head];
     for path in sibling_volumes(first) {
-        archives.push(parse_one(&path, password)?);
+        let mut volume = parse_one(&path, password)?;
+        // Пароль у набора один, соль тоже, а тома разбираются по одному и
+        // каждый заводит свою ячейку под выведенный ключ. Без этой строки
+        // набор из 42 томов выводил ключ 42 раза — 246 мс там, где хватает
+        // одного вывода.
+        volume.share_key_cache_with(&archives[0]);
+        archives.push(volume);
     }
     Ok(archives)
 }

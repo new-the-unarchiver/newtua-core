@@ -343,6 +343,12 @@ impl Archive {
         self.source.range_reader(range)
     }
 
+    /// NEWTUA: см. `Archive::share_key_cache_with` в `mod.rs` — один вывод
+    /// ключа на набор томов, а не на том.
+    pub(crate) fn share_key_cache_with(&mut self, first: &Self) {
+        self.key_cache = first.key_cache.clone();
+    }
+
     pub fn files(&self) -> impl Iterator<Item = &FileHeader> {
         self.blocks.iter().filter_map(|block| match block {
             Block::File(file) => Some(file),
@@ -638,6 +644,36 @@ fn parse_archive_encryption_header(
     Ok(keys)
 }
 
+/// Ключ записи по её записи шифрования: проверить версию, вывести (или взять из
+/// кэша), сверить пароль.
+///
+/// NEWTUA: одно место на два пути. Правило приёма зашифрованной записи нужно и
+/// разбору (`attach_file_crypto`), и распаковке
+/// (`extract.rs`, `crypto_with_password`), а лежало оно там двумя копиями —
+/// тикет 33 чуть не развёл их окончательно, протащив кэш в обе. Разойдись они,
+/// разбор и распаковка стали бы принимать разные архивы.
+pub(super) fn keys_from_encryption(
+    encryption: &FileEncryption,
+    password: &[u8],
+    key_cache: &Rar50KeyCache,
+) -> Result<Rar50Keys> {
+    if encryption.version != 0 {
+        return Err(Error::UnsupportedFeature {
+            version: crate::vendor::rars::version::ArchiveVersion::Rar50,
+            feature: "RAR 5 unknown file encryption version",
+        });
+    }
+    // NEWTUA (тикет 33): через кэш. Иначе ключ выводился заново на каждую
+    // запись при распаковке и на каждый заголовок при разборе архива с
+    // зашифрованными заголовками (`rar a -hp`).
+    let keys = key_cache.derive(password, encryption.salt, encryption.kdf_count)?;
+    if let Some(check_value) = encryption.check_value {
+        keys.check_password(&check_value)
+            .map_err(map_rar50_crypto_error)?;
+    }
+    Ok(keys)
+}
+
 fn attach_file_crypto(
     file: &mut FileHeader,
     password: Option<&[u8]>,
@@ -652,20 +688,7 @@ fn attach_file_crypto(
     let encryption = file.encryption.as_ref().ok_or(Error::InvalidHeader(
         "RAR 5 encrypted file is missing encryption record",
     ))?;
-    if encryption.version != 0 {
-        return Err(Error::UnsupportedFeature {
-            version: crate::vendor::rars::version::ArchiveVersion::Rar50,
-            feature: "RAR 5 unknown file encryption version",
-        });
-    }
-    // NEWTUA (тикет 33): через кэш. Разбор архива с зашифрованными заголовками
-    // (`rar a -hp`) выводил ключ на каждый заголовок — та же болезнь, что и на
-    // распаковке, только в разборе.
-    let keys = key_cache.derive(password, encryption.salt, encryption.kdf_count)?;
-    if let Some(check_value) = encryption.check_value {
-        keys.check_password(&check_value)
-            .map_err(map_rar50_crypto_error)?;
-    }
+    let keys = keys_from_encryption(encryption, password, key_cache)?;
     file.crypto = Some(FileCryptoState {
         keys,
         iv: encryption.iv,

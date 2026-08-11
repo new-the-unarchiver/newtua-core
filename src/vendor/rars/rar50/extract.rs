@@ -44,22 +44,12 @@ impl FileHeader {
         let encryption = self.encryption.as_ref().ok_or(Error::InvalidHeader(
             "RAR 5 encrypted file is missing encryption record",
         ))?;
-        if encryption.version != 0 {
-            return Err(Error::UnsupportedFeature {
-                version: crate::vendor::rars::version::ArchiveVersion::Rar50,
-                feature: "RAR 5 unknown file encryption version",
-            });
-        }
-        // NEWTUA (тикет 33): ключ выводится один раз на архив, а не на запись.
+        // Правило приёма и вывод ключа — общие с разбором (`rar50.rs`).
         // Оглавление читается сперва без пароля (`format/rar.rs`), поэтому
-        // `self.crypto` выше почти всегда пуст, и до кэша дело доходило каждый
-        // раз заново.
-        let keys = key_cache.derive(password, encryption.salt, encryption.kdf_count)?;
-        if let Some(check_value) = encryption.check_value {
-            keys.check_password(&check_value)
-                .map_err(super::map_rar50_crypto_error)?;
-        }
-        Ok(Some(keys))
+        // `self.crypto` выше почти всегда пуст, и сюда доходит каждая запись.
+        Ok(Some(super::keys_from_encryption(
+            encryption, password, key_cache,
+        )?))
     }
 
     fn encryption_iv(&self) -> Result<[u8; 16]> {

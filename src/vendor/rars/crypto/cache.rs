@@ -39,8 +39,12 @@ struct Cached<K, V> {
 }
 
 impl<K, V> Clone for DerivedSecretCache<K, V> {
-    /// Копии архива делят одну ячейку — это и нужно: копия описывает тот же
-    /// архив с тем же паролем.
+    /// Копия делит ячейку с исходником, а не заводит свою. На этом держится
+    /// «один вывод ключа на набор томов»: тома — отдельные `Archive`, и ячейку
+    /// им раздаёт `format/rar.rs`, `parse_set`.
+    ///
+    /// Написано руками, а не выведено: `#[derive(Clone)]` потребовал бы
+    /// `K: Clone, V: Clone`, которых копированию `Arc` не нужно.
     fn clone(&self) -> Self {
         Self {
             entry: Arc::clone(&self.entry),
@@ -63,7 +67,7 @@ impl<K, V> std::fmt::Debug for DerivedSecretCache<K, V> {
     }
 }
 
-impl<K: PartialEq + Clone, V: Clone> DerivedSecretCache<K, V> {
+impl<K: PartialEq, V: Clone> DerivedSecretCache<K, V> {
     /// Отдаёт запомненный секрет или выводит новый через `derive`.
     ///
     /// Проверка пароля (`check_value` у RAR 5) остаётся заботой вызывающего и
@@ -95,14 +99,11 @@ impl<K: PartialEq + Clone, V: Clone> DerivedSecretCache<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     /// Счётчик выводов — то же прямое доказательство, каким дефект и был найден:
     /// не «стало быстрее», а «работа сделана один раз».
-    fn counting_cache() -> (DerivedSecretCache<(u8, u8), String>, std::cell::Cell<usize>) {
-        (DerivedSecretCache::default(), std::cell::Cell::new(0))
-    }
-
-    fn derive(calls: &std::cell::Cell<usize>, password: &[u8], params: (u8, u8)) -> String {
+    fn derive(calls: &Cell<usize>, password: &[u8], params: (u8, u8)) -> String {
         calls.set(calls.get() + 1);
         format!(
             "{}-{}-{}",
@@ -113,22 +114,9 @@ mod tests {
     }
 
     #[test]
-    fn second_call_with_the_same_password_and_params_does_not_derive() {
-        let (cache, calls) = counting_cache();
-        let first = cache
-            .get_or_derive::<()>(b"pw", (1, 2), || Ok(derive(&calls, b"pw", (1, 2))))
-            .unwrap();
-        let again = cache
-            .get_or_derive::<()>(b"pw", (1, 2), || Ok(derive(&calls, b"pw", (1, 2))))
-            .unwrap();
-
-        assert_eq!(first, again);
-        assert_eq!(calls.get(), 1, "второй раз выводить было незачем");
-    }
-
-    #[test]
     fn any_difference_in_the_key_derives_again() {
-        let (cache, calls) = counting_cache();
+        let cache = DerivedSecretCache::<(u8, u8), String>::default();
+        let calls = Cell::new(0);
         cache
             .get_or_derive::<()>(b"pw", (1, 2), || Ok(derive(&calls, b"pw", (1, 2))))
             .unwrap();
@@ -153,9 +141,10 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_derivation_leaves_the_cell_alone() {
-        let (cache, calls) = counting_cache();
-        cache
+    fn a_hit_does_not_derive_and_a_failed_derivation_leaves_the_cell_alone() {
+        let cache = DerivedSecretCache::<(u8, u8), String>::default();
+        let calls = Cell::new(0);
+        let first = cache
             .get_or_derive::<()>(b"pw", (1, 2), || Ok(derive(&calls, b"pw", (1, 2))))
             .unwrap();
         assert!(
@@ -164,11 +153,31 @@ mod tests {
                 .is_err()
         );
 
-        // Ошибка не должна ни затереть годную ячейку, ни запомниться сама.
+        // Ошибка не должна ни затереть годную ячейку, ни запомниться сама, а
+        // попадание в неё — не считать заново.
         let hit = cache
             .get_or_derive::<()>(b"pw", (1, 2), || Ok(derive(&calls, b"pw", (1, 2))))
             .unwrap();
-        assert_eq!(hit, "pw-1-2");
-        assert_eq!(calls.get(), 1);
+        assert_eq!(hit, first);
+        assert_eq!(calls.get(), 1, "второй раз выводить было незачем");
+    }
+
+    #[test]
+    fn a_clone_shares_the_cell_with_its_source() {
+        // На этом стоит «один вывод на набор томов»: том получает копию ячейки
+        // первого тома, а не пустую свою.
+        let cache = DerivedSecretCache::<(u8, u8), String>::default();
+        let calls = Cell::new(0);
+        let volume = cache.clone();
+
+        cache
+            .get_or_derive::<()>(b"pw", (1, 2), || Ok(derive(&calls, b"pw", (1, 2))))
+            .unwrap();
+        let from_clone = volume
+            .get_or_derive::<()>(b"pw", (1, 2), || Ok(derive(&calls, b"pw", (1, 2))))
+            .unwrap();
+
+        assert_eq!(from_clone, "pw-1-2");
+        assert_eq!(calls.get(), 1, "копия ячейки обязана делить содержимое");
     }
 }

@@ -69,6 +69,22 @@ pub struct Archive {
     key_cache: Rar30CipherCache,
 }
 
+/// NEWTUA (тикет 35): выведенный шифр RAR 3, запомненный на весь архив.
+///
+/// Вывод ключа здесь — 262 144 раунда SHA-1 (`HASH_ROUNDS` в `crypto/rar30.rs`),
+/// то есть дороже, чем у RAR 5. Раньше кэш был только у заголовков; тела
+/// записей выводили ключ каждое своё, хотя WinRAR пишет одну соль на архив
+/// (измерено на трёх образцах RAR 4 — тикет 35 §2).
+///
+/// Ячейка хранит **нетронутый** шифр, а наружу отдаёт копию: `Rar30Cipher`
+/// сцепляет блоки и по ходу расшифровки меняет свой вектор, так что общий на
+/// всех он был бы порчей. Копия — это копия развёрнутого ключа AES, около
+/// двухсот байт.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Rar30CipherCache {
+    inner: DerivedSecretCache<Option<[u8; 8]>, Rar30Cipher>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MainHeader {
@@ -645,6 +661,12 @@ impl Archive {
         self.source.range_reader(range)
     }
 
+    /// NEWTUA: см. `Archive::share_key_cache_with` в `mod.rs` — один вывод
+    /// ключа на набор томов, а не на том.
+    pub(crate) fn share_key_cache_with(&mut self, first: &Self) {
+        self.key_cache = first.key_cache.clone();
+    }
+
     pub fn files(&self) -> impl Iterator<Item = &FileHeader> {
         self.blocks.iter().filter_map(|block| match block {
             Block::File(file) => Some(file),
@@ -758,22 +780,6 @@ struct EncryptedHeader {
     block: BlockHeader,
     header: Vec<u8>,
     total_size: usize,
-}
-
-/// NEWTUA (тикет 35): выведенный шифр RAR 3, запомненный на весь архив.
-///
-/// Вывод ключа здесь — 262 144 раунда SHA-1 (`HASH_ROUNDS` в `crypto/rar30.rs`),
-/// то есть дороже, чем у RAR 5. Раньше кэш был только у заголовков; тела
-/// записей выводили ключ каждое своё, хотя WinRAR пишет одну соль на архив
-/// (измерено на трёх образцах RAR 4 — тикет 35 §2).
-///
-/// Ячейка хранит **нетронутый** шифр, а наружу отдаёт копию: `Rar30Cipher`
-/// сцепляет блоки и по ходу расшифровки меняет свой вектор, так что общий на
-/// всех он был бы порчей. Копия — это копия развёрнутого ключа AES, около
-/// двухсот байт.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct Rar30CipherCache {
-    inner: DerivedSecretCache<Option<[u8; 8]>, Rar30Cipher>,
 }
 
 impl Rar30CipherCache {

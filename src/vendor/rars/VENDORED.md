@@ -418,6 +418,30 @@ line. No archive of thousands of encrypted RAR 4 members exists to measure — `
 7.22 cannot write RAR 4 at all — so the proof here is the derivation count, not
 seconds.
 
+### What `/simplify` found after tickets 33 and 35
+
+**The cache was per volume, not per volume set.** Volumes are parsed one at a
+time, each `Archive` starting with its own empty cell, while the password and the
+salt belong to the whole set — so a 43-volume encrypted set derived the key 43
+times. Measured, paired, our own two builds: **0.1885 s → 0.0074 s**. Single
+volume archives are untouched (×1.00, ×1.00, ×0.98 on the three controls), and
+the extracted tree still matches `unar` byte for byte on the 43-volume set.
+
+The cell is shared by `Archive::share_key_cache_with` (`mod.rs`), handed out in
+`format/rar.rs`'s `parse_set` — the cache is `Arc` inside, so "share" is a
+pointer copy. That also removed the need for `fragment_reader` to *choose* a
+volume to take the cache from: any volume's cell is the same cell now.
+
+Two more from the same pass:
+
+- **The rule for accepting an encrypted RAR 5 member was written twice** — once
+  in parsing (`attach_file_crypto`) and once in extraction
+  (`crypto_with_password`), about twenty lines each, and the key cache had just
+  been threaded through both. `keys_from_encryption` is now the one place, for
+  the same reason the filter rules are: two copies of an acceptance rule mean
+  parsing and extraction can come to accept different archives.
+- `K: Clone` was required by the cache and used by nothing.
+
 ## Tests
 
 **Every unit test inside `src/` came along** — codecs, crypto, headers, CRC,

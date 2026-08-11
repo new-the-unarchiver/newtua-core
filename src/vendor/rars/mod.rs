@@ -67,6 +67,29 @@ pub enum Archive {
     Rar50Plus(rar50::Archive),
 }
 
+impl Archive {
+    /// NEWTUA: том перенимает ячейку выведенного ключа у первого тома набора.
+    ///
+    /// Тома разбираются по одному и каждый заводит свою ячейку, а пароль и соль
+    /// у набора общие — без этого набор из 42 томов выводил ключ 42 раза
+    /// (246 мс против 55 мс на замере). Ячейка делится через `Arc`, так что
+    /// «перенять» — это скопировать указатель.
+    ///
+    /// Разные поколения формата в одном наборе невозможны, и такая пара просто
+    /// ничего не делает: у RAR 1.3 ячейки нет вовсе — его шифр это три байта.
+    pub(crate) fn share_key_cache_with(&mut self, first: &Self) {
+        match (self, first) {
+            (Self::Rar15To40(volume), Self::Rar15To40(first)) => {
+                volume.share_key_cache_with(first);
+            }
+            (Self::Rar50Plus(volume), Self::Rar50Plus(first)) => {
+                volume.share_key_cache_with(first);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 /// Common member view plus family-specific detail.

@@ -433,10 +433,15 @@ impl PendingSplitRefs {
         password: Option<&[u8]>,
     ) -> Result<Box<dyn Read + 'a>> {
         let mut readers = Vec::with_capacity(self.fragments.len());
+        // Ячейка ключа берётся у любого тома набора — они её делят
+        // (`Archive::share_key_cache_with`), — поэтому здесь просто первый
+        // попавшийся, а не ещё один поиск по `volumes`.
+        let mut key_cache = None;
         for &(volume_index, file_index) in &self.fragments {
             let archive = volumes
                 .get(volume_index)
                 .ok_or(Error::InvalidHeader("RAR 1.5 split volume is missing"))?;
+            key_cache.get_or_insert(&archive.key_cache);
             let file = archive
                 .files()
                 .nth(file_index)
@@ -451,19 +456,14 @@ impl PendingSplitRefs {
         let Some(password) = password else {
             return Err(Error::NeedPassword);
         };
-        // Кэш берётся у первого тома набора: у каждого тома он свой, и вывод
-        // ключа всё равно случится один раз на том, а не на запись.
-        let cache_owner = self
-            .fragments
-            .first()
-            .and_then(|&(volume_index, _)| volumes.get(volume_index))
-            .ok_or(Error::InvalidHeader("RAR 1.5 split volume is missing"))?;
+        let key_cache =
+            key_cache.ok_or(Error::InvalidHeader("RAR 1.5 split entry has no fragments"))?;
         Ok(Box::new(DecryptingReader::new(
             reader,
             self.unp_ver,
             password,
             self.salt,
-            &cache_owner.key_cache,
+            key_cache,
         )?))
     }
 }
