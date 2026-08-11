@@ -154,7 +154,8 @@ handed the files to you with today's date and default permissions.
   was paying it for every single file, although one archive uses one key
   throughout. A folder of 4000 small files under a password took **17 seconds**
   where the same archive without one took 0.03 s; with the names encrypted too
-  (`rar -hp`) it took **20 seconds**. The key is derived once per archive now:
+  (`rar -hp`) it took **20 seconds**. The key is derived once per archive — once
+  per *set*, if the archive is split into volumes — now:
   both take about **0.03 s**, which is five times faster than libunrar on the
   first and ten times on the second. An archive that really does use a different
   salt per file still gets a fresh key for each — the wrong key would produce
