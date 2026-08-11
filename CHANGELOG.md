@@ -171,6 +171,38 @@ handed the files to you with today's date and default permissions.
   twice as fast** (×1.07 → ×0.44 and ×0.73 → ×0.36). An archive that really does
   vary the salt still gets a key per salt. Verified against `unar` byte for byte
   on eight encrypted RAR 3/4 archives.
+- **A password-protected RAR stored without compression (`rar -m0`) lost most of
+  its files.** Any file whose size was not a multiple of 16 could be refused as
+  a broken archive: encryption pads the last block, and the engine demanded that
+  the discarded padding be zero, which RAR never promised and does not do. A
+  single archive of 40 files came out as 4. All 40 come out now, byte for byte
+  with `unrar` and with the files the archive was built from.
+- **A file split across the volumes of a RAR whose names are encrypted
+  (`rar -hp`) was reported as corrupt.** Its bytes were right the whole time;
+  the check was wrong — split files were verified by a different rule than
+  whole ones. On a 44-volume archive of 200 files, 5 came out; all 200 come out
+  now. The two paths share one verification, so they cannot drift apart again.
+- **A wrong password on a RAR 3 or 4 archive whose names are encrypted now says
+  so.** It used to report `input is too short` — an archive that looks
+  truncated — sending you to re-download a file that was never damaged. It now
+  reports an incorrect password, as RAR 5 always has. RAR 3 stores nothing that
+  can tell a wrong password from real corruption, so a genuinely damaged archive
+  of that vintage reports the password too; `unrar` blames the password there as
+  well.
+- **Opening a split archive whose names are encrypted no longer pays for the
+  password once per volume.** Turning a password into a key is deliberately
+  expensive, and a 44-volume set was doing it 44 times because the key is what
+  makes each volume's names readable. Opening such a set went from 734 ms to
+  146 ms; sets without encrypted names were already paying once and are
+  unchanged.
+- **One damaged file inside a RAR no longer takes the rest of the archive with
+  it.** A checksum failure ended the walk, and every file after it was reported
+  as "the headers ran out" — which was not true, and told you nothing you could
+  act on. Files that do not depend on the damaged one are now read individually:
+  on a damaged six-file split archive, four come out intact where three used to.
+  The ones that genuinely cannot be recovered — a file split across a volume
+  boundary, or any file in a solid archive — now say what actually happened.
+  `unrar` still recovers one more file from that archive than we do.
 
 ### Other
 
