@@ -240,11 +240,9 @@ where
                         } else {
                             session.write_file_to(archive, file, &mut writer)
                         };
-                        if let Err(error) =
-                            wrote.map_err(|error| file.entry_error("extracting", error))
-                        {
-                            resume(error)?;
-                        }
+                        wrote
+                            .map_err(|error| file.entry_error("extracting", error))
+                            .or_else(&mut *resume)?;
                     }
                 }
                 SplitVolumeStep::Start => {
@@ -258,11 +256,9 @@ where
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
                     completed.append(file, volume_index, file_index);
-                    if let Err(error) =
-                        completed.write_to(volumes, file, password, &mut session, &mut open)
-                    {
-                        resume(error)?;
-                    }
+                    completed
+                        .write_to(volumes, file, password, &mut session, &mut open)
+                        .or_else(&mut *resume)?;
                 }
                 SplitVolumeStep::MissingFirst => {
                     return Err(Error::InvalidHeader(

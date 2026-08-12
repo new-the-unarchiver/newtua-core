@@ -776,6 +776,13 @@ impl<'a> Walker<'a> {
         self.next >= self.want.len()
     }
 
+    /// Обходу дальше идти не за чем: список исчерпан или приёмник просил стоп.
+    /// Спрашивают двое — начало очередной записи и отказ тела, — и ответ у них
+    /// обязан быть один.
+    fn nothing_more_wanted(&self) -> bool {
+        self.stop || self.exhausted()
+    }
+
     /// Очередная запись прохода: нужна ли она и куда писать её тело.
     fn open_body(&mut self) -> rars::Result<Box<dyn Write + 'a>> {
         if self.begin_next()? {
@@ -795,7 +802,7 @@ impl<'a> Walker<'a> {
 
     fn begin_next(&mut self) -> rars::Result<bool> {
         self.close_open(Ok(()))?;
-        if self.stop || self.exhausted() {
+        if self.nothing_more_wanted() {
             return Err(rars::Error::Cancelled);
         }
         let pos = self.pos;
@@ -854,13 +861,12 @@ impl<'a> Walker<'a> {
     /// поодиночке не собрать вовсе (остаток G14).
     ///
     /// Открытой записи может и не быть: испортилось тело того, чего не просили.
-    /// Приписывать некому и незачем — обход просто идёт дальше.
+    /// Приписывать некому и незачем — `close_open` в этом случае ничего не
+    /// делает, и обход просто идёт дальше.
     fn body_failed(&mut self, err: Error) -> rars::Result<()> {
-        if self.open.is_some() {
-            self.close_open(Err(err))?;
-        }
-        // Список исчерпан — дальше идти не за чем, и это не авария.
-        if self.stop || self.exhausted() {
+        self.close_open(Err(err))?;
+        // Дальше идти не за чем — и это не авария.
+        if self.nothing_more_wanted() {
             return Err(rars::Error::Cancelled);
         }
         Ok(())

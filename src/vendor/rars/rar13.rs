@@ -476,7 +476,7 @@ where
                 let mut writer = open(&meta)?;
                 // NEWTUA: неудача тела — вопрос к вызывающему, а не приговор
                 // остатку набора (см. договор у этой функции выше).
-                if let Err(error) = entry
+                entry
                     .write_compressed_to(
                         archive,
                         password,
@@ -485,9 +485,7 @@ where
                         &mut writer,
                     )
                     .map_err(|error| entry.entry_error("extracting", error))
-                {
-                    resume(error)?;
-                }
+                    .or_else(&mut *resume)?;
                 extracted_count += 1;
                 continue;
             }
@@ -507,12 +505,10 @@ where
                     current.append(entry, volume_index, entry_index)?;
                     let completed = pending.take().expect("pending split");
                     let solid = archive.main.is_solid() && extracted_count != 0;
-                    if let Err(error) = completed
+                    completed
                         .write_to(volumes, entry, password, &mut unpack15, solid, &mut open)
                         .map_err(|error| entry.entry_error("extracting", error))
-                    {
-                        resume(error)?;
-                    }
+                        .or_else(&mut *resume)?;
                     extracted_count += 1;
                 }
                 _ => {
@@ -615,7 +611,7 @@ impl PendingSplitRefs {
     }
 
     fn write_to<'w, F>(
-        self,
+        mut self,
         volumes: &[Archive],
         final_entry: &Entry,
         password: Option<&[u8]>,
@@ -630,7 +626,10 @@ impl PendingSplitRefs {
         // отказ склейки пришёлся бы на предыдущую запись: приёмнику о конце тела
         // никто не сообщает, и до следующего `open` открытой у него числится она.
         let meta = ExtractedEntryMeta {
-            name: self.name.clone(),
+            // Имя забирается, а не копируется: `fragment_reader` ниже смотрит
+            // только на `fragments`, и заём всей структуры ему нужен как раз
+            // после того, как имя отсюда ушло.
+            name: std::mem::take(&mut self.name),
             file_time: self.file_time,
             file_attr: self.file_attr,
             is_directory: false,

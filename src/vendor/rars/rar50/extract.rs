@@ -666,9 +666,9 @@ where
                         // NEWTUA: неудача тела — вопрос к вызывающему, а не
                         // приговор остатку набора (см.
                         // `rar13::extract_volumes_to`).
-                        if let Err(error) = session.write_file_to(archive, file, &mut writer) {
-                            resume(error)?;
-                        }
+                        session
+                            .write_file_to(archive, file, &mut writer)
+                            .or_else(&mut *resume)?;
                     }
                 }
                 SplitVolumeStep::Start => {
@@ -682,10 +682,9 @@ where
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
                     completed.append(volume_index, file_index);
-                    if let Err(error) = completed.write_to(volumes, file, &mut session, &mut *open)
-                    {
-                        resume(error)?;
-                    }
+                    completed
+                        .write_to(volumes, file, &mut session, &mut *open)
+                        .or_else(&mut *resume)?;
                 }
                 SplitVolumeStep::MissingFirst => {
                     return Err(Error::InvalidHeader(
