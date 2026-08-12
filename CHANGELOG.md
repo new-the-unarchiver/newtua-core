@@ -120,10 +120,10 @@ handed the files to you with today's date and default permissions.
   smaller machine meant swapping or the system killing the process outright. The
   body now reaches disk as it is decompressed: on a 700 MB file inside a solid
   archive the peak went from 863 MB to 114 MB, and that 114 MB is the archive's
-  dictionary, so a file of any size costs the same. A member under 512 MiB is
-  still decoded in one piece, but it too got lighter — a 300 MB one went from
+  dictionary, so a file of any size costs the same. Small members are still
+  decoded in one piece, and they got lighter too — a 300 MB one went from
   751 MB to 414 MB, and a 196 MB executable, where RAR's filters actually run,
-  from 502 MB to 272 MB.
+  from 502 MB to 272 MB. (Both figures fell further still — see below.)
 - **A solid RAR of many small files no longer gets slower the more files it
   holds.** This is the commonest shape a RAR comes in — a folder of thousands of
   small files packed as one stream — and the wait used to grow faster than the
