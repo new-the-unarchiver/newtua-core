@@ -198,11 +198,15 @@ handed the files to you with today's date and default permissions.
 - **One damaged file inside a RAR no longer takes the rest of the archive with
   it.** A checksum failure ended the walk, and every file after it was reported
   as "the headers ran out" — which was not true, and told you nothing you could
-  act on. Files that do not depend on the damaged one are now read individually:
-  on a damaged six-file split archive, four come out intact where three used to.
-  The ones that genuinely cannot be recovered — a file split across a volume
-  boundary, or any file in a solid archive — now say what actually happened.
-  `unrar` still recovers one more file from that archive than we do.
+  act on. The walk now carries on past the damaged file, so its neighbours come
+  out — including a file split across a volume boundary, which exists only
+  inside that walk and cannot be read on its own. On a damaged six-file split
+  archive, five files come out intact where three used to: the same five
+  `unrar` recovers, byte for byte, with the failure reported against the one
+  file that is actually broken. A solid archive is the exception and says so:
+  there every file is decoded out of the window its predecessors filled, so
+  after damage there is nothing trustworthy left to continue with — `unrar`
+  finds every file of such an archive damaged too.
 
 ### Other
 

@@ -553,6 +553,40 @@ outside by `write_to`. Three upstream unit tests matched on the bare error and
 now unwrap the `AtEntry` context first — the same way `format/rar.rs` unwraps it
 to decide whether to ask for a password.
 
+### The walk survives a damaged member, if the caller allows it (остаток G14)
+
+Upstream's three walks — `rar13::extract_volumes_to`,
+`rar15_40::extract_volumes_to`,
+`rar50::extract_volumes_to_with_redirections` — ended at the first member whose
+body would not decode, and took the rest of the set with it. Everything after
+the damage was lost, including members that do not depend on it at all.
+
+Each of the three now takes one more argument: `resume: &mut dyn FnMut(Error) ->
+Result<()>`, called **only** when the body of an already-opened member failed.
+`Ok(())` means "count that member as failed and carry on"; `Err` means "stop",
+which is upstream's behaviour to the letter. Header, key and set-structure
+errors do not go through it — there is nothing to carry on with after those.
+
+Why the caller decides and not the walk: in a solid archive the next member is
+decoded out of the window its predecessors filled, so after a failure that
+window is worthless. `format/rar.rs` passes a closure that refuses for solid
+archives and allows otherwise. Measured, not assumed: on a solid sample with one
+damaged member `unrar` declares **all four** members damaged.
+
+**One reordering came with it.** In `rar13` and `rar50` the split-member path
+(`PendingSplitRefs::write_to`) prepared its reader — and in RAR 5 derived the
+key — before calling `open`. A failure there would have been blamed on the
+previous member, because the caller is told a body has ended only when the next
+`open` arrives. `open` now comes first in all three generations, so a failure
+always belongs to the member it happened in.
+
+What it buys, on the damaged six-file split set in `tests/fixtures/torn.part*`:
+**four intact members out of six → five**, which is what `unrar` recovers there,
+byte for byte, and the sixth is the one that is genuinely damaged. The member
+that was unreachable before is the one split across a volume boundary: it is
+assembled by the walk and by nothing else, so no amount of per-member retrying
+would have found it.
+
 ## Tests
 
 **Every unit test inside `src/` came along** — codecs, crypto, headers, CRC,

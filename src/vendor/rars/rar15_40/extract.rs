@@ -199,10 +199,14 @@ impl FileHeader {
 /// Streams a multivolume archive set to caller-provided writers.
 ///
 /// NEWTUA: писарь получил время жизни (`'w`) — см. `rar13::extract_volumes_to`.
+/// NEWTUA (остаток G14): обход переживает запись, чьё тело не далось, если
+/// вызывающий это позволит. Договор — в `rar13::extract_volumes_to`, он один на
+/// все три поколения.
 pub fn extract_volumes_to<'w, F>(
     volumes: &[Archive],
     options: crate::vendor::rars::ArchiveReadOptions<'_>,
     mut open: F,
+    resume: &mut dyn FnMut(Error) -> Result<()>,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + 'w>>,
@@ -228,13 +232,18 @@ where
                         let _ = open(&meta)?;
                     } else {
                         let mut writer = open(&meta)?;
-                        if file.is_stored() {
+                        // NEWTUA: неудача тела — вопрос к вызывающему, а не
+                        // приговор остатку набора (см.
+                        // `rar13::extract_volumes_to`).
+                        let wrote = if file.is_stored() {
                             file.write_stored_to(archive, password, &mut writer)
-                                .map_err(|error| file.entry_error("extracting", error))?;
                         } else {
-                            session
-                                .write_file_to(archive, file, &mut writer)
-                                .map_err(|error| file.entry_error("extracting", error))?;
+                            session.write_file_to(archive, file, &mut writer)
+                        };
+                        if let Err(error) =
+                            wrote.map_err(|error| file.entry_error("extracting", error))
+                        {
+                            resume(error)?;
                         }
                     }
                 }
@@ -249,7 +258,11 @@ where
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
                     completed.append(file, volume_index, file_index);
-                    completed.write_to(volumes, file, password, &mut session, &mut open)?;
+                    if let Err(error) =
+                        completed.write_to(volumes, file, password, &mut session, &mut open)
+                    {
+                        resume(error)?;
+                    }
                 }
                 SplitVolumeStep::MissingFirst => {
                     return Err(Error::InvalidHeader(
@@ -803,6 +816,13 @@ mod tests {
         }
     }
 
+    /// NEWTUA (остаток G14): здесь обход обязан обрываться на первой неудаче —
+    /// продолжать после порчи разрешает только вызывающий, и эти проверки как
+    /// раз о том, что происходит без такого разрешения.
+    fn abort_on_error(error: Error) -> Result<()> {
+        Err(error)
+    }
+
     fn never_open(_meta: &ExtractedEntryMeta) -> Result<Box<dyn Write>> {
         panic!("open should not be invoked for this test");
     }
@@ -814,7 +834,8 @@ mod tests {
             extract_volumes_to(
                 &empty,
                 crate::vendor::rars::ArchiveReadOptions::default(),
-                never_open
+                never_open,
+                &mut abort_on_error,
             ),
             Err(Error::InvalidHeader(_))
         ));
@@ -828,6 +849,7 @@ mod tests {
                 &only_continuation,
                 crate::vendor::rars::ArchiveReadOptions::default(),
                 never_open,
+                &mut abort_on_error,
             ),
             Err(Error::InvalidHeader(_))
         ));
@@ -841,6 +863,7 @@ mod tests {
                 &interrupted,
                 crate::vendor::rars::ArchiveReadOptions::default(),
                 never_open,
+                &mut abort_on_error,
             ),
             Err(Error::InvalidHeader(_))
         ));
@@ -854,6 +877,7 @@ mod tests {
                 &incomplete,
                 crate::vendor::rars::ArchiveReadOptions::default(),
                 never_open,
+                &mut abort_on_error,
             ),
             Err(Error::InvalidHeader(_))
         ));
@@ -1106,6 +1130,7 @@ mod tests {
             &volumes,
             crate::vendor::rars::ArchiveReadOptions::default(),
             capture.opener(),
+            &mut abort_on_error,
         )
         .unwrap();
 
@@ -1136,6 +1161,7 @@ mod tests {
             &volumes,
             crate::vendor::rars::ArchiveReadOptions::default(),
             capture.opener(),
+            &mut abort_on_error,
         )
         .unwrap();
 
@@ -1166,6 +1192,7 @@ mod tests {
             &volumes,
             crate::vendor::rars::ArchiveReadOptions::default(),
             capture.opener(),
+            &mut abort_on_error,
         )
         .unwrap_err();
         assert!(
@@ -1203,6 +1230,7 @@ mod tests {
             &volumes,
             crate::vendor::rars::ArchiveReadOptions::default(),
             capture.opener(),
+            &mut abort_on_error,
         )
         .unwrap();
 
@@ -1243,6 +1271,7 @@ mod tests {
             &volumes,
             crate::vendor::rars::ArchiveReadOptions::default(),
             capture.opener(),
+            &mut abort_on_error,
         )
         .unwrap_err();
         assert!(

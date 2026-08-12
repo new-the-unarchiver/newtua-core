@@ -425,10 +425,32 @@ impl Entry {
 /// то есть `'static`, и вызывающий не мог отдать писаря, который пишет в
 /// заимствованный приёмник, — тело приходилось копить целиком в памяти
 /// (тикет 29). Правка одинаковая во всех трёх поколениях формата.
+///
+/// **Обход переживает запись, чьё тело распаковать не удалось, если вызывающий
+/// это позволит.**
+///
+/// NEWTUA (остаток G14, тикет 37 §5). Испорченное тело обрывало обход целиком, а
+/// вместе с ним и весь остаток набора: соседей, которые от этой записи не
+/// зависят, забирала чужая беда. `unrar` в том же архиве идёт дальше, и главное —
+/// дальше он собирает запись, **разрезанную границей тома**: поодиночке её не
+/// прочитать, она существует только внутри обхода.
+///
+/// **Договор один на все три поколения.** `resume` зовётся тогда и только тогда,
+/// когда не далось тело уже открытой записи — то есть после `open` для неё.
+/// Вернуть `Ok(())` значит «эту запись считайте отказавшей и идите дальше»,
+/// вернуть `Err` — «обрывайте обход», и тогда всё в точности как до правки.
+/// Ошибки заголовков, ключа и строения набора сюда не попадают: продолжать после
+/// них нечего.
+///
+/// **Решает вызывающий, а не обход.** Для сплошного архива продолжать нельзя:
+/// запись распаковывается из окна, накопленного предыдущими, и после неудачи
+/// окно уже не то. Обход этого не знает, знает вызывающий — он и отдаёт
+/// замыкание, которое возвращает `Err`, когда продолжать не следует.
 pub fn extract_volumes_to<'w, F>(
     volumes: &[Archive],
     password: Option<&[u8]>,
     mut open: F,
+    resume: &mut dyn FnMut(Error) -> Result<()>,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + 'w>>,
@@ -452,7 +474,9 @@ where
                     continue;
                 }
                 let mut writer = open(&meta)?;
-                entry
+                // NEWTUA: неудача тела — вопрос к вызывающему, а не приговор
+                // остатку набора (см. договор у этой функции выше).
+                if let Err(error) = entry
                     .write_compressed_to(
                         archive,
                         password,
@@ -460,7 +484,10 @@ where
                         archive.main.is_solid() && extracted_count != 0,
                         &mut writer,
                     )
-                    .map_err(|error| entry.entry_error("extracting", error))?;
+                    .map_err(|error| entry.entry_error("extracting", error))
+                {
+                    resume(error)?;
+                }
                 extracted_count += 1;
                 continue;
             }
@@ -480,9 +507,12 @@ where
                     current.append(entry, volume_index, entry_index)?;
                     let completed = pending.take().expect("pending split");
                     let solid = archive.main.is_solid() && extracted_count != 0;
-                    completed
+                    if let Err(error) = completed
                         .write_to(volumes, entry, password, &mut unpack15, solid, &mut open)
-                        .map_err(|error| entry.entry_error("extracting", error))?;
+                        .map_err(|error| entry.entry_error("extracting", error))
+                    {
+                        resume(error)?;
+                    }
                     extracted_count += 1;
                 }
                 _ => {
@@ -596,14 +626,17 @@ impl PendingSplitRefs {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + 'w>>,
     {
-        let mut reader = self.fragment_reader(volumes, password)?;
+        // NEWTUA: запись открывается **до** первой неудачи, а не после. Иначе
+        // отказ склейки пришёлся бы на предыдущую запись: приёмнику о конце тела
+        // никто не сообщает, и до следующего `open` открытой у него числится она.
         let meta = ExtractedEntryMeta {
-            name: self.name,
+            name: self.name.clone(),
             file_time: self.file_time,
             file_attr: self.file_attr,
             is_directory: false,
         };
         let mut writer = open(&meta)?;
+        let mut reader = self.fragment_reader(volumes, password)?;
         let mut checksum = Rar13Checksum::new();
         let mut checksum_writer = Rar13ChecksumWriter {
             inner: &mut writer,

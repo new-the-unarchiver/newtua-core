@@ -439,19 +439,41 @@ impl Volumes {
     }
 
     /// Обойти набор целиком, отдавая каждую запись ходоку.
-    fn walk(&self, password: Option<&[u8]>, walker: &mut Walker<'_>) -> rars::Result<()> {
+    ///
+    /// `resumable` — можно ли идти дальше через запись, чьё тело не далось.
+    /// Спрашивается у вызывающего, потому что ответ зависит от архива: в
+    /// сплошном следующая запись распаковывается из окна, накопленного
+    /// предыдущими, и после неудачи это окно уже не то.
+    fn walk(
+        &self,
+        password: Option<&[u8]>,
+        resumable: bool,
+        walker: &mut Walker<'_>,
+    ) -> rars::Result<()> {
         let opts = rars::ArchiveReadOptions::with_optional_password(password);
         // `RefCell` тут не от лени: у RAR 5 обходов два — на записи с телом и на
         // ссылки, — а замыкания взяли бы ходока в исключительное пользование
         // каждое.
         let walker = RefCell::new(walker);
+        let resume = &mut |error: rars::Error| {
+            if !resumable {
+                return Err(error);
+            }
+            walker.borrow_mut().body_failed(map_err(error))
+        };
         match self {
-            Self::Rar13(v) => {
-                rars::rar13::extract_volumes_to(v, password, |_| walker.borrow_mut().open_body())
-            }
-            Self::Rar15To40(v) => {
-                rars::rar15_40::extract_volumes_to(v, opts, |_| walker.borrow_mut().open_body())
-            }
+            Self::Rar13(v) => rars::rar13::extract_volumes_to(
+                v,
+                password,
+                |_| walker.borrow_mut().open_body(),
+                resume,
+            ),
+            Self::Rar15To40(v) => rars::rar15_40::extract_volumes_to(
+                v,
+                opts,
+                |_| walker.borrow_mut().open_body(),
+                resume,
+            ),
             // Ссылка RAR 5 живёт отдельным полем заголовка, а не телом записи,
             // и обычный обход её молча пропускает. Пропуск сдвинул бы все
             // номера после неё, поэтому берётся обход, который о ссылках
@@ -462,6 +484,7 @@ impl Volumes {
                 opts,
                 |_| walker.borrow_mut().open_body(),
                 |_, _| walker.borrow_mut().open_link(),
+                resume,
             ),
         }
     }
@@ -622,7 +645,9 @@ impl RarReader {
         let reached = {
             let mut walker = Walker::new(indices, sink);
             loop {
-                let outcome = self.volumes.walk(self.password_bytes(), &mut walker);
+                let outcome = self
+                    .volumes
+                    .walk(self.password_bytes(), !self.solid, &mut walker);
                 if let Some(err) = walker.fatal.take() {
                     // Отказал приёмник — распаковку отменили или писать некуда.
                     // Это не беда архива, и остаток списка не отмечается.
@@ -819,6 +844,26 @@ impl<'a> Walker<'a> {
                 Err(rars::Error::Cancelled)
             }
         }
+    }
+
+    /// Тело записи не далось, а обход готов идти дальше.
+    ///
+    /// Отличие от `blame_open` — в том, кто продолжает. Там проход уже мёртв и
+    /// его перезапускают с начала; здесь он жив, и записи после испорченной
+    /// достанутся тем же проходом — включая разрезанную границей тома, которую
+    /// поодиночке не собрать вовсе (остаток G14).
+    ///
+    /// Открытой записи может и не быть: испортилось тело того, чего не просили.
+    /// Приписывать некому и незачем — обход просто идёт дальше.
+    fn body_failed(&mut self, err: Error) -> rars::Result<()> {
+        if self.open.is_some() {
+            self.close_open(Err(err))?;
+        }
+        // Список исчерпан — дальше идти не за чем, и это не авария.
+        if self.stop || self.exhausted() {
+            return Err(rars::Error::Cancelled);
+        }
+        Ok(())
     }
 
     /// Приписать ошибку прохода записи, чьё тело он не довёл.

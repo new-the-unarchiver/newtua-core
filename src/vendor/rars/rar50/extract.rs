@@ -612,17 +612,21 @@ fn rar50_buffered_decode_limit(options: crate::vendor::rars::ArchiveReadOptions<
 }
 
 /// NEWTUA: писарь получил время жизни (`'w`) — см. `rar13::extract_volumes_to`.
+/// NEWTUA (остаток G14): обход переживает запись, чьё тело не далось, если
+/// вызывающий это позволит. Договор — в `rar13::extract_volumes_to`, он один на
+/// все три поколения.
 pub fn extract_volumes_to_with_redirections<'w, F, R>(
     volumes: &[Archive],
     options: crate::vendor::rars::ArchiveReadOptions<'_>,
     mut open: F,
     mut redirect: R,
+    resume: &mut dyn FnMut(Error) -> Result<()>,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + 'w>>,
     R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
 {
-    extract_volumes_to_impl(volumes, options, &mut open, &mut redirect, true)
+    extract_volumes_to_impl(volumes, options, &mut open, &mut redirect, resume, true)
 }
 
 fn extract_volumes_to_impl<'w, F, R>(
@@ -630,6 +634,7 @@ fn extract_volumes_to_impl<'w, F, R>(
     options: crate::vendor::rars::ArchiveReadOptions<'_>,
     open: &mut F,
     redirect: &mut R,
+    resume: &mut dyn FnMut(Error) -> Result<()>,
     emit_redirections: bool,
 ) -> Result<()>
 where
@@ -658,7 +663,12 @@ where
                     let meta = file.metadata();
                     let mut writer = open(&meta)?;
                     if !meta.is_directory {
-                        session.write_file_to(archive, file, &mut writer)?;
+                        // NEWTUA: неудача тела — вопрос к вызывающему, а не
+                        // приговор остатку набора (см.
+                        // `rar13::extract_volumes_to`).
+                        if let Err(error) = session.write_file_to(archive, file, &mut writer) {
+                            resume(error)?;
+                        }
                     }
                 }
                 SplitVolumeStep::Start => {
@@ -672,7 +682,10 @@ where
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
                     completed.append(volume_index, file_index);
-                    completed.write_to(volumes, file, &mut session, &mut *open)?;
+                    if let Err(error) = completed.write_to(volumes, file, &mut session, &mut *open)
+                    {
+                        resume(error)?;
+                    }
                 }
                 SplitVolumeStep::MissingFirst => {
                     return Err(Error::InvalidHeader(
@@ -766,7 +779,10 @@ impl PendingSplitRefs {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + 'w>>,
     {
-        let decryptor = session.split_decryptor(&self, volumes)?;
+        // NEWTUA: запись открывается **до** первой неудачи, а не после. Иначе
+        // отказ вывода ключа пришёлся бы на предыдущую запись: приёмнику о конце
+        // тела никто не сообщает, и до следующего `open` открытой у него
+        // числится она.
         let meta = ExtractedEntryMeta {
             name: self.name.clone(),
             file_time: self.file_time,
@@ -775,6 +791,7 @@ impl PendingSplitRefs {
             is_directory: false,
         };
         let mut writer = open(&meta)?;
+        let decryptor = session.split_decryptor(&self, volumes)?;
         if final_file.is_stored() {
             // Пометку операции ставит `stream_stored_body` — та же, что у целой
             // записи. Второй обёртки здесь нет нарочно: она приписала бы к
@@ -1523,6 +1540,7 @@ mod tests {
                 seen.push((meta.name.clone(), redirection.target_name.clone()));
                 Ok(())
             },
+            &mut |error| Err(error),
         )
         .unwrap();
 
